@@ -1,6 +1,6 @@
-# C++26 SIMD（tile_len=128）× GPU-like 编程模型：PyTorch 算子 Pattern 分类与全量动态 Shape 易用性设计
+# C++26 SIMD（tile_len=128）× GPU-like：Elementwise / Reduce / Broadcast 分类、尾块处理与性能发挥
 
-> 目标：在 **固定 SIMD 宽度 `tile_len = 128`**（元素数或等价 lane 数，见 §1）的前提下，用接近 GPU 的编程抽象（block/tile/mask）覆盖 PyTorch/ATen 现有算子 pattern，实现 **全量动态 shape** 的易用编写与可移植映射，并给出指令分类与易用性评估。
+> 目标：固定逻辑 SIMD 宽度 `TILE = 128`，以 GPU-like 的 tile + mask 模型覆盖 PyTorch/ATen 主体算子；强调 **全量动态 shape**、**尾块处理**、**硬件性能发挥度量** 与 **软件表达建议**。需专用处理的类别单独归入第 6 章。
 
 ---
 
@@ -8,452 +8,421 @@
 
 | 维度 | 结论 |
 |---|---|
-| 编程模型 | 以 C++26 `std::datapar::simd` / `simd_mask` 为 **lane 原语**；之上固定 `TILE=128`，用 GPU-like 的 `blockIdx × tile` + **尾块 mask** 表达动态长度 |
-| 动态 shape 关键 | 不要求编译期 shape；运行时仅依赖 `numel / strides / sizes`；所有 kernel 统一 `for (i = tid*TILE; i < n; i += grid*TILE)` + `mask = iota < remain` |
-| PyTorch 覆盖 | 按 shape 行为 + 计算结构双轴分类；**~70%+ 算子（TensorIterator/pointwise/reduction/view）** 可落入少数通用 pattern；Fixed/Batched/Matmul/Conv 需专用 tile 模板 |
-| 指令需求 | 八大类：算术、谓词/mask、归约、gather/scatter、广播/shuffle、内存（连续/跨步/间接）、同步、特殊数学 |
-| 易用性 | Pointwise / 简单 Reduce：**高**；Broadcast+Strided：**中高**；Indexing / Unique 等 data-dependent：**中低**；Matmul/Conv/Attention：**低（需专用 DSL/模板，而非裸 simd）** |
+| 术语 | 统一使用 **elementwise**（逐元素）；ATen 文档中的 `pointwise` tag 视为同义别名 |
+| 通用路径 | **Elementwise / Broadcast / Reduce / Layout-copy** 走统一 tile 循环 + 尾块策略，可全动态 shape |
+| 尾块 | 不以 `numel % 128 == 0` 为契约；整块用满宽向量，尾块用 **masked / 拆分 / 标量回退** 三选一（见 §4） |
+| 专用路径 | GEMM、Conv、Attention、全局 Sort/TopK、data-dependent 输出等 **集中到第 6 章**，不塞进通用 elementwise 引擎 |
+| 性能发挥 | 关键看 **向量利用率、尾块占比、带宽效率、谓词开销、广播/归约轴是否可向量化**；软件表达应让整块路径零分支、尾块路径可预测 |
+| 易用性 | Elementwise / 简单 Broadcast+Reduce：**高**；复杂 Broadcast+多维 Reduce：**中高**；第 6 章专用类：**模板/库级表达** |
 
-**一句话**：`tile_len=128` 把硬件 SIMD/向量机抽象成「固定宽 GPU warp」；动态 shape 的易用性来自 **统一尾块 mask + 运行时线性化索引**，而不是为每个 shape 特化 kernel。
+**一句话**：把动态长度拆成「满 128 的整块 + 不足 128 的尾块」；整块追求峰值吞吐，尾块保证正确且可控开销。
 
 ---
 
-## 1. 基线假设与抽象
+## 1. 基线：固定 TILE=128 的 GPU-like 抽象
 
-### 1.1 C++26 SIMD 角色
-
-C++26 引入 data-parallel types（P1928，`std::datapar::simd` / `basic_simd`）：
-
-- **元素级并行**：`simd` 上运算默认 element-wise、lane 间无序
-- **谓词**：`simd_mask` + `where(mask, v) = expr`
-- **水平操作**：reduction（sum/min/max…）单独标注
-- **宽度**：标准允许实现相关 ABI；本设计 **强制固定逻辑宽度** `TILE = 128`
+### 1.1 逻辑 tile（非物理寄存器宽度）
 
 ```cpp
-// 逻辑约定（示意，非标准强制 API）
-inline constexpr std::size_t TILE = 128;
+inline constexpr std::size_t TILE = 128;  // 128 个元素 lane（与 dtype 无关的逻辑宽度）
 template<class T>
-using tile_t = std::datapar::simd<T, std::datapar::simd_abi::fixed_size<TILE>>;
+using tile_t = std::datapar::simd<T, /* fixed_size<TILE> 或后端等价 */>;
 template<class T>
-using mask_t = std::datapar::simd_mask<T, std::datapar::simd_abi::fixed_size<TILE>>;
+using mask_t = typename tile_t<T>::mask_type;  // 或 simd_mask 等价物
 ```
 
-> 说明：物理寄存器可能是 4/8/16/32 lane（AVX/NEON）或可伸缩（SVE）。`TILE=128` 是 **软件逻辑 tile**：编译器可拆成多条物理向量指令，或映射到 NPU/GPU 的 128-lane 向量单元。对 Ascend/类 GPU 后端，这对应「一次处理 128 个元素的向量指令宽度」。
-
-### 1.2 GPU-like 执行模型（固定 tile）
-
-| GPU 概念 | 本模型对应 |
+| GPU 概念 | 本模型 |
 |---|---|
-| warp / wavefront | 一个 `tile_t<T>`（128 lanes） |
-| threadIdx.x | lane id ∈ `[0,128)` |
-| block | 多个 tile 的协作组（可选，用于 shared reduce / transpose） |
-| grid-stride loop | `for (base = gid*TILE; base < n; base += grid*TILE)` |
-| predicated exec | `mask_t` / `where` |
-| shared memory | `tile_shared[TILE]` 或 block-shared buffer（后端提供） |
-| global load | `simd::copy_from` / gather；跨步用 strided load 或标量拼装 |
+| warp | 一个 `tile_t`（128 lanes） |
+| predicated exec | `mask_t` / masked load-store |
+| grid-stride | 多个满宽 tile 迭代；最后一截为尾块 |
 
-```text
-                 numel = N (runtime dynamic)
-  ┌──────────────┬──────────────┬─────┬──────────┐
-  │ tile 0 (128) │ tile 1 (128) │ ... │ tile k   │  ← last tile masked
-  └──────────────┴──────────────┴─────┴──────────┘
-  grid-stride: each "core/block" owns a stream of tiles
-```
+物理后端（AVX/NEON/SVE/NPU）可将 128 再切为多条物理向量指令；对软件表达而言 **只暴露 TILE=128**。
 
-### 1.3 「全量动态 Shape」定义
+### 1.2 全量动态 Shape（通用路径契约）
 
-本设计中的 **全量动态 shape** 指：
-
-1. **Rank / sizes / strides 仅运行时可知**（含 symbolic / 导出后的动态维）
-2. Kernel **不** 为具体 `[B,H,W]` 特化代码路径（除可选 JIT 特化）
-3. 尾部 `N % 128 ≠ 0` 必须正确（mask），禁止「要求对齐到 128」作为 API 契约
-4. Broadcast、非连续 stride、任意 reduce 轴在 **统一运行时描述符** 下工作
-5. Data-dependent 输出 shape（`unique`、`nonzero`）允许二阶段，但不退出统一编程模型
+1. `rank / sizes / strides / numel` 仅运行时可知  
+2. 不要求编译期固定 `[B,H,W]`，也不要求 `numel` 对齐到 128  
+3. Broadcast 与 Reduce 的轴集合运行时给定  
+4. 专用类（第 6 章）可另定契约，但对外尺寸仍动态  
 
 ---
 
-## 2. PyTorch 现有算子 Pattern 分类
+## 2. PyTorch 算子 Pattern 分类（通用路径）
 
-结合 ezyang *shape taxonomy*（~1364 op 变体统计）与 ATen `tags.yaml`（`pointwise` / `reduction` / `dynamic_output_shape` / `core`），整理为 **双轴分类**：
+双轴：**Shape 行为（A）** × **计算结构（B）**。ATen `tags.yaml` 中的 `pointwise` 在本文一律写作 **elementwise**。
 
-- **轴 A：Shape 行为**（决定索引与输出分配）
-- **轴 B：计算结构**（决定指令与 tile 模板）
+### 2.1 Shape 行为（A）
 
-### 2.1 轴 A — Shape 行为（来自 PyTorch 生态）
-
-| ID | Pattern | 约占比（历史统计） | 代表算子 | 动态 Shape 要点 |
-|---|---|---|---|---|
-| A1 | **TensorIterator / Pointwise** | ~505（最大头） | `add/mul/relu/where` | 输出 = broadcast(inputs)；element 独立 |
-| A2 | **Reduction** | 含于 TI + tag:reduction | `sum/mean/amax/prod` | 轴运行时指定；keepdim 元数据 |
-| A3 | **Fixed-rank** | ~273 | `conv2d/addmm` | 固定 2D/3D 循环；batch 维动态 |
-| A4 | **N-D generic** | ~107 | `squeeze/index_add/tensordot` | 任意 rank；需 list 级 shape 规则 |
-| A5 | **Identity / View** | ~42 + view 族 | `clone/view/reshape/permute` | 多为元数据；或纯 copy tile |
-| A6 | **Flatten-as-1D** | ~11 | `take/bucketize` | 忽略高维，按 1D 动态长度 |
-| A7 | **Batched / FeatureBatched** | ~94 / ~19 | `nll_loss/batch_norm` | 前缀 batch 或后缀 feature 动态 |
-| A8 | **Composite** | ~95 | `kl_div/isfinite` | 分解到 A1–A7，不单独映射指令 |
-| A9 | **Factory** | ~90 | `empty/arange/randn` | 无输入 tensor；按运行时 size 填 |
-| A10 | **Variadic** | ~14 | `cat/stack` | 输入个数/各维动态 |
-| A11 | **Dynamic output shape** | ~15 + tag | `unique/nonzero/masked_select` | 输出长度依赖数据 → 两阶段 |
-| A12 | **Sparse / Trivial** | ~40 / ~59 | sparse ops / `size` | 特殊路径或 host 侧 |
-
-### 2.2 轴 B — 计算结构（面向 tile=128 实现）
-
-| ID | 计算 Pattern | 典型 ATen | Tile 算法骨架 |
+| ID | Pattern | 代表 | 动态 Shape 要点 |
 |---|---|---|---|
-| B1 | **Elementwise unary/binary/ternary** | pointwise | map / zip_with + mask |
-| B2 | **Broadcast elementwise** | `add` 带广播 | 每 lane 多维索引 → 输入偏移 |
-| B3 | **Horizontal / dimensional reduce** | `sum(dim)` | tile 内 reduce + block 原子/树归约 |
-| B4 | **Scan / prefix** | `cumsum` | tile scan + 跨 tile 前缀传递 |
-| B5 | **Compare-select / 谓词** | `where/clamp/maximum` | mask 生成 + blend |
-| B6 | **Gather / Index** | `index/gather/embedding` | 间接 load（gather 指令） |
-| B7 | **Scatter / Atomic** | `index_add/scatter` | 间接 store / atomic |
-| B8 | **Sort / TopK 局部** | `sort/topk` | tile 内网络 + 跨 tile 归并（重） |
-| B9 | **Matmul-like** | `mm/bmm/addmm` | 128×K 外积/分块（专用） |
-| B10 | **Convolution-like** | `conv1d/2d/3d` | im2col+B9 或专用滑窗 tile |
-| B11 | **Normalize / Softmax 族** | `layer_norm/softmax` | 两/三遍 reduce + map |
-| B12 | **RNG** | `rand/dropout` | 计数器 RNG 每 lane 独立 |
-| B13 | **Memory / layout** | `copy/transpose/pad` | 连续 copy 或 gather-scatter 重排 |
-| B14 | **Data-dependent compact** | `nonzero/unique` | 谓词 → ballot/scan → 写回 |
+| A1 | **Elementwise**（原 pointwise / TensorIterator 主体） | `add/mul/relu/where` | 输出形状 = broadcast(inputs) |
+| A2 | **Reduction** | `sum/mean/amax` | `dim` / `keepdim` 运行时 |
+| A3 | **N-D / Batched** | `index_add`、带 batch 的 loss | 任意前缀 batch 或任意 rank |
+| A4 | **View / Identity / Flatten-1D** | `view/clone/take` | 元数据或按 1D `numel` |
+| A5 | **Variadic layout** | `cat/stack` | 段长动态 |
+| A6 | **Composite** | `kl_div` | 分解到 A1/A2，不直映射指令 |
+| A7 | **Factory** | `arange/empty` | 按运行时 size 填充 |
 
-### 2.3 交叉矩阵：哪些 A×B 必须优先支持
+> Fixed-rank 重计算（conv/mm）、data-dependent 输出（unique/nonzero）、稀疏等 → **第 6 章**。
 
-|  | B1 Map | B2 Bcast | B3 Reduce | B4 Scan | B6/B7 Index | B9/B10 重计算 | B14 Compact |
-|---|---|---|---|---|---|---|---|
-| **A1 Pointwise** | ★必选 | ★必选 | — | — | — | — | — |
-| **A2 Reduction** | 预处理 | 可选 | ★必选 | 少见 | — | — | — |
-| **A3 Fixed** | 局部 | 局部 | 局部 | — | — | ★专用模板 | — |
-| **A4/A7 N-D/Batch** | ★ | ★ | ★ | 可选 | ★ | 分解 | — |
-| **A5 View/Copy** | — | — | — | — | — | — | copy 模板 |
-| **A10 Cat** | — | — | — | — | — | — | 分段 copy |
-| **A11 DynOut** | — | — | — | ★ | ★ | — | ★必选 |
+### 2.2 计算结构（B）— 通用
 
-★ = 全量动态 shape 下的 **第一优先** 通用内核。
+| ID | Pattern | 代表 | 说明 |
+|---|---|---|---|
+| B1 | **Elementwise map** | unary/binary/ternary | 无广播或已对齐 |
+| B2 | **Broadcast elementwise** | 见 §3.1 多场景 | 运行时算每 lane 源地址 |
+| B3 | **Reduce** | 见 §3.2 多场景 | tile 内归约 + 跨 tile 合并 |
+| B4 | **Compare-select** | `where/clamp` | mask + blend（可并入 B1） |
+| B5 | **Layout copy** | `copy/contiguous` 段 | 连续或可合并跨步 |
 
-### 2.4 覆盖策略：「少量 Pattern 模板」吃掉长尾
+Scan / Gather-Scatter / Compact 等偏专用或半专用，主述见第 6 章；通用引擎仅在需要时薄封装。
+
+### 2.3 覆盖关系（通用）
 
 ```text
-Composite (A8) ──decompose──► A1/A2/A5/...
-     │
-     ▼
-统一 Runtime Descriptor (TensorDesc{sizes,strides,dtype})
-     │
-     ├── Pattern PE (Pointwise Engine)     ← B1+B2
-     ├── Pattern RE (Reduction Engine)     ← B3 (+B11 多遍)
-     ├── Pattern SE (Scan/Compact Engine)  ← B4+B14
-     ├── Pattern IE (Indexing Engine)      ← B6+B7
-     ├── Pattern ME (Memory/Layout Engine) ← B13+A5+A10
-     └── Pattern XE (Expert: GEMM/Conv/Attn)← B9+B10 手写/生成
+Composite ──decompose──► Elementwise / Broadcast / Reduce / Layout
+                              │
+                              ▼
+              统一 TensorDesc + 整块循环 + 尾块策略（§4）
 ```
 
-经验比例（实现投入 vs 算子覆盖）：
-
-| 引擎 | 估计覆盖 ATen 变体 | 对动态 shape 的完成度 |
+| 组合引擎 | 估计覆盖 | 动态 shape |
 |---|---|---|
-| PE + RE + ME | ~55–65% | **可全动态** |
-| + IE + SE | ~70–80% | 全动态（含二阶段） |
-| + XE（GEMM/Conv/Attn/Norm 融合） | ~90%+ 性能关键路径 | 动态 batch/seq；算法 tile 固定 128 |
+| Elementwise + Broadcast + Reduce + Layout | ~55–70% 变体 | 全动态 |
+| + 第 6 章专用模板 | 性能关键长尾 | 对外动态 |
 
 ---
 
-## 3. 全量动态 Shape 的易用性设计
+## 3. Broadcast 与 Reduce 场景（展开）
 
-### 3.1 统一运行时描述符
+### 3.1 Broadcast 场景
 
-```cpp
-struct TensorDesc {
-  void*       data;
-  int64_t     numel;          // 动态
-  int         rank;           // 动态 0..MAX_RANK
-  int64_t     sizes[MAX_RANK];
-  int64_t     strides[MAX_RANK];
-  DType       dtype;
-};
+约定：输出逻辑形状为 `out_sizes`；每个输入通过 `expand` 规则对齐。实现时对每个输入维护 `stride_eff[d] = (sizes[d]==1 ? 0 : strides[d])`。
+
+| 场景 ID | 名称 | 形状例 | 访问特征 | 尾块关系 | 软件表达建议 |
+|---|---|---|---|---|---|
+| BC0 | **无广播 / 已对齐** | `[N]+[N]→[N]` | 连续 unit-stride | 仅 `numel` 尾块 | `elementwise(out,a,b,op)` |
+| BC1 | **标量广播** | `[]+[N]` / `[1]+[N]` | 一端 splat 到 tile | 随 `N` 尾块 | `broadcast_scalar` 或自动识别 |
+| BC2 | **末维对齐广播** | `[B,1]+[B,K]` | 内维连续，外维扩 | 按行/`numel` 切尾 | collapse 后当 BC0/BC1 |
+| BC3 | **中间维广播** | `[B,1,K]+[B,H,K]` | 非单调跨步 | 每行/每 tile 独立尾块 | `BroadcastPlan` + 运行时偏移 |
+| BC4 | **多输入异形广播** | 三输入各不同 | 每输入一套 `stride_eff` | 以 **输出 numel** 为准切块 | TensorIterator 式输出主导 |
+| BC5 | **高维可合并广播** | 多维但可 `collapse` | 合并后降为 BC0–2 | 合并后一次尾块 | **优先 runtime dim collapse** |
+| BC6 | **非连续 + 广播** | broadcast 且 stride≠1 | 跨步 load 或 gather | 尾块 mask 必须配合跨步 | 能 `contiguous` 则拷贝；热路径保留跨步 |
+| BC7 | **行广播 / 列广播** | `[M,1]+[1,N]→[M,N]` | 外积式扩展 | 按输出行主序切 128 | 专用 `Broadcast2D` 短路径（仍通用引擎内） |
+
+**动态 shape 要点**：广播维集合运行时变化时，只更新 `stride_eff` 与 `collapse` 结果，不换 kernel 族。
+
+### 3.2 Reduce 场景
+
+| 场景 ID | 名称 | 形状例 | 归约结构 | 尾块落点 | 软件表达建议 |
+|---|---|---|---|---|---|
+| RD0 | **全维归约** | `[…]→[]` | 全局一值 | **输入**侧按 `numel` 切块；无效 lane 填中性元 | `reduce_all(op, neutral)` |
+| RD1 | **最内维归约** | `[B,K]→[B]`，`dim=-1` | 每行独立 | **每行长度 K** 各自有尾块 | `reduce_inner`（向量友好） |
+| RD2 | **最外维归约** | `[B,K]→[K]`，`dim=0` | 沿外维累加到长为 K 的缓冲 | 输出/`K` 维切块；外维循环可无 mask | `reduce_outer` |
+| RD3 | **中间维归约** | `[B,H,K]→[B,K]`，`dim=1` | 重排为 outer×reduce×inner | reduce 长度上的尾块 | 运行时拆 `outer/reduce/inner` |
+| RD4 | **多维同时归约** | `dim=(1,2)` | 合并 reduce 轴 | 合并后同 RD0/RD1 | **先合并轴再归约** |
+| RD5 | **keepdim** | 同上但保留 1 | 仅元数据差 | 同对应 RD* | 输出 view 包一层 |
+| RD6 | **分段 / 部分归约** | 每段长动态 | 段内 RD0/RD1 | **每段各自尾块** | 传入 `segment_offset/length` |
+| RD7 | **Arg-reduce** | `argmax` | (val,idx) 对 | 同 RD1/RD0；无效 lane 禁用 idx | `reduce_argmax` |
+| RD8 | **两阶段统计** | `softmax`/`layer_norm` 的 max/sum | 多遍 RD1 + elementwise | 每遍独立尾块 | 分解为 Reduce 遍 + Elementwise 遍（完整算子见 §6） |
+| RD9 | **布尔 / 比特归约** | `any/all` | and/or 归约 | 中性元 `true/false` | 同 RD0/RD1，换 op/neutral |
+
+**向量化友好序**：`RD1 ≈ RD4(合并后内维) > RD0 > RD2 > RD3`。软件侧应 **自动把可合并轴变成内维归约**。
+
+### 3.3 Broadcast × Reduce 组合（常见）
+
+| 组合 | 例 | 处理顺序 | 尾块 |
+|---|---|---|---|
+| 先 Broadcast 再 Elementwise | `x + bias` | BC* → B1 | 输出主导 |
+| 先 Reduce 再 Broadcast | `x - x.mean(...)` | RD* → BC1/BC2 | 两阶段各管各的尾块 |
+| Broadcast 输入上的 Reduce | `sum(a + b)` 且 a、b 异形 | 融合则按输出扩展域归约；否则物化 | 以扩展后线性域切块 |
+
+---
+
+## 4. 尾块处理（重点）
+
+动态 shape 下，任意长度 `L`（`numel`、行长 `K`、段长等）都拆成：
+
+```text
+n_full = L / TILE          // 整块个数
+n_tail = L % TILE          // 尾块有效元素数，∈ [0, TILE)
 ```
 
-编写者不碰静态 shape；只写 **lane 纯函数** 或 **带 desc 的索引函数**。
+整块：`mask = all_true`，走满宽向量指令。  
+尾块：`0 < n_tail < TILE`，必须显式策略，禁止读/写越界。
 
-### 3.2 三种易用 API 层级
+### 4.1 三种尾块策略
 
-#### L0 — Scalar lambda（最高易用，覆盖 A1）
+| 策略 | 做法 | 正确性 | 性能特征 | 适用 |
+|---|---|---|---|---|
+| **T-Mask（推荐默认）** | `mask = (lane_id < n_tail)`；masked load/compute/store | 强 | 一条向量路径；依赖硬件谓词效率 | 通用 elementwise / 多数 reduce |
+| **T-Split** | 尾块再切成物理 VL 的满块 + 更小尾块；或整块循环后单独标量/窄向量 epilogue | 强 | 整块峰值不受损；epilogue 指令开销固定 | 谓词弱或代价高的后端 |
+| **T-Pad（受限）** | 分配/临时缓冲 pad 到 128，无效 lane 填中性元，最后写回有效前缀 | 需控制写回范围 | 计算满宽，但多拷贝/多带宽 | 小尾块且有廉价 scratch；**不可**作为对外 API 契约 |
+
+> API **不得**要求调用方保证 `L % 128 == 0`。T-Pad 只能是实现内部优化。
+
+### 4.2 尾块在各 Pattern 中的落点
+
+| Pattern | 切块长度 `L` | 整块 | 尾块要点 |
+|---|---|---|---|
+| Elementwise / BC0–BC4 | 输出 `numel` | 满宽 map | T-Mask store，防止写穿 |
+| BC7 行主序 | 每行 `N` 或全局 `M*N` | 同行连续优先 | 行长不足 128：行尾 T-Mask；跨行拼 tile 需慎用（边界行） |
+| RD0 全维 | 输入 `numel` | 累加到寄存器/共享 | 无效 lane ← **中性元**（0 / +inf / …） |
+| RD1 内维 | 每行 `K` | 行内满块 | **每个 outer 一条尾块**；短行（`K<128`）整行即尾块 |
+| RD2 外维 | 输出向量长 | 沿外维迭代可无 mask | 输出侧若向量写，仍按输出长切尾 |
+| RD3/RD4 | `reduce_len` 或合并后长度 | 同 RD0/1 | 先合并轴，减少「每段都是短尾块」 |
+| Layout copy | 字节或元素长度 | 连续 DMA/向量搬 | 尾块 T-Mask 或窄拷贝 |
+
+### 4.3 尾块控制流（软件侧推荐形态）
+
+**形态 A — 统一 mask（易用优先）**
 
 ```cpp
-// 用户只写标量语义；框架负责 tile=128、尾 mask、broadcast、dtype dispatch
-pointwise(out, a, b, [](auto x, auto y) { return x * y + T(1); });
-```
-
-内部：
-
-```cpp
-for (int64_t base = gid * TILE; base < n; base += grid * TILE) {
-  mask_t m = lane_id < (n - base);          // 动态尾块
-  auto xa = load_bcast(a, base, m);         // 按尺寸广播
-  auto ya = load_bcast(b, base, m);
-  auto zo = map(m, xa, ya, op);
-  store(out, base, m, zo);
+for (int64_t base = 0; base < L; base += TILE) {
+  const int32_t valid = (int32_t)min<int64_t>(TILE, L - base);
+  mask_t m = lane_lt(valid);          // lane_id < valid
+  auto x = load(in + base, m);
+  store(out + base, m, map(x));
 }
 ```
 
-#### L1 — Index lambda（覆盖跨步 / 非 element 对齐）
+整块时 `valid==TILE`，后端应常量折叠掉谓词（见 §5）。
+
+**形态 B — 整块 / 尾块分流（性能优先，推荐热路径）**
 
 ```cpp
-transform_indexed(out, in, [](int64_t i, auto v) {
-  // i 为逻辑线性下标，运行时从动态 sizes 解码多维坐标
-  return v * v;
-});
+int64_t base = 0;
+for (; base + TILE <= L; base += TILE) {   // 无 mask 快路径
+  store(out + base, map(load_full(in + base)));
+}
+if (base < L) {                            // 至多一次尾块
+  mask_t m = lane_lt((int32_t)(L - base));
+  store(out + base, m, map(load(in + base, m)));
+}
 ```
 
-#### L2 — Tile 专家（覆盖 B9/B10/B11）
+**形态 C — Reduce 中性元**
 
 ```cpp
-tile_kernel(desc, [](TileContext ctx) {
-  auto x = ctx.load_tile<float>();          // 128 lanes
-  auto m = ctx.mask();                      // 动态 valid lanes
-  auto s = reduce_sum(where(m, x, 0));      // tile 内
-  ctx.store_tile(x / s);
-});
+acc = neutral;
+for (full tiles) acc = combine(acc, reduce_tile(load_full(...)));
+if (tail) acc = combine(acc, reduce_tile(where(m, load(...), neutral)));
 ```
 
-### 3.3 动态 Shape 关键机制对照
+### 4.4 短尾块与超短问题
 
-| 机制 | 作用 | 对应 GPU |
+| 情况 | 现象 | 建议 |
 |---|---|---|
-| **Grid-stride + mask** | 任意 `numel`，无对齐要求 | 标准 CUDA grid-stride |
-| **运行时 broadcast 偏移** | `sizes` 不一致时每 lane 算地址 | TensorIterator |
-| **线性化 ↔ 多维坐标** | 任意 rank 的 reduce/transpose | 通用 ND 索引 |
-| **两阶段 compact** | `nonzero`：先 count 再 write | thrust copy_if |
-| **动态轴 reduce** | `dim` 运行时；inner/outer 分解 | CUB BlockReduce |
-| **可选 shape 特化 JIT** | 热路径静态化 strides | 性能优化，非正确性必需 |
-
-### 3.4 「全量」边界（诚实清单）
-
-| 可全动态且易用 | 可全动态但难写 | 需放宽/二阶段 |
-|---|---|---|
-| pointwise、激活、逐点比较 | 任意轴 softmax/layer_norm | `unique` / `nonzero` 输出长度 |
-| copy/contiguous/cat | 高维 transpose 融合 | data-dependent 控制流 |
-| sum/mean 全维或单维 | sort 全局 | 稀疏变长索引 |
-| gather/scatter 常规 | 动态 rank > MAX_RANK | host 同步取 shape |
-
-`MAX_RANK`（建议 8 或 16）是工程折中，与 PyTorch 常见上限一致；超过则走慢路径。
+| `L ≫ 128` 且均匀 | 尾块占比 → 0 | 形态 B，整块打满 |
+| 大量 `K < 128` 的短行（RD1） | **每次都是尾块**，向量利用率低 | 转置/打包多行拼 tile，或换 RD 算法；软件暴露 `reduce_inner_packed` |
+| `L` 分布动态（训练动态 batch） | 尾块占比波动 | 度量 `tail_ratio`（§5）；必要时 pad batch（实现内） |
 
 ---
 
-## 4. 需要采用的指令分类（面向 tile=128）
+## 5. 硬件性能发挥：度量与软件表达
 
-将硬件/后端指令按 **算子 pattern 消费关系** 分为 8 类。每类给出：语义、C++26/`tile` 映射、主要服务的 B-pattern、动态 shape 注意点。
+### 5.1 度量指标
 
-### 4.1 I1 算术与逻辑（Arithmetic / Logic）
-
-| 子类 | 示例 | C++26 / tile API | 服务 |
+| 指标 | 定义 | 健康方向 | 主要影响因素 |
 |---|---|---|---|
-| 二元算术 | add/sub/mul/div/fma | `simd` 运算符 / `fma` | B1/B2 |
-| 比较 | eq/lt/gt | → `simd_mask` | B5 |
-| 位运算 | and/or/xor/shift | `simd` 位运算 | B1、量化 |
-| 类型转换 | cast、bf16↔f32 | `simd_cast` / 扩展 | 全 pattern |
+| **向量利用率 η_vec** | 有效元素运算 / 发出的 lane 槽位 | → 1 | 尾块策略、短行、无效谓词 lane |
+| **尾块占比 r_tail** | 尾块处理元素 / 总元素 ≈ `(L%TILE)/L`（多段则按段平均） | → 0（长轴） | 动态 shape、是否多短段 |
+| **满宽指令比 ρ_full** | 无谓词满宽向量指令 / 全部向量指令 | 高 | 形态 B 分流、collapse |
+| **谓词开销因子 α_pred** | 同计算在 masked vs full 下的耗时比 | → 1 | 硬件 predication 质量 |
+| **带宽效率 η_bw** | 有效业务字节 / 实际搬运字节 | → 1 | 广播重复读、pad、非连续 |
+| **归约并行效率 η_red** | 相对峰值归约吞吐 | 高 | 内维 vs 外维、跨 tile 原子 |
+| **占用 / 延迟隐藏** | pipeline busy | 高 | 整块循环展开、多缓冲 |
 
-**动态 shape**：与长度无关；只作用在有效 mask 的 lane。
+实用近似（单次 elementwise 连续）：
 
-### 4.2 I2 谓词与混合（Mask / Predication / Blend）
+```text
+η_vec ≈ 1 - r_tail * (1 - n_tail/TILE)/ (L/TILE 相关项)
+      ≈ L / (ceil(L/TILE) * TILE)
+```
 
-| 子类 | 示例 | 映射 | 服务 |
+即：**ceil 对齐浪费的 lane 比例**。`L=129` → η_vec≈129/256≈0.50；`L=12800` → ≈0.999。
+
+### 5.2 场景对性能发挥的影响（定性）
+
+| 场景 | η_vec | η_bw | 说明 |
 |---|---|---|---|
-| 尾块 mask | `iota < remain` | `simd_mask` | **所有动态长度** |
-| 条件写 | `where(m, a, b)` | `where` | B5、`clamp` |
-| 谓词存储 | masked store | 扩展 / 后端 | 防写越界 |
-| ballot / popcount | 有效 lane 计数 | 后端扩展 | B14 |
+| BC0 长尾 `L≫128` | 高 | 高 | 峰值主战场 |
+| BC1 标量广播 | 高 | 中高 | splat，少带宽 |
+| BC3/BC6 跨步广播 | 中高 | **低** | 易变成 gather |
+| BC5 先 collapse | **升高** | 升高 | **软件必做** |
+| RD1 长内维 | 高 | 高 | 最佳 reduce |
+| RD1 大量短行 | **很低** | 中 | 需打包/转置 |
+| RD2 外维 | 中 | 中 | 写冲突/原子可能降 η_red |
+| RD3 中间维未合并 | 低–中 | 低 | 先合并到 RD1/RD4 |
+| 统一 T-Mask 不分流 | 名义满宽但 α_pred>1 | — | 整块也被拖慢 |
+| 形态 B 分流 | 整块 α_pred≈1 | — | **推荐热路径表达** |
 
-**动态 shape 关键指令**：没有 I2，就没有安全的全动态 `numel`。
+### 5.3 软件表达建议（让硬件打满）
 
-### 4.3 I3 归约与扫描（Reduce / Scan）
+#### （1）分层 API：用户不见 TILE，热路径可分流
 
-| 子类 | 示例 | 映射 | 服务 |
-|---|---|---|---|
-| tile 水平归约 | sum/min/max/and | `reduce` | B3/B11 |
-| 跨 tile 原子归约 | atomicAdd | 后端 | 全局 reduce |
-| 前缀和 | inclusive/exclusive scan | 扩展库 | B4/B14 |
-| arg-reduce | argmax | 成对 (val,idx) | `amax`+index |
-
-**动态 shape**：reduce 轴长度运行时变化 → 必须支持「任意次 tile 迭代 + 中性元填无效 lane」。
-
-### 4.4 I4 内存访问（Memory）
-
-| 子类 | 示例 | 映射 | 服务 |
-|---|---|---|---|
-| 连续向量 load/store | unit-stride | `copy_from/to` | B1/B13 |
-| 掩码 load/store | masked | 扩展 | 尾块 |
-| 跨步 load/store | stride = S | 循环标量或 strided 指令 | 非 contiguous |
-| 广播 load | 标量→ tile | `simd(value)` | B2 |
-| 异步拷贝 / DMA | TMA-like | 后端 | 大块 ME/XE |
-
-### 4.5 I5 间接访问（Gather / Scatter）
-
-| 子类 | 示例 | 映射 | 服务 |
-|---|---|---|---|
-| gather | `x[idx[lane]]` | gather 指令或标量回退 | B6、embedding |
-| scatter | `y[idx[lane]] = v` | scatter | B7 |
-| atomic scatter | conflict 安全 | atomic | `index_add` |
-
-**动态 shape**：索引范围运行时检查；冲突频率决定是否需要排序优化路径。
-
-### 4.6 I6 通道重排（Permute / Shuffle / Broadcast lane）
-
-| 子类 | 示例 | 服务 |
+| 层级 | 表达 | 谁处理尾块 |
 |---|---|---|
-| lane shuffle / broadcast lane0 | tile 内通信 | B3 树归约、B4 scan |
-| interleave / deinterleave | 转置碎片 | B13、`transpose` |
-| compress / expand | 按 mask 压缩 | B14 |
+| **L0 声明式** | `elementwise(out, a, b, op)` / `reduce(out, in, dims, op)` | 框架 |
+| **L1 计划式** | `BroadcastPlan` / `ReducePlan`（collapse 后的 inner/outer） | 框架按 plan 选 BC*/RD* |
+| **L2 分流行** | 框架生成「整块循环 + 单次尾块」IR | 显式形态 B |
 
-C++26 标准 simd **弱于** ISPC/GPU 的 lane shuffle；实现全量动态 compact **必须** 补 I6 扩展或 lib 仿真。
+用户默认 L0；编译/运行时 lowering 到 L1/L2。
 
-### 4.7 I7 同步与协作（Sync）
+#### （2）表达原则
 
-| 子类 | 示例 | 服务 |
+1. **输出主导切块**：elementwise/broadcast 以输出线性域为 `L`，避免多输入各切各的。  
+2. **先 collapse，再发向量**：动态 shape 下每次 launch 做 dim 合并，把 BC3→BC0/2、RD3→RD1。  
+3. **整块无谓词**：`valid==TILE` 走 `load_full/store_full`；禁止在热循环里每次算 `lane_lt`。  
+4. **尾块至多一次（单段）**：形态 B；多段 reduce 则「每段至多一次尾块」。  
+5. **Reduce 中性元显式**：`neutral_of<Op,T>()`，尾块 `where(m,x,neutral)`，避免脏 lane 污染。  
+6. **短内维申报**：当 `inner < TILE` 占主导，plan 标记 `ShortInner`，换打包策略，而不是沉默低 η_vec。  
+7. **能力探测**：无硬件 mask store 则 T-Split；有 MMA 则进第 6 章，不走 elementwise 仿真。
+
+#### （3）推荐 IR 片段（示意）
+
+```text
+ElementwiseOp {
+  plan: collapse(out, inputs) -> {L, loads[]}
+  body:  FullTiles(L) { map(load_full*) -> store_full }
+         Tail(L)      { m=lane_lt(n_tail); map(load_m*) -> store_m }
+}
+
+ReduceOp {
+  plan: dims -> {outer, reduce_len, inner}  // 动态
+  body:  prefer inner-reduce (RD1);
+         each segment: FullTiles(reduce_len) + Tail with neutral
+}
+```
+
+#### （4）与易用性的折中
+
+| 表达选择 | 易用 | 性能发挥 |
 |---|---|---|
-| tile 内隐式同步 | 单 simd 操作 | 默认 |
-| block barrier | 多 tile 共享缓冲 | B3/B11/B9 |
-| grid / device sync | 多 kernel 两阶段 | A11 |
-
-### 4.8 I8 特殊函数与矩阵（Special / Tensor Core-like）
-
-| 子类 | 示例 | 服务 |
-|---|---|---|
-| 初等函数 | exp/log/sin/rsqrt | 激活、softmax |
-| RNG | philox 每 lane | B12 |
-| 矩阵块 MMA | 128×tile 外积 | B9/B10 |
-| 直方图 / sort 网络 | 局部 | B8 |
-
-### 4.9 Pattern → 指令需求映射表
-
-| Pattern | I1 | I2 | I3 | I4 | I5 | I6 | I7 | I8 |
-|---|---|---|---|---|---|---|---|---|
-| B1 Pointwise | ● | ● | | ● | | | | ○ |
-| B2 Broadcast EW | ● | ● | | ● | | | | |
-| B3 Reduce | ● | ● | ● | ● | | ○ | ○ | |
-| B4 Scan | ● | ● | ● | ● | | ● | ○ | |
-| B5 CmpSel | ● | ● | | ● | | | | |
-| B6/B7 Index | ● | ● | | ○ | ● | | ○ | |
-| B9/B10 GEMM/Conv | ● | ○ | ○ | ● | ○ | ○ | ● | ● |
-| B11 Norm/Softmax | ● | ● | ● | ● | | ○ | ● | ● |
-| B13 Layout | | ● | | ● | ○ | ● | | |
-| B14 Compact | ● | ● | ● | ● | | ● | ● | |
-
-● 必需　○ 强烈建议 / 性能路径
-
-### 4.10 最小指令集建议（MVP → 完整）
-
-**MVP（先打通全动态易用）**：I1 + I2 + I4(连续+mask) + I3(tile reduce)  
-→ 可实现绝大多数 pointwise / 全维 reduce / contiguous copy。
-
-**完整动态 shape**：MVP + I4 跨步 + I5 + I6(compress) + I3 跨 tile  
-→ gather/scatter/nonzero/cumsum/任意轴 reduce。
-
-**性能完备**：完整 + I7 block + I8 MMA/特殊函数  
-→ matmul/conv/softmax 训练推理主路径。
+| 全程统一 T-Mask 循环 | 最高 | 整块受 α_pred 拖累 |
+| L0 API + 内部形态 B | 高 | **佳平衡** |
+| 要求用户手写整块/尾块 | 低 | 高但不稳 |
+| 强制输入 pad 到 128 | 假易用 | 带宽与生态差，**禁止作契约** |
 
 ---
 
-## 5. 易用性评估
+## 6. 需专用处理的类别（专章）
 
-### 5.1 评分标准（1–5）
+以下 **不** 塞进通用 elementwise/broadcast/reduce 引擎；对外仍支持动态尺寸，对内独立模板或库。
 
-| 分 | 含义 |
-|---|---|
-| 5 | 用户写标量/一行 lambda；动态 shape 零心智负担 |
-| 4 | 需选引擎 API（reduce dim 等），仍无手写 mask |
-| 3 | 需理解 tile/mask 或二阶段；有样板可抄 |
-| 2 | 需专家 tile kernel；动态维易踩坑 |
-| 1 | 几乎必须专用内核生成器 / 图编译 |
+### 6.1 清单与理由
 
-### 5.2 分类评估表
-
-| 算子类别（A×B） | 表达易用性 | 动态 Shape 正确性难度 | 性能可达性 | 综合 | 说明 |
+| 类别 | 代表算子 | 为何专用 | 与 TILE=128 的关系 | 动态 shape | 建议表达 |
 |---|---|---|---|---|---|
-| Pointwise 无广播 (A1×B1) | 5 | 1（易） | 5 | **优秀** | L0 API 即可 |
-| Pointwise 广播 (A1×B2) | 5 | 2 | 4 | **优秀** | 框架藏 broadcast |
-| 激活 / 逐点三元 (B5) | 5 | 1 | 5 | **优秀** | mask blend |
-| 全维 / 简单维 reduce (A2×B3) | 4 | 2 | 4 | **良好** | 中性元+多 tile |
-| Softmax / LayerNorm (B11) | 3 | 3 | 3–4 | **中等** | 多遍；数值稳定 |
-| Contiguous copy / cat (B13) | 5 | 1 | 5 | **优秀** | ME |
-| Transpose / permute 高维 | 3 | 3 | 2–3 | **中等** | 依赖 I6/跨步 |
-| Gather/Embedding (B6) | 4 | 2 | 3 | **良好** | 需 I5 |
-| Scatter/index_add (B7) | 3 | 3 | 2–3 | **中等** | 冲突与原子 |
-| Cumsum (B4) | 3 | 3 | 3 | **中等** | 需 scan |
-| Nonzero/Unique (A11×B14) | 3 | 4 | 2–3 | **偏难** | 二阶段+同步 |
-| Matmul/BMM (B9) | 2 | 2（含动态 MNK） | 5（有 MMA） | **专家** | 不用裸 simd 手写 |
-| Conv (B10) | 2 | 3 | 4–5 | **专家** | 专用模板 |
-| Sort/TopK 全局 (B8) | 2 | 3 | 2–3 | **专家** | 库级算法 |
-| Composite (A8) | 5（分解后） | 1 | — | **优秀** | 不直写 |
+| **GEMM / 批量 GEMM** | `mm/bmm/addmm` | 需 MMA/分块；非 lane map | 块尺寸取 128 的因子 | M/N/K 动态 | `gemm_tiled` 库；禁止 simd 三层循环 |
+| **Convolution** | `conv1d/2d/3d` | 滑窗/im2col+GEMM | 同左 | NCHW 动态 | `conv` 模板 / winograd 等 |
+| **Attention 族** | SDPA / FlashAttn | 块状 softmax+GEMM 融合 | 序列维按 128 分块 | `seq` 动态 | 融合 kernel，不拆成通用 RD+GEMM naive |
+| **Normalize 融合** | `softmax/layer_norm/rms_norm` | 多遍 + 数值稳定 | 内维按 128 切；短内维专用 | 特征维动态 | `normalize_inner` 专用；可复用 RD1 尾块策略 |
+| **全局 Sort / TopK** | `sort/topk` | 跨 tile 归并网络 | 局部 128 位序网络 | `n` 动态 | 算法库 |
+| **Scan 全局** | `cumsum` 任意维 | 跨 tile 前缀依赖 | tile scan + 前缀传递 | 轴长动态 | `scan` 库；尾块用 mask+中性元 |
+| **Gather / Scatter / Index** | `gather/index_add/embedding` | 间接寻址、冲突 | 每 tile 128 个索引 | 索引长动态 | `gather/scatter` 引擎；尾块 T-Mask |
+| **Data-dependent 输出** | `nonzero/unique/masked_select` | 输出长度依赖数据 | compact 按 mask | 二阶段 | `count_then_write`；ballot/scan 扩展 |
+| **RNG 质量路径** | `randn/dropout` 大批量 | 计数器 RNG 对齐 | 128 lane 独立流 | shape 动态 | `rng_philox_tile` |
+| **Sparse / 混合布局** | sparse mm 等 | 索引结构特殊 | 视格式而定 | 动态nnz | 独立后端 |
+| **Fixed-rank 尚不可分解者** | 部分 legacy op | 维度语义绑死 | 仅 batch 动态 | 有限动态 | 逐 op 模板，能分解则降级到 §2 |
 
-### 5.3 「全量动态 Shape 易用性」总评
+### 6.2 专用类的尾块与性能
 
-| 目标 | 评估 |
-|---|---|
-| API 是否能让用户忘记 `TILE=128` | **能**（L0/L1）；L2 才暴露 |
-| 是否要求 `numel % 128 == 0` | **否**（I2 尾 mask 为硬需求） |
-| 任意 rank / 动态维 broadcast | **能**（运行时 desc + 线性索引） |
-| 一次编写、多后端（CPU simd / GPU / NPU） | **中高**：L0/L1 可移植；I5/I6/I8 需后端能力探测 |
-| 覆盖「写得出」vs「跑得快」 | 写得出：~80% 算子；跑得快：还需 XE 与融合 |
-| 相对手写 CUDA / 手写 AVX | 点对点算子 **明显更易**；GEMM 级 **不易替代** cuBLAS/专用库 |
-
-**综合结论**：
-
-- 在 `tile_len=128` + GPU-like mask 模型下，对 PyTorch **主体算子（pointwise / reduction / memory）实现全量动态 shape 的易用性为「高」**。
-- 对 **indexing / compact / scan** 为「中」，取决于 I5/I6 是否一等公民。
-- 对 **GEMM/Conv/Attention** 不应期待 C++26 simd 裸写达到易用；应提供 **同 tile 约束下的专家模板**，对外仍是动态 `M,N,K`。
-
-### 5.4 风险与缓解
-
-| 风险 | 影响 | 缓解 |
+| 类别 | 尾块策略 | 性能要点 |
 |---|---|---|
-| C++26 `where` 弱于真实谓词执行 | 分支算子性能差 | 后端 lowering 到原生 predication |
-| 固定 128 与物理宽度不整除 | 多余拆分开销 | 逻辑 tile；后端再切 physical VL |
-| 高 rank 索引计算重 | 广播点对点变慢 | 短路径：可合并维 / 运行时 collapse |
-| data-dependent shape 与图编译 | export/trace 失败 | 保留 ATen `dynamic_output_shape` 语义；二阶段 host 可见 size |
-| 过度统一导致 GEMM 退化 | 训练不可用 | Pattern XE 旁路，不走 PE |
+| GEMM/Conv/Attn | 边缘块（M/N/K 尾）独立 epilogue | 整块 MMA 满吞吐；边缘块允许较低 η_vec |
+| Softmax/Norm | 内维 T-Mask + 中性元 | 短特征维时 η_vec 差 → 专用打包 |
+| Sort/Scan | 末 tile mask | 延迟绑定，带宽次之 |
+| Gather/Scatter | 索引尾块 mask | 随机访问主导，η_bw 先天低 |
+| DynOut compact | 末 tile mask + 全局 sync | 两 kernel；测的是 scan/atomic 而非向量峰值 |
+
+### 6.3 专用类软件表达（建议）
+
+```text
+// 通用：声明式，框架负责整块/尾块
+elementwise(out, x, y, [](auto a, auto b){ return a+b; });
+reduce(out, x, dims={1}, op=sum);
+
+// 专用：显式领域 API，不伪装成 elementwise
+gemm(C, A, B, {.tile = 128});
+softmax_inner(out, in, /*dim=*/-1);
+nonzero_async(count, out, pred);   // 二阶段
+```
+
+原则：**专用类暴露领域名**；内部可复用 §4 尾块原语，但 **调度与寄存器/共享内存规划独立**。
 
 ---
 
-## 6. 推荐落地路线（与易用性对齐）
+## 7. 指令分类（面向通用路径 + 专用衔接）
 
-| Phase | 交付 | 解锁的 PyTorch 类 | 易用性目标 |
+| 类 | 名称 | 通用路径用途 | 尾块相关 |
 |---|---|---|---|
-| **P0** | `tile_t`/`mask_t` + L0 `pointwise` + 尾 mask | A1、A8 分解后的点对点 | 评分 5 |
-| **P1** | 运行时 broadcast + strided load | 非连续 / 广播 A1 | 评分 5 |
-| **P2** | Reduction Engine（含动态 dim） | A2、部分 B11 | 评分 4 |
-| **P3** | Gather/Scatter + Compact/Scan | A4 indexing、A11 | 评分 3–4 |
-| **P4** | Layout/transpose/cat | A5/A10 | 评分 4–5 |
-| **P5** | Expert GEMM/Conv/Norm tile 模板 | A3/B9/B10/B11 | 对外动态，对内专家 |
+| **I1** | 算术/逻辑/cast | elementwise | 仅作用于有效 lane |
+| **I2** | 谓词 / blend / masked 访存 | 尾块与 `where` | **T-Mask 核心** |
+| **I3** | 水平归约 / 跨 tile 合并 | RD* | 中性元 + 尾块 |
+| **I4** | 连续 / 跨步 访存 | BC* / layout | masked load/store |
+| **I5** | Gather/Scatter/Atomic | 第 6 章索引 | 索引尾块 |
+| **I6** | Shuffle / compress | 短行打包、compact | 提升短尾 η_vec |
+| **I7** | Block/grid 同步 | 多遍 reduce、专用融合 | 二阶段 dynout |
+| **I8** | 初等函数 / MMA / RNG | 激活；第 6 章 GEMM | MMA 边缘块 |
+
+**MVP（通用动态 shape）**：I1 + I2 + I4(连续+mask) + I3(tile reduce)。  
+**性能增强**：形态 B 分流、I4 跨步、I6 打包。  
+**专用完备**：I5 + I7 + I8。
 
 ---
 
-## 7. 附录
+## 8. 易用性评估（修订）
 
-### 7.1 与标准 / 生态的关系
+评分：5 = 只写标量语义；4 = 选 dim/plan；3 = 需理解尾块/二阶段；2 = 领域专家 API；1 = 生成器/图编译。
 
-| 项目 | 关系 |
-|---|---|
-| C++26 `std::datapar::simd` | Lane 级可移植原语 |
-| P0350 `execution::simd` | 可作 host 侧算法策略；设备侧仍用 tile kernel |
-| PyTorch TensorIterator | L0/L1 的语义对标 |
-| ISPC / CUDA / Triton | 易用性上限参考；本设计用库+固定 TILE 逼近 |
-| AscendC / NPU `kernel_operator_vec_*` | I1–I4 可直接映射；I5/I6 对齐 gather/scatter/brcb |
+| 类别 | 表达易用 | 动态 shape | 性能发挥（配合 §5 表达） | 综合 |
+|---|---|---|---|---|
+| Elementwise 对齐 (BC0) | 5 | 易 | 高（形态 B） | **优秀** |
+| 标量/末维广播 (BC1/2/5) | 5 | 易 | 高 | **优秀** |
+| 复杂广播 (BC3/4/6/7) | 4 | 中 | 中–高（取决于 collapse） | **良好** |
+| 内维/合并归约 (RD1/4/5) | 4 | 易 | 高 | **良好** |
+| 全维/外维/中间维 (RD0/2/3) | 4 | 中 | 中–高 | **良好** |
+| 短内维大量尾块 (RD1 短行) | 3 | 易 | **低**（需打包） | **中等** |
+| 多遍统计 (RD8→§6 Norm) | 3 | 中 | 中–高 | **中等** |
+| Layout copy | 5 | 易 | 高 | **优秀** |
+| 第 6 章 GEMM/Conv/Attn | 2 | 中（尺寸动态） | 很高（专用） | **专家** |
+| 第 6 章 DynOut / Sort | 2–3 | 难 | 中 | **专用** |
 
-### 7.2 `tile_len=128` 的含义澄清
-
-| 解释 | 何时采用 |
-|---|---|
-| 128 个 **元素**（与 dtype 无关） | 软件逻辑 tile（推荐默认） |
-| 128 **字节** | 映射 cache line / UB 块时 |
-| 128 个 **bit lanes** | 与 mask 寄存器讨论时需换算 |
-
-本文默认：**128 个元素 lanes**；`float` tile = 512B 逻辑载荷，后端可再切。
-
-### 7.3 参考
-
-- P1928R15：`std::simd` 并入 C++26  
-- cppreference：Data-parallel types (SIMD)  
-- ezyang：*A brief taxonomy of PyTorch operators by shape behavior*（2020）  
-- PyTorch `aten/src/ATen/native/tags.yaml`：`pointwise` / `reduction` / `dynamic_output_shape`  
+**总评**：通用路径在「L0 API + 内部整块/尾块分流 + collapse」下，**全量动态 shape 易用性高，且不牺牲整块峰值**；性能风险集中在 **短尾块密集** 与 **未合并的广播/归约轴**，应用 plan 与第 6 章打包/专用核化解。
 
 ---
 
-*文档性质：设计分析；不绑定具体仓库实现。可与 `npu_arch_kernel_operator_feature_simplify.md` 对照：后者是 AscendC 多 arch 实现收敛，本文是上层「固定 tile + 动态 shape」算子编程模型。*
+## 9. 落地顺序（简）
+
+| Phase | 内容 |
+|---|---|
+| P0 | Elementwise + 形态 B 尾块 + 度量 `η_vec/r_tail` |
+| P1 | Broadcast 场景 BC0–BC5（含 collapse） |
+| P2 | Reduce RD0/RD1/RD4/RD5 + 中性元尾块 |
+| P3 | RD2/RD3/RD6、BC6/BC7 短路径 |
+| P4 | 第 6 章：GEMM/Norm/Gather 等按需接入，复用尾块原语 |
+
+---
+
+## 10. 附录
+
+### 10.1 术语
+
+| 本文 | ATen / 文献别名 |
+|---|---|
+| **elementwise** | `pointwise` tag、逐元素 |
+| **tile / TILE** | 逻辑 SIMD 宽度 128 lanes |
+| **整块 / 尾块** | full tile / remainder epilogue |
+| **collapse** | 相邻维合并（TensorIterator 同类） |
+
+### 10.2 参考
+
+- C++26 data-parallel types（P1928）  
+- ezyang：PyTorch operators by shape behavior  
+- ATen `tags.yaml`（`pointwise`≡本文 elementwise；`reduction`；`dynamic_output_shape`）  
+
+---
+
+*修订要点：pointwise→elementwise；Broadcast/Reduce 多场景化；压缩算法叙述；尾块专章；性能度量与软件表达；专用类归入第 6 章。*
