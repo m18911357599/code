@@ -1,39 +1,56 @@
-# `dispatch.combine`：RDMA fullmesh 的 Write / Read 语义
+# `dispatch.combine`：RDMA fullmesh Write / Read
 
-> 范围：仅 `comm_alg=fullmesh`；跨卡通信只用 **RDMA Write** 与 **RDMA Read**。  
-> 不含 hierarchy / HCCS 中转；不含 Host 控制面。  
-> 记号：`BS`/`max_bs` 本卡 token 上界，`H` hidden，`K` topK，`E` 全局专家数，`R`=`ep_world_size`，`L`=`local_expert_num`（通常 `E/R`），`A` 本卡 recv token 上界。
+> 范围：仅 `comm_alg=fullmesh`；跨卡只用 **RDMA Write / Read**。不含 hierarchy。  
+> 结构：**Host 预置 → 源端 → 宿端 → 规格原因**。  
+> 术语：
+>
+> | 名称 | 含义 |
+> |---|---|
+> | **Host 预置** | 进程侧按公式备好对称窗与 `expand_x` 上界（只定容量，不跑路由） |
+> | **源端** | 持有自然序 token 的 Device rank（Gate / Dispatch 发出 / Combine 归约） |
+> | **宿端** | 持有目标专家的 Device rank（收 Write / 整理 / FFN / 回传） |
 
-对齐辅助：
+记号：`BS`/`max_bs`，`H`，`K`，`E`，`R=ep_world_size`，`L=local_expert_num`，`A`=本卡 recv 行上界。
 
 ```text
-Align32(x)  = ((x + 31)  / 32)  * 32
-Align512(x) = ((x + 511) / 512) * 512
-480Align512(x) = ((x + 479) / 480) * 512    # A3 fullmesh_v2
+Align32(x)     = ((x + 31)  / 32)  * 32
+Align512(x)    = ((x + 511) / 512) * 512
+480Align512(x) = ((x + 479) / 480) * 512
+```
+
+总览：
+
+```text
+Host 预置:  算 A、配 HCCL_BUFFSIZE、注册对称窗
+源端:       Matmul → TopK → map/dedup/pack → RDMA Write
+宿端:       poll → 按专家整理 → FFN → Write 回源 / 待 Read
+源端:       收齐回程 → Σ w·y → x_out
 ```
 
 ---
 
-## 0. fullmesh 通信模型
+## 1. Host 预置
 
-每对 rank 之间有直连 QP；每卡预注册对称窗（send/recv + flag）。  
-token 只发往 **目标专家所在卡**，无中间跳。
+只做数据面容量与窗布局；不扫 `expert_ids`、不拼 WQE。
+
+### 1.1 逻辑窗
 
 ```text
-Dispatch：源卡  --RDMA Write-->  专家卡 recv 窗
-Combine ：专家卡 --RDMA Write-->  源卡   combine 窗
-           或源卡 --RDMA Read -->  专家卡 send 窗（见 §5）
+每卡对称通信窗
+├── dispatch_recv[src][slot][H]   # 宿端被 Write
+├── dispatch_flag[src]
+├── combine_send[dst][slot][H]    # 宿端放专家输出（Read 源 或 Write 源）
+├── combine_recv[src][slot][H]    # 源端收回传（Write 回传时）
+└── combine_flag[…]
 ```
 
-本卡专家：本地拷贝，不进 RDMA。
+```text
+RDMA Write(Dispatch) → 对端 dispatch_recv
+RDMA Write(Combine)  → 对端 combine_recv
+RDMA Read (Combine)  → 读宿端 combine_send
+```
 
----
-
-## 1. 数据面 Buffer 大小
-
-fullmesh 数据面需要两类容量：**业务侧 expand 上界 `A`**，以及 **RDMA 对称通信窗**（`HCCL_BUFFSIZE` / `hccl_buffer_size`，单位 MB，未配时默认常为 200MB）。
-
-### 1.1 recv token 上界 `A`（expand_x 行数）
+### 1.2 `expand_x` 行上界 `A`
 
 ```text
 共享专家卡:  A = BS * shared_expert_num / shared_expert_rank_num
@@ -43,353 +60,224 @@ MoE 专家卡:
   global_bs != 0:  A >= global_bs * min(L, K)
 ```
 
-`expand_x` shape：`(A, H)`。量化时 elem 可为 int8，否则与 `x` 同 dtype。
+`expand_x`：`(A, H)`。
 
-### 1.2 逻辑窗拆分（单卡，示意）
+### 1.3 通信窗公式（`HCCL_BUFFSIZE` / `hccl_buffer_size`，MB）
 
-```text
-对称通信窗
-├── dispatch_recv : 被各 src RDMA Write 的 token 载荷
-├── dispatch_flag : 每 src 完成位 / 计数
-├── combine_send  : 本卡专家结果（供对端 Read，或作为 Write 源）
-├── combine_recv  : 收各专家卡回传（Write 回传路径）
-└── combine_flag  : 回程完成位
-```
-
-容量直觉（去重前上界，bf16/fp16 时 `elem_size=2`）：
+**Atlas A2 · fullmesh**
 
 ```text
-# 每卡 Dispatch 收窗上界（按专家槽展开）
-S_dispatch_payload >= L * max_bs * R * H * elem_size
-
-# Combine 回程：每 token 最多 K 路（局部 reduce 后可更小）
-S_combine_payload  >= K * max_bs * H * elem_size   # 另含 shared 时见下式
-
-# flag / meta 远小于 payload，公式里常打进 Align 与固定余量
+>= 2 * ( BS * R * min(L, K) * H * sizeof(uint16) + 2MB )
 ```
 
-实际以通信库公式为准（下列 1.3 / 1.4）；双缓冲时整体常乘 `2`。
-
-### 1.3 Atlas A2 · `comm_alg=fullmesh`
+**Atlas A3 · fullmesh_v1**（`""` 默认）
 
 ```text
-HCCL_BUFFSIZE
-  >= 2 * ( BS * R * min(L, K) * H * sizeof(uint16) + 2MB )
+>= 2 * (
+      L * max_bs * R * Align512( Align32(2*H) + 64 )
+    + (K + shared_expert_num) * max_bs * Align512(2*H)
+   )
 ```
 
-说明：
-
-- 外层 `2`：Dispatch / Combine（或双缓冲）各留一份量级。  
-- `sizeof(uint16)`：公式按 2 字节元计（与 fp16/bf16 载荷一致）。  
-- `+2MB`：flag / 对齐 / 通信库元数据余量（在括号内，再被 `2*`）。
-
-### 1.4 Atlas A3 · fullmesh（EP 域）
-
-**fullmesh_v1**（含 `comm_alg=""` 默认走 v1）：
+**Atlas A3 · fullmesh_v2**（需 `tp_world_size=1`）
 
 ```text
-HCCL_BUFFSIZE
-  >= 2 * (
-        L * max_bs * R * Align512( Align32(2 * H) + 64 )
-      + (K + shared_expert_num) * max_bs * Align512(2 * H)
-     )
+>= 2 * (
+      L * max_bs * R * 480Align512( Align32(2*H) + 64 )
+    + (K + shared_expert_num) * max_bs * Align512(2*H)
+   )
 ```
 
-**fullmesh_v2**（`tp_world_size=1` 时可用）：
-
-```text
-HCCL_BUFFSIZE
-  >= 2 * (
-        L * max_bs * R * 480Align512( Align32(2 * H) + 64 )
-      + (K + shared_expert_num) * max_bs * Align512(2 * H)
-     )
-```
-
-项含义：
-
-| 项 | 对应数据面 |
+| 公式块 | 窗 |
 |---|---|
-| `L * max_bs * R * Align512(Align32(2H)+64)` | 各 src → 本卡各 local expert 的 Dispatch 收窗（含 per-token 头 64B 量级） |
-| `(K + shared_expert_num) * max_bs * Align512(2H)` | Combine 回程 / 共享专家相关载荷 |
-| 外层 `2` | 双相 / Dispatch+Combine 窗 |
+| `L·max_bs·R·Align…(2H+64)` / A2 的 `BS·R·min(L,K)·H·2` | Dispatch 收窗 |
+| `(K+shared)·max_bs·Align512(2H)` / A2 括号内同源量级 | Combine 回程窗 |
+| 外层 `2` | 双相或 Dispatch+Combine |
 
-（若启用 TP 域另有公式，不在本文 fullmesh-EP 范围。）
-
-### 1.5 与 Write / Read 的对应
-
-```text
-RDMA Write(Dispatch)  写入对端  dispatch_recv  ⊆ 上式第一大项
-RDMA Write(Combine)   写入对端  combine_recv   ⊆ 上式第二项
-RDMA Read (Combine)   读本端   combine_send   ⊆ 同上第二项（窗复用，不另加一份满额时需实现保证生命周期不重叠）
-```
-
-配置约束：所有 EP rank 的 buffer 公式入参（`R,L,K,max_bs,H,…`）一致；过小会在运行期通信失败。
+各 EP rank 入参一致；默认未配时常按 200MB，过小则运行期失败。理由见 §4。
 
 ---
 
-## 2. 源端：Matmul → 选专家 → token 转换
+## 2. 源端
 
-源卡在发起任何 RDMA Write 之前，完成本地三条链：**门控 Matmul、选专家、token 布局转换**。  
-后两步把“自然序 token”变成“可 Write 的 (dst_rank, slot) 载荷”。
+持有 `x[BS,H]` 的 rank：本地出路由，再 **RDMA Write** 到宿端；回程后加权归约。
 
-### 2.1 总示意
-
-```text
-源卡 Device
-┌──────────────────────────────────────────────────────────────────────────┐
-│                                                                          │
-│  x[BS, H]                                                                │
-│     │                                                                    │
-│     │  ① Gate Matmul                                                     │
-│     ▼                                                                    │
-│  logits = x @ W_gateᵀ     →  [BS, E]                                     │
-│     │                                                                    │
-│     │  ② 选专家 (softmax + TopK)                                          │
-│     ▼                                                                    │
-│  expert_ids[BS, K]   expert_scales[BS, K]                                │
-│     │                      │                                             │
-│     │  ③ token 转换        │  (权重随路由走，Combine 再用)                 │
-│     │  map / dedup / pack  │                                             │
-│     ▼                      ▼                                             │
-│  send_buf[n_write, H]   meta(dst_rank, slot, src_tok, scales…)           │
-│     │                                                                    │
-│     │  ④ RDMA Write (fullmesh)                                           │
-│     ▼                                                                    │
-│  专家卡.dispatch_recv[src][slot]                                         │
-└──────────────────────────────────────────────────────────────────────────┘
-```
-
-### 2.2 ① Gate Matmul
+### 2.1 Matmul → 选专家 → token 转换
 
 ```text
-                    W_gate[E, H]
-                         │
-  token0 ──┐             │
-  token1 ──┼─ x[BS,H] ──►│◄── Matmul ──► logits[BS, E]
-  token2 ──┘             │                 │
-                         │            每行 E 个专家分
+x[BS,H]
+  │ ① Gate Matmul:  logits = x @ W_gateᵀ → [BS,E]     （布局仍为 token 序）
+  │ ② TopK:         expert_ids[BS,K], expert_scales[BS,K]
+  │                 e → (dst_rank, local_eid)=(e/L, e%L)
+  │ ③ 转换:         map → dedup → gather/pack
+  ▼
+send_buf[n_write,H] + meta(dst_rank, slot, src_tok, scales…)
+  │ ④ RDMA Write (fullmesh)
+  ▼
+宿端.dispatch_recv[src][slot]
 ```
-
-- 输入：本卡自然序 hidden `x[i,:] = token_i`。  
-- 输出：每个 token 对全部专家的分数；**仍按 token 行序**，未打乱。  
-- 通信无关：Matmul 纯本地，不产生 RDMA。
-
-### 2.3 ② 选专家
 
 ```text
-logits[BS, E]
-    │  softmax / sigmoid（按实现）
-    │  TopK → 每行取 K 个最大
-    ▼
-token0:  expert_ids[0]=[e2, e5, …]   scales[0]=[w2, w5, …]
-token1:  expert_ids[1]=[e0, e2, …]   scales[1]=[w0, w2, …]
-   …                 │
-                     ▼
-            e → (dst_rank, local_eid) = (e/L, e%L)
+                    W_gate[E,H]
+token0..BS-1 ─x──► Matmul ──► logits[BS,E] ──TopK──► ids/scales
+                                              │
+                    x[BS,H] ──────────────────┤
+                                              ▼
+                                         map / dedup / pack
+                                              │
+                                              ▼
+                                         RDMA Write × n_write
 ```
 
-小例子（`R=4, L=2, K=2`）：
+小例（`R=4,L=2,K=2`）：
 
 ```text
-token  expert_ids   dst_ranks(去重前)   dst_ranks(去重后)
-  t0    [0, 1]       [0, 0]              [0]        ← 同卡两专家，只 Write 1 次
-  t1    [2, 5]       [1, 2]              [1, 2]     ← 两次 Write
-  t2    [3, 4]       [1, 2]              [1, 2]
+token  expert_ids  dst 去重前   dst 去重后
+ t0    [0,1]       [0,0]       [0]      → Write ×1
+ t1    [2,5]       [1,2]       [1,2]    → Write ×2
+ t2    [3,4]       [1,2]       [1,2]    → Write ×2
 ```
 
-选专家输出是 **索引 + 权重**，不是已重排的激活；激活仍停在 `x`。
-
-### 2.4 ③ token 转换（自然序 → Write 载荷）
-
-把 `(x, expert_ids)` 转成 fullmesh Write 所需的 **紧凑 send 布局**：
-
-```text
-自然序 (token-major)              通信序 (rank-major, 已去重)
-─────────────────────             ─────────────────────────────
-x[0] ──► 专家 0,1 @rank0    \\
-x[1] ──► 专家 2@r1, 5@r2     }──►  pack
-x[2] ──► 专家 3@r1, 4@r2    /
-
-send_buf / WQE 列表（示意）:
-  Write#0: payload=x[0] → rank0.slot_a
-  Write#1: payload=x[1] → rank1.slot_b
-  Write#2: payload=x[1] → rank2.slot_c
-  Write#3: payload=x[2] → rank1.slot_d
-  Write#4: payload=x[2] → rank2.slot_e
-  （t0→rank0 仅一条；t0 在 rank0 上再 fan-out 到 local e0,e1）
-```
-
-转换三步（均在源卡）：
-
-| 步 | 做什么 | 输入 → 输出 |
-|---|---|---|
-| map | `expert_id → dst_rank / local_eid / remote_slot` | `expert_ids` → 描述符表 |
-| dedup | 同一 `(token, dst_rank)` 合并 | K 条路由 → ≤K 次 Write |
-| pack | gather `x[token]` 到注册窗 / send 视图 | `x[BS,H]` → `send_buf[n_write,H]` |
-
-```text
-         expert_ids                    x[BS,H]
-              │                           │
-              ▼                           │
-         ┌─────────┐                      │
-         │  map    │── dest 表 ──┐        │
-         └─────────┘             │        │
-              │                  ▼        ▼
-              ▼            ┌──────────────────┐
-         ┌─────────┐       │ gather / pack    │
-         │  dedup  │──────►│ send_buf + WQE   │──► RDMA Write
-         └─────────┘       └──────────────────┘
-              │
-              └──► assist / counts（给 Combine）
-```
-
-要点：
-
-- **Matmul 不改变 token 布局**；**选专家只产索引**；**转换才搬激活**。  
-- pack 目标应是 §1 已计入容量的注册窗（或 view），以便 Write 无额外 staging 窗。  
-- `expert_scales` 可随 meta 走或随 token 一并 Write，供远端/回程加权。
-
-### 2.5 与后续 RDMA 的衔接
-
-```text
-① Matmul     ② TopK        ③ 转换           ④ Write
-x → logits → ids/scales → send_buf+meta → 专家卡.dispatch_recv
-     本地         本地          本地            fullmesh
-```
-
----
-
-## 3. 选专家 → Write/Read 描述符
-
-§2.3–2.4 的 map 结果直接落到 WQE：
-
-```text
-e → dst_rank = e / L
-    local_eid = e % L
-    slot      = 远端 recv 窗内偏移（由 src_rank、token、去重序决定）
-```
-
-| 阶段 | 操作 | 本地地址 | 远端地址 |
-|---|---|---|---|
-| Dispatch | Write | `send_buf` 中该 token 行 | `dst_rank.dispatch_recv[src][slot]` |
-| Combine | Write 或 Read | 专家输出 / 源卡输出槽 | 对端 combine 窗对应 slot |
-
-同行 K 个 `expert_ids` 不重复；可选 mask 关掉无效槽，避免空 Write。
-
----
-
-## 4. 去重（减少 Write 次数）
-
-同一 token 的多个 expert 落在同一 `dst_rank` 时：
-
-```text
-ranks = unique(dst_rank(expert_ids[t,*]))
-for r in ranks:
-    RDMA Write token_t → r.dispatch_recv  一次
-# r 卡内再 fan-out 到各 local_eid 输入区
-```
-
-- Write 键：`(src_rank, token, dst_rank)`，不是 `(…, dst_expert)`。  
-- Combine 对称：同卡多专家输出可先本地加权，再 **一次** Write/Read 回源卡。
-
----
-
-## 5. Write / Read 语义（fullmesh 唯一数据面）
-
-### 5.1 对称 Buffer
-
-布局与容量见 **§1**。逻辑视图：
-
-```text
-rank r:
-  dispatch_recv[src][slot][H]   # 被源卡 Write
-  dispatch_flag[src]            # Write 完成通知（或写后原子加）
-  combine_send[dst][slot][H]    # 专家结果待取/待写
-  combine_recv[src][slot][H]    # 源卡收结果（Write 回传时）
-  combine_flag[…]
-```
-
-### 5.2 Dispatch = RDMA Write
-
-```text
-源卡:
-  1) §2 token 转换得到 send_buf / WQE
-  2) RDMA Write(local_token, remote=r.dispatch_recv[src][slot], len=H')
-  3) 写完后通知：Write flag 或带 immediate / 单独小 Write
-
-专家卡:
-  poll dispatch_flag 收齐预期 src
-  按 local_eid 整理 → expand_x[A,H] → FFN
-```
-
-语义：**推模型（push）**。发送方主动把数据推进远端 recv 窗；接收方只轮询完成位，不发起数据面 Read。
-
-### 5.3 Combine = RDMA Write（回写）或 RDMA Read（拉取）
-
-**Write 回传（常用 push）：**
-
-```text
-专家卡:  (可选本地加权) → RDMA Write → 源卡.combine_recv[expert_rank][slot]
-源卡:    poll combine_flag → Σ w·y → x_out[BS,H]
-```
-
-**Read 拉取（pull，语义等价、发起端在源卡）：**
-
-```text
-专家卡:  把 y 放进本卡 combine_send[src][slot]，置 ready flag
-源卡:    poll 对端 ready → RDMA Read(remote=combine_send, local=combine_recv)
-         → Σ w·y → x_out
-```
-
-| | RDMA Write（Combine） | RDMA Read（Combine） |
-|---|---|---|
-| 数据面发起方 | 专家卡 | 源卡 |
-| 远端窗角色 | 源卡 `combine_recv` 被写 | 专家卡 `combine_send` 被读 |
-| 完成通知 | 写 flag / 写后通知 | Read 完成 CQ + 对端 ready |
-| fullmesh 约束 | 直连到源卡，无中转 | 直连读专家卡，无中转 |
-
-Dispatch 固定 **Write**；Combine 在 Write/Read 二选一。
-
-### 5.4 与零拷贝的交界
-
-- §2 pack 的 `send_buf` 落在 §1 注册窗内（或 view），不再另开一份 payload 窗。  
-- FFN 若直接写 `combine_send`，Combine 的 Write/Read 无 Device staging。
-
----
-
-## 6. 远端收齐 → 整理 → 计算 → 回送（仅 Write/Read）
-
-```text
-① 收齐：poll 各 src 的 dispatch_flag（数据已由对端 Write 进本卡窗）
-② 整理：dispatch_recv → 按 local_eid 展开 expand_x（去重 token 本地 fan-out）
-③ 计算：FFN(expand_x 切片)
-④ 回送：
-     Write 路径: Write(y) → 源卡 combine_recv + flag
-     Read  路径: 发布 combine_send + ready，等源卡 Read
-⑤ 源卡: 对各专家回程槽做加权归约 → x_out
-```
-
----
-
-## 7. 端到端（单层）
-
-```text
-Src:       Matmul → TopK → map/dedup/pack
-Dispatch:  RDMA Write → (专家卡 poll)          〔窗容量见 §1〕
-Expert:    pack → FFN
-Combine:   RDMA Write 回源  或  源卡 RDMA Read
-Src:       reduce → x_out
-```
-
----
-
-## 8. 小结
-
-| 步骤 | fullmesh RDMA 语义 |
+| 步 | 输入 → 输出 |
 |---|---|
-| 数据面 Buffer | `A` 上界 + A2/A3 fullmesh `HCCL_BUFFSIZE` 公式（§1） |
-| 源端 Matmul | `x @ W_gate` → `logits[BS,E]`，布局仍为 token 自然序 |
-| 选专家 | TopK → `expert_ids/scales`；再 `e→(dst_rank,local_eid)` |
-| token 转换 | map + dedup + gather/pack → `send_buf` + WQE |
-| 写远端 buffer | Dispatch：**RDMA Write** 进专家卡 `dispatch_recv` |
-| 收齐整理计算回送 | poll → 整理 → FFN → Combine：**Write** 或 **Read** |
+| map | `expert_ids` → `(dst_rank, local_eid, slot)` |
+| dedup | 同 `(token,dst_rank)` 合并 → Write 次数 ≤K |
+| pack | `x[token]` → 注册窗内 `send_buf` |
+
+要点：Matmul 不改布局；选专家只产索引/权重；**转换才搬激活**。  
+Write 键：`(src_rank, token, dst_rank)`，不是 per-expert。
+
+### 2.2 Dispatch：RDMA Write
+
+```text
+for each deduped (t → r):
+  RDMA Write(send_buf[t], remote=r.dispatch_recv[src][slot])
+  通知: flag / immediate
+# 本卡专家: 本地拷贝，不进 RDMA
+```
+
+推模型：源端主动 Write；宿端只 poll，不发数据面 Read。
+
+### 2.3 Combine 归约（回程落源端）
+
+宿端回传完成后（§3.3）：
+
+```text
+poll combine_flag  (Write 回传)
+  或  RDMA Read(宿端.combine_send) 后本地完成
+Σ_k w_k * y_k  →  x_out[BS,H]
+```
+
+| Combine 模式 | 源端角色 |
+|---|---|
+| Write 回传 | 被动收 `combine_recv`，再 reduce |
+| Read 拉取 | 主动 Read 宿端 `combine_send`，再 reduce |
+
+---
+
+## 3. 宿端
+
+持有目标专家的 rank：收齐源端 Write → 按专家整理 → 计算 → 回送。
+
+### 3.1 收齐
+
+```text
+while 未收齐预期 src 的 dispatch_flag:
+  poll
+# 载荷已在本卡 dispatch_recv（由源端 Write 填入）
+```
+
+### 3.2 整理 + 计算
+
+```text
+dispatch_recv
+  → 按 local_eid 展开 / fan-out（去重 token 在本卡复制到多专家槽）
+  → expand_x[A,H]（有效行由 expert_token_nums 给出）
+  → 各 local expert FFN(expand_x 切片)
+```
+
+### 3.3 回送（Write 或待 Read）
+
+**Write 回传（push）**
+
+```text
+(可选) 同 token 多本地专家输出先按 scales 局部加权
+RDMA Write(y) → 源端.combine_recv[本卡][slot] + flag
+```
+
+**Read 拉取（pull，发起在源端）**
+
+```text
+把 y 写入本卡 combine_send[src][slot]，置 ready
+# 源端随后 RDMA Read 该窗
+```
+
+```text
+源端 ──Write──► 宿端.dispatch_recv ──整理/FFN──► combine_send/recv 路径
+                                              │
+                 ┌── Write 回传 ───────────────┘
+                 └── 或源端 Read(combine_send)
+```
+
+---
+
+## 4. 规格原因
+
+说明 §1 公式为何如此，而非调参经验堆砌。
+
+### 4.1 为何 `A ≥ BS·R·min(L,K)`（`global_bs=0`）
+
+- 最坏：每个 src 的每个 token，最多命中本卡 `min(L,K)` 个本地专家槽（TopK 与本地专家数取小）。  
+- `R` 个 src 都打满 → 行数上界 `BS·R·min(L,K)`。  
+- `global_bs≠0` 时用全局 token 上界替换 `BS·R`，避免各卡 BS 不齐时低估。  
+- 共享专家卡流量模型不同，故单独 `A=BS·shared/shared_ranks`。
+
+### 4.2 为何出现 `min(L,K)` 而非 `K` 或 `L`
+
+- 单 token 对本卡：选中专家数 ≤K，且本卡只有 L 个专家 → ≤`min(L,K)`。  
+- 用 `K` 会在 `L<K` 时高估；用 `L` 会在 `K<L` 时高估。  
+- A2 通信窗与 `A` 同用该因子，使 **业务 expand 与 RDMA 收窗同一悲观界**。
+
+### 4.3 为何 A2 用 `sizeof(uint16)` 且 `+2MB`，外层再 `×2`
+
+- fp16/bf16 载荷按 2B 计；公式写成 `uint16` 即此。  
+- `+2MB`：flag、小头、通信库对齐，避免纯 payload 估满后无余量。  
+- 外层 `×2`：Dispatch 与 Combine（或 ping-pong）各一份，防止同窗覆写。
+
+### 4.4 为何 A3 要 `Align32(2H)+64` 再 `Align512` / `480Align512`
+
+```text
+token 记录 ≈ Align32(2·H)     # 2B·H 载荷，32B 对齐
+           + 64               # per-token 头（索引/scale/flag 槽位）
+再 Align512 / 480Align512     # 匹配 RDMA/HCCL 块与多平面搬运粒度
+```
+
+- v1 用 `Align512`；v2 用 `480Align512` 适配另一套平面拼块，减小内部碎片（约束更严，如 K≤12、`tp=1`）。  
+- Combine 项 `(K+shared)·max_bs·Align512(2H)`：回程按「每 token 最多 K 路 + 共享专家」计，与源端归约扇入一致；局部 reduce 只减实际流量，**预置仍按上界**。
+
+### 4.5 为何预置按上界、运行按去重
+
+| | 预置（Host） | 运行（源/宿端） |
+|---|---|---|
+| 目标 | 永不因窗小失败 | 少 Write、少字节 |
+| 计数 | `min(L,K)` 满扇出 | 按 `(token,dst_rank)` 去重 |
+| 结果 | `A` 与 `HCCL_BUFFSIZE` 偏大但稳定 | `n_write ≤ BS·K`，常远小于上界 |
+
+去重不能缩小预置公式：最坏路由仍可能接近满上界（专家均匀打到各卡且少碰撞）。
+
+### 4.6 为何 Dispatch 只用 Write、Combine 允许 Read
+
+- Dispatch：宿端在收齐前无有效数据可被 Read；Write 推送与 flag 轮询最简单。  
+- Combine：专家输出已在宿端，Write 回源或源端 Read 语义等价；Read 便于源端调度拉取节奏，Write 便于宿端算完即推。  
+- 两种 Combine 复用同一量级回程窗（§1.3），故规格不因选 Write/Read 再翻倍，但实现须保证 send/recv 生命周期不双开满额。
+
+---
+
+## 5. 对照小结
+
+| 段落 | 做什么 |
+|---|---|
+| **Host 预置** | 定 `A`、配 fullmesh 窗公式、注册 `dispatch_*` / `combine_*` |
+| **源端** | Matmul → TopK → map/dedup/pack → **Write**；回程 reduce → `x_out` |
+| **宿端** | poll 收齐 → 按专家整理 → FFN → **Write 回传** 或 **待 Read** |
+| **规格原因** | `min(L,K)`、Align、`×2`、上界预置 vs 去重运行 |
