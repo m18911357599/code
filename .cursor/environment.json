@@ -1,0 +1,17 @@
+{
+  "name": "code docs",
+  "install": "bash .cursor/install.sh",
+  "terminals": [
+    {
+      "name": "mkdocs-serve",
+      "command": "./.venv/bin/mkdocs serve -a 0.0.0.0:8000",
+      "description": "MkDocs dev server for the documentation site (http://localhost:8000)."
+    }
+  ],
+  "ports": [
+    {
+      "name": "docs",
+      "port": 8000
+    }
+  ]
+}
