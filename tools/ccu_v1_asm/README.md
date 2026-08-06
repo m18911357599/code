@@ -71,5 +71,4 @@ TRANS_LOC_MEM_TO_LOC_MS slice0, src, offset, offset, peer, 0, 1, done, 0x1, 0, 0
 c/include/ccu_v1_isa.h ccu_v1_asm.h ccu_v1_vasm.h
 c/src/isa.c asm.c vasm.c cli.c
 examples/all_opcodes.s vars_reuse.s
-python_ref/   # 可选参考实现
 ```
