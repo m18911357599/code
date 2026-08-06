@@ -414,6 +414,8 @@ typedef struct {
     uint8_t type;
     uint16_t code;
     CcuV1OpcodeId id;
+    const char *const *operands; /* positional operand names, NULL-terminated */
+    int nop;                     /* operand count */
 } CcuV1OpcodeDesc;
 
 const CcuV1OpcodeDesc *ccu_v1_opcodes(void);

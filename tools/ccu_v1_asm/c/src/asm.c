@@ -219,73 +219,141 @@ static int parse_list(const char *s, const char *end, OpKV *kv)
     return -1;
 }
 
-static int parse_operands(const char *line, OpMap *map, char *errmsg, size_t errmsg_sz)
+static int looks_named_operands(const char *p)
+{
+    p = skip_ws(p);
+    if (*p == '\0' || *p == '#') {
+        return 0;
+    }
+    if (!(isalpha((unsigned char)*p) || *p == '_')) {
+        return 0;
+    }
+    while (*p && (isalnum((unsigned char)*p) || *p == '_')) {
+        ++p;
+    }
+    return *p == '=';
+}
+
+static int parse_one_value_token(const char **pp, OpKV *kv, const char *field_name, char *errmsg, size_t errmsg_sz)
+{
+    const char *p = skip_ws(*pp);
+    kv->is_list = 0;
+    kv->scalar = 0;
+    kv->list_n = 0;
+    snprintf(kv->name, sizeof(kv->name), "%s", field_name);
+    if (*p == '[') {
+        const char *lb = p;
+        while (*p && *p != ']') {
+            ++p;
+        }
+        if (*p != ']') {
+            snprintf(errmsg, errmsg_sz, "unclosed list in %s", field_name);
+            return -1;
+        }
+        ++p;
+        if (parse_list(lb, p, kv) != 0) {
+            snprintf(errmsg, errmsg_sz, "bad list for %s", field_name);
+            return -1;
+        }
+    } else {
+        const char *v0 = p;
+        while (*p && *p != ',' && *p != '#' && *p != ' ' && *p != '\t') {
+            ++p;
+        }
+        if (parse_u64(v0, p, &kv->scalar) != 0) {
+            snprintf(errmsg, errmsg_sz, "bad value for %s", field_name);
+            return -1;
+        }
+    }
+    *pp = skip_ws(p);
+    return 0;
+}
+
+static int parse_operands(const char *line, const CcuV1OpcodeDesc *desc, OpMap *map, char *errmsg, size_t errmsg_sz)
 {
     opmap_init(map);
     const char *p = skip_ws(line);
     if (*p == '\0' || *p == '#') {
+        if (desc->nop != 0) {
+            /* allow empty only if nop==0; all our ops have operands — treat as all-default? reject. */
+            snprintf(errmsg, errmsg_sz, "missing operands for %s (need %d)", desc->mnemonic, desc->nop);
+            return -1;
+        }
         return 0;
     }
-    while (*p) {
+
+    if (looks_named_operands(p)) {
+        /* Legacy named form: name=value, ... (still accepted) */
+        while (*p) {
+            if (map->count >= MAX_OPS) {
+                snprintf(errmsg, errmsg_sz, "too many operands");
+                return -1;
+            }
+            const char *n0 = p;
+            while (*p && (isalnum((unsigned char)*p) || *p == '_')) {
+                ++p;
+            }
+            if (p == n0 || *p != '=') {
+                snprintf(errmsg, errmsg_sz, "expected name=value near '%s'", n0);
+                return -1;
+            }
+            size_t nlen = (size_t)(p - n0);
+            if (nlen >= MAX_NAME) {
+                snprintf(errmsg, errmsg_sz, "operand name too long");
+                return -1;
+            }
+            char fname[MAX_NAME];
+            memcpy(fname, n0, nlen);
+            fname[nlen] = '\0';
+            ++p;
+            OpKV *kv = &map->items[map->count];
+            if (parse_one_value_token(&p, kv, fname, errmsg, errmsg_sz) != 0) {
+                return -1;
+            }
+            map->count++;
+            if (*p == ',') {
+                ++p;
+                p = skip_ws(p);
+                continue;
+            }
+            if (*p == '\0' || *p == '#') {
+                return 0;
+            }
+            snprintf(errmsg, errmsg_sz, "unexpected text near '%s'", p);
+            return -1;
+        }
+        return 0;
+    }
+
+    /* Positional form: v0, v1, ... matching desc->operands */
+    for (int i = 0; i < desc->nop; ++i) {
+        if (*p == '\0' || *p == '#') {
+            snprintf(errmsg, errmsg_sz, "%s: missing operand %d (%s)", desc->mnemonic, i, desc->operands[i]);
+            return -1;
+        }
         if (map->count >= MAX_OPS) {
             snprintf(errmsg, errmsg_sz, "too many operands");
             return -1;
         }
-        const char *n0 = p;
-        while (*p && (isalnum((unsigned char)*p) || *p == '_')) {
-            ++p;
-        }
-        if (p == n0 || *p != '=') {
-            snprintf(errmsg, errmsg_sz, "expected name=value near '%s'", n0);
-            return -1;
-        }
-        size_t nlen = (size_t)(p - n0);
-        if (nlen >= MAX_NAME) {
-            snprintf(errmsg, errmsg_sz, "operand name too long");
-            return -1;
-        }
         OpKV *kv = &map->items[map->count];
-        memcpy(kv->name, n0, nlen);
-        kv->name[nlen] = '\0';
-        kv->is_list = 0;
-        kv->scalar = 0;
-        kv->list_n = 0;
-        ++p;
-        p = skip_ws(p);
-        if (*p == '[') {
-            const char *lb = p;
-            while (*p && *p != ']') {
-                ++p;
-            }
-            if (*p != ']') {
-                snprintf(errmsg, errmsg_sz, "unclosed list in %s", kv->name);
-                return -1;
-            }
-            ++p;
-            if (parse_list(lb, p, kv) != 0) {
-                snprintf(errmsg, errmsg_sz, "bad list for %s", kv->name);
-                return -1;
-            }
-        } else {
-            const char *v0 = p;
-            while (*p && *p != ',' && *p != '#' && *p != ' ' && *p != '\t') {
-                ++p;
-            }
-            if (parse_u64(v0, p, &kv->scalar) != 0) {
-                snprintf(errmsg, errmsg_sz, "bad value for %s", kv->name);
-                return -1;
-            }
+        if (parse_one_value_token(&p, kv, desc->operands[i], errmsg, errmsg_sz) != 0) {
+            return -1;
         }
         map->count++;
-        p = skip_ws(p);
-        if (*p == ',') {
+        if (i + 1 < desc->nop) {
+            if (*p != ',') {
+                snprintf(errmsg, errmsg_sz, "%s: expected ',' after %s", desc->mnemonic, desc->operands[i]);
+                return -1;
+            }
             ++p;
             p = skip_ws(p);
-            continue;
         }
-        if (*p == '\0' || *p == '#') {
-            return 0;
-        }
+    }
+    if (*p == ',') {
+        snprintf(errmsg, errmsg_sz, "%s: too many operands", desc->mnemonic);
+        return -1;
+    }
+    if (*p != '\0' && *p != '#') {
         snprintf(errmsg, errmsg_sz, "unexpected text near '%s'", p);
         return -1;
     }
@@ -665,7 +733,7 @@ static int assemble_line(const char *line, int lineno, CcuV1Instr *out, char *er
     }
     OpMap map;
     char local_err[128];
-    if (parse_operands(p, &map, local_err, sizeof(local_err)) != 0) {
+    if (parse_operands(p, desc, &map, local_err, sizeof(local_err)) != 0) {
         snprintf(errmsg, errmsg_sz, "line %d: %s", lineno, local_err);
         return -1;
     }
@@ -774,19 +842,38 @@ int ccu_v1_format_instr(const CcuV1Instr *instr, char *buf, size_t buf_sz)
         return -1;
     }
     int pos = 0;
+    int first = 1;
     if (appendf(buf, buf_sz, &pos, "%s", desc->mnemonic) != 0) {
         return -1;
     }
 
-#define SEP() appendf(buf, buf_sz, &pos, (pos > (int)strlen(desc->mnemonic)) ? ", " : " ")
+#define SEP()                                                                                                          \
+    do {                                                                                                               \
+        if (appendf(buf, buf_sz, &pos, first ? " " : ", ") != 0)                                                       \
+            return -1;                                                                                                 \
+        first = 0;                                                                                                     \
+    } while (0)
 #define U16(name, v)                                                                                                   \
     do {                                                                                                               \
-        if (SEP() != 0 || appendf(buf, buf_sz, &pos, "%s=%u", name, (unsigned)(v)) != 0)                               \
+        (void)(name);                                                                                                  \
+        SEP();                                                                                                         \
+        if (appendf(buf, buf_sz, &pos, "%u", (unsigned)(v)) != 0)                                                      \
             return -1;                                                                                                 \
     } while (0)
 #define HEX(name, v)                                                                                                   \
     do {                                                                                                               \
-        if (SEP() != 0 || appendf(buf, buf_sz, &pos, "%s=0x%llx", name, (unsigned long long)(v)) != 0)                  \
+        (void)(name);                                                                                                  \
+        SEP();                                                                                                         \
+        if (appendf(buf, buf_sz, &pos, "0x%llx", (unsigned long long)(v)) != 0)                                        \
+            return -1;                                                                                                 \
+    } while (0)
+#define MSLIST(name, msarr)                                                                                            \
+    do {                                                                                                               \
+        (void)(name);                                                                                                  \
+        char msbuf[128];                                                                                               \
+        fmt_ms(msbuf, sizeof(msbuf), msarr);                                                                           \
+        SEP();                                                                                                         \
+        if (appendf(buf, buf_sz, &pos, "%s", msbuf) != 0)                                                              \
             return -1;                                                                                                 \
     } while (0)
 
@@ -1006,11 +1093,7 @@ int ccu_v1_format_instr(const CcuV1Instr *instr, char *buf, size_t buf_sz)
         HEX("wait_mask", instr->sync_xn.wait_mask);
         break;
     case CCU_V1_OP_ADD: {
-        char msbuf[128];
-        fmt_ms(msbuf, sizeof(msbuf), instr->add.ms);
-        if (SEP() != 0 || appendf(buf, buf_sz, &pos, "ms=%s", msbuf) != 0) {
-            return -1;
-        }
+        MSLIST("ms", instr->add.ms);
         U16("count", instr->add.count);
         U16("cast", instr->add.cast);
         U16("dtype", instr->add.dtype);
@@ -1024,11 +1107,7 @@ int ccu_v1_format_instr(const CcuV1Instr *instr, char *buf, size_t buf_sz)
     }
     case CCU_V1_OP_MAX:
     case CCU_V1_OP_MIN: {
-        char msbuf[128];
-        fmt_ms(msbuf, sizeof(msbuf), instr->maxmin.ms);
-        if (SEP() != 0 || appendf(buf, buf_sz, &pos, "ms=%s", msbuf) != 0) {
-            return -1;
-        }
+        MSLIST("ms", instr->maxmin.ms);
         U16("count", instr->maxmin.count);
         U16("dtype", instr->maxmin.dtype);
         U16("len_xn", instr->maxmin.len_xn);
@@ -1045,6 +1124,7 @@ int ccu_v1_format_instr(const CcuV1Instr *instr, char *buf, size_t buf_sz)
 #undef SEP
 #undef U16
 #undef HEX
+#undef MSLIST
     if (pos >= (int)buf_sz) {
         return -1;
     }

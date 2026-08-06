@@ -30,25 +30,32 @@ make -j && make test
 ./build/ccu_v1_asm verify-vasm ../examples/vars_reuse.s
 ```
 
-## 变量汇编语法
+## 汇编语法（位置操作数）
+
+默认去掉 `field=`，按助记符规范顺序书写（更快解析）：
 
 ```asm
-# 声明（可省略，首次使用时按操作数字段自动推断类型）
+LOAD_IMD_TO_XN offset, 0x1000, 0
+# 等价旧写法: LOAD_IMD_TO_XN xn=offset, imm=0x1000, sec=0
+```
+
+## 变量汇编
+
+```asm
 .xn  offset
 .gsa src
 .ms  slice0
 .cke done
 .ch  peer
-.var xn pinned_reg = 3   # 固定物理 id（pinned，不参与复用抢占该 id 的冲突区间）
+.var xn pinned_reg = 3   # 固定物理 id
 
-LOAD_IMD_TO_XN xn=offset, imm=0x1000, sec=0
-TRANS_LOC_MEM_TO_LOC_MS ms=slice0, gsa=src, xn=offset, len_xn=offset, ch=peer, \
-  clear=0, len_en=1, set_id=done, set_mask=0x1, wait_id=0, wait_mask=0
+LOAD_IMD_TO_XN offset, 0x1000, 0
+TRANS_LOC_MEM_TO_LOC_MS slice0, src, offset, offset, peer, 0, 1, done, 0x1, 0, 0
 ```
 
-- 资源操作数字段中的**标识符** → 变量（自动分配物理 id）
-- **数字字面量** → 直接编码（不进入分配器）
-- 字段→类型：`xn/xd/xm/len_xn/...`→xn，`gsa/gsad/...`→gsa，`ms/...`→ms，`set_id/wait_id/...`→cke，`ch`→ch，`sqe`→sqe
+- 位置上的**标识符** → 变量（自动分配物理 id）；**数字** → 字面量
+- 仍兼容 `name=value` 旧语法
+- 操作数顺序见 `c/src/isa.c` 的 `k_ops_*`
 
 ### ID 生命周期与复用
 

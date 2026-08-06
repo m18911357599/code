@@ -451,30 +451,94 @@ static int parse_insn_line(const char *line, int lineno, VasmInsn *out, char *er
         return -1;
     }
     p = skip_ws(p);
-    while (*p && *p != '#') {
+
+    /* Detect named (legacy) vs positional */
+    int named = 0;
+    {
+        const char *t = p;
+        if (*t && *t != '#' && is_ident_start(*t)) {
+            while (*t && is_ident(*t)) {
+                ++t;
+            }
+            named = (*t == '=');
+        }
+    }
+
+    if (named) {
+        while (*p && *p != '#') {
+            if (out->op_count >= MAX_OPS_PER_INSN) {
+                snprintf(errmsg, errmsg_sz, "line %d: too many operands", lineno);
+                return -1;
+            }
+            VasmOp *op = &out->ops[out->op_count];
+            memset(op, 0, sizeof(*op));
+            const char *n0 = p;
+            while (*p && is_ident(*p)) {
+                ++p;
+            }
+            if (p == n0 || *p != '=') {
+                snprintf(errmsg, errmsg_sz, "line %d: expected name=value", lineno);
+                return -1;
+            }
+            size_t nlen = (size_t)(p - n0);
+            if (nlen >= MAX_NAME) {
+                snprintf(errmsg, errmsg_sz, "line %d: field name too long", lineno);
+                return -1;
+            }
+            memcpy(op->field, n0, nlen);
+            op->field[nlen] = '\0';
+            ++p;
+            p = skip_ws(p);
+            const char *v0 = p;
+            if (*p == '[') {
+                while (*p && *p != ']') {
+                    ++p;
+                }
+                if (*p != ']') {
+                    snprintf(errmsg, errmsg_sz, "line %d: unclosed list", lineno);
+                    return -1;
+                }
+                ++p;
+            } else {
+                while (*p && *p != ',' && *p != '#' && *p != ' ' && *p != '\t') {
+                    ++p;
+                }
+            }
+            char local[128];
+            if (parse_op_value(v0, p, op, 0, local, sizeof(local)) != 0) {
+                snprintf(errmsg, errmsg_sz, "line %d: %s", lineno, local);
+                return -1;
+            }
+            out->op_count++;
+            p = skip_ws(p);
+            if (*p == ',') {
+                ++p;
+                p = skip_ws(p);
+                continue;
+            }
+            if (*p == '\0' || *p == '#') {
+                break;
+            }
+            snprintf(errmsg, errmsg_sz, "line %d: unexpected text", lineno);
+            return -1;
+        }
+        return 0;
+    }
+
+    /* Positional: values in desc->operands order */
+    for (int i = 0; i < out->desc->nop; ++i) {
+        if (*p == '\0' || *p == '#') {
+            snprintf(errmsg, errmsg_sz, "line %d: %s missing operand %d (%s)", lineno, out->desc->mnemonic, i,
+                     out->desc->operands[i]);
+            return -1;
+        }
         if (out->op_count >= MAX_OPS_PER_INSN) {
             snprintf(errmsg, errmsg_sz, "line %d: too many operands", lineno);
             return -1;
         }
         VasmOp *op = &out->ops[out->op_count];
         memset(op, 0, sizeof(*op));
-        const char *n0 = p;
-        while (*p && is_ident(*p)) {
-            ++p;
-        }
-        if (p == n0 || *p != '=') {
-            snprintf(errmsg, errmsg_sz, "line %d: expected name=value", lineno);
-            return -1;
-        }
-        size_t nlen = (size_t)(p - n0);
-        if (nlen >= MAX_NAME) {
-            snprintf(errmsg, errmsg_sz, "line %d: field name too long", lineno);
-            return -1;
-        }
-        memcpy(op->field, n0, nlen);
-        op->field[nlen] = '\0';
-        ++p;
-        p = skip_ws(p);
+        snprintf(op->field, sizeof(op->field), "%s", out->desc->operands[i]);
         const char *v0 = p;
         if (*p == '[') {
             while (*p && *p != ']') {
@@ -497,14 +561,20 @@ static int parse_insn_line(const char *line, int lineno, VasmInsn *out, char *er
         }
         out->op_count++;
         p = skip_ws(p);
-        if (*p == ',') {
+        if (i + 1 < out->desc->nop) {
+            if (*p != ',') {
+                snprintf(errmsg, errmsg_sz, "line %d: expected ',' after operand %s", lineno, op->field);
+                return -1;
+            }
             ++p;
             p = skip_ws(p);
-            continue;
         }
-        if (*p == '\0' || *p == '#') {
-            break;
-        }
+    }
+    if (*p == ',') {
+        snprintf(errmsg, errmsg_sz, "line %d: too many operands", lineno);
+        return -1;
+    }
+    if (*p && *p != '#') {
         snprintf(errmsg, errmsg_sz, "line %d: unexpected text", lineno);
         return -1;
     }
@@ -722,11 +792,24 @@ static int lower_to_text(CcuV1VasmResult *r, const VasmIr *ir, char *errmsg, siz
         char line[2048];
         int pos = 0;
         pos += snprintf(line + pos, sizeof(line) - (size_t)pos, "%s", ins->desc->mnemonic);
-        for (int o = 0; o < ins->op_count; ++o) {
-            const VasmOp *op = &ins->ops[o];
-            pos += snprintf(line + pos, sizeof(line) - (size_t)pos, "%s%s=", o ? ", " : " ", op->field);
+        /* Emit in canonical positional order for fast second-stage assemble */
+        for (int oi = 0; oi < ins->desc->nop; ++oi) {
+            const char *fname = ins->desc->operands[oi];
+            const VasmOp *op = NULL;
+            for (int o = 0; o < ins->op_count; ++o) {
+                if (strcmp(ins->ops[o].field, fname) == 0) {
+                    op = &ins->ops[o];
+                    break;
+                }
+            }
+            pos += snprintf(line + pos, sizeof(line) - (size_t)pos, "%s", oi ? ", " : " ");
+            if (!op) {
+                /* missing → 0 (should not happen after positional parse) */
+                pos += snprintf(line + pos, sizeof(line) - (size_t)pos, "0");
+                continue;
+            }
             if (op->kind == OP_IMM) {
-                if (!strcmp(op->field, "imm") || !strcmp(op->field, "expect") || strstr(op->field, "mask")) {
+                if (!strcmp(fname, "imm") || !strcmp(fname, "expect") || strstr(fname, "mask")) {
                     pos += snprintf(line + pos, sizeof(line) - (size_t)pos, "0x%llx", (unsigned long long)op->imm);
                 } else {
                     pos += snprintf(line + pos, sizeof(line) - (size_t)pos, "%llu", (unsigned long long)op->imm);
