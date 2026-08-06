@@ -9,6 +9,8 @@
 #include <stdlib.h>
 #include <string.h>
 
+__thread CcuV1CasmCtx *ccu_v1_casm_tls;
+
 void ccu_v1_casm_init(CcuV1CasmCtx *ctx)
 {
     assert(ctx);
@@ -27,24 +29,19 @@ void ccu_v1_casm_free(CcuV1CasmCtx *ctx)
     ctx->failed = 0;
 }
 
-static __thread CcuV1CasmCtx *g_casm_current;
-
 void ccu_v1_casm_begin(CcuV1CasmCtx *ctx)
 {
     assert(ctx);
-    assert(g_casm_current == NULL);
-    g_casm_current = ctx;
+    assert(ccu_v1_casm_tls == NULL);
+    /* Pre-reserve zeroed slots once — emit only bumps on the hot path. */
+    assert(ccu_v1_program_reserve(&ctx->program, CCU_V1_CASM_INIT_CAP) == 0);
+    ccu_v1_casm_tls = ctx;
 }
 
 void ccu_v1_casm_end(void)
 {
-    assert(g_casm_current != NULL);
-    g_casm_current = NULL;
-}
-
-CcuV1CasmCtx *ccu_v1_casm_current(void)
-{
-    return g_casm_current;
+    assert(ccu_v1_casm_tls != NULL);
+    ccu_v1_casm_tls = NULL;
 }
 
 void ccu_v1_casm_run(CcuV1CasmCtx *ctx, void (*entry)(void))
@@ -55,6 +52,12 @@ void ccu_v1_casm_run(CcuV1CasmCtx *ctx, void (*entry)(void))
     entry();
     ccu_v1_casm_end();
     assert(!ctx->failed);
+}
+
+void ccu_v1_casm_grow(CcuV1CasmCtx *ctx)
+{
+    assert(ctx);
+    assert(ccu_v1_program_reserve(&ctx->program, ctx->program.count + 1) == 0);
 }
 
 void ccu_v1_casm_write_file(const CcuV1CasmCtx *ctx, const char *path)
@@ -71,31 +74,12 @@ void ccu_v1_casm_write_file(const CcuV1CasmCtx *ctx, const char *path)
     fclose(f);
 }
 
-void ccu_v1_casm_emit(CcuV1CasmCtx *ctx, uint8_t type, uint16_t code)
-{
-    assert(ctx);
-    assert(ccu_v1_program_reserve(&ctx->program, ctx->program.count + 1) == 0);
-    CcuV1Instr *inst = &ctx->program.items[ctx->program.count++];
-    /* Slot already zeroed in program_reserve; only set header. */
-    inst->header.raw = ccu_v1_make_header(type, code);
-    ctx->inst = inst;
-}
-
 static void append_instr(CcuV1CasmCtx *ctx, const CcuV1Instr *instr)
 {
     assert(ctx);
     assert(instr);
-    ccu_v1_casm_emit(ctx, 0, 0);
-    *ctx->inst = *instr;
-}
-
-void ccu_v1_casm_loop(CcuV1CasmCtx *ctx, uint16_t start, uint16_t end, uint16_t xn)
-{
-    assert(ctx);
-    ccu_v1_casm_emit(ctx, CCU_V1_CTRL_TYPE, 0x0);
-    ctx->inst->loop.start = start;
-    ctx->inst->loop.end = end;
-    ctx->inst->loop.xn = xn;
+    CcuV1Instr *dst = ccu_v1_casm_emit(ctx, 0, 0);
+    *dst = *instr;
 }
 
 static void name_to_mnemonic(const char *name, char *out, size_t out_sz)
@@ -507,6 +491,10 @@ int ccu_v1_casm_compile(const char *text, size_t text_len, CcuV1CasmCtx *ctx)
     }
     ccu_v1_casm_free(ctx);
     ccu_v1_casm_init(ctx);
+    if (ccu_v1_program_reserve(&ctx->program, CCU_V1_CASM_INIT_CAP) != 0) {
+        snprintf(ctx->errmsg, sizeof(ctx->errmsg), "oom");
+        return -1;
+    }
 
     Parser ps = {.p = text, .end = text + text_len, .line = 1, .ctx = ctx};
     if (parse_main(&ps) != 0) {
