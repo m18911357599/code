@@ -38,7 +38,11 @@ int main(int argc, char **argv)
     ccu_v1_casm_run(&ctx, ccu_user_main);
 
     /* write packed instruction bytes directly to file */
-    ccu_v1_casm_write_file(&ctx, out_path);
+    if (ccu_v1_casm_write_file(&ctx, out_path) != 0) {
+        fprintf(stderr, "error: cannot write %s\n", out_path);
+        ccu_v1_casm_free(&ctx);
+        return 2;
+    }
 
     printf("casm_host: %zu instructions -> %s (%zu bytes)\n", ctx.program.count, out_path,
            ctx.program.count * (size_t)CCU_V1_INSTR_SIZE);

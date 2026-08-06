@@ -33,8 +33,10 @@ void ccu_v1_casm_begin(CcuV1CasmCtx *ctx)
 {
     assert(ctx);
     assert(ccu_v1_casm_tls == NULL);
-    /* Pre-reserve zeroed slots once — emit only bumps on the hot path. */
-    assert(ccu_v1_program_reserve(&ctx->program, CCU_V1_CASM_INIT_CAP) == 0);
+    /* Pre-reserve zeroed slots once — must always run (not inside assert). */
+    if (ccu_v1_program_reserve(&ctx->program, CCU_V1_CASM_INIT_CAP) != 0) {
+        abort();
+    }
     ccu_v1_casm_tls = ctx;
 }
 
@@ -57,21 +59,30 @@ void ccu_v1_casm_run(CcuV1CasmCtx *ctx, void (*entry)(void))
 void ccu_v1_casm_grow(CcuV1CasmCtx *ctx)
 {
     assert(ctx);
-    assert(ccu_v1_program_reserve(&ctx->program, ctx->program.count + 1) == 0);
+    if (ccu_v1_program_reserve(&ctx->program, ctx->program.count + 1) != 0) {
+        abort();
+    }
 }
 
-void ccu_v1_casm_write_file(const CcuV1CasmCtx *ctx, const char *path)
+int ccu_v1_casm_write_file(const CcuV1CasmCtx *ctx, const char *path)
 {
     assert(ctx);
     assert(path);
     FILE *f = fopen(path, "wb");
-    assert(f);
+    if (!f) {
+        return -1;
+    }
     size_t n = ctx->program.count;
     if (n > 0) {
-        assert(ctx->program.items);
-        assert(fwrite(ctx->program.items, CCU_V1_INSTR_SIZE, n, f) == n);
+        if (!ctx->program.items || fwrite(ctx->program.items, CCU_V1_INSTR_SIZE, n, f) != n) {
+            fclose(f);
+            return -1;
+        }
     }
-    fclose(f);
+    if (fclose(f) != 0) {
+        return -1;
+    }
+    return 0;
 }
 
 static void append_instr(CcuV1CasmCtx *ctx, const CcuV1Instr *instr)

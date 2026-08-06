@@ -8,7 +8,8 @@
  *   4. ccu_v1_casm_end()
  *   5. ccu_v1_casm_write_file(...)  — fwrite packed 32B*N bytes
  *
- * Hot path uses assert (compiles out with -DNDEBUG); no null/error branches.
+ * Hot-path assert() is only for pure preconditions (no side effects).
+ * I/O and allocation always execute and return errors — never wrap them in assert().
  */
 #ifndef CCU_V1_CASM_H
 #define CCU_V1_CASM_H
@@ -80,8 +81,8 @@ static inline CcuV1Instr *ccu_v1_casm_emit(CcuV1CasmCtx *ctx, uint8_t type, uint
     return inst;
 }
 
-/* fwrite program.items as raw 32B * count. */
-void ccu_v1_casm_write_file(const CcuV1CasmCtx *ctx, const char *path);
+/* fwrite program.items as raw 32B * count. Returns 0 on success, -1 on I/O error. */
+int ccu_v1_casm_write_file(const CcuV1CasmCtx *ctx, const char *path);
 
 /** Emit CTRL/LOOP and fill loop fields. */
 static inline void ccu_v1_casm_loop(CcuV1CasmCtx *ctx, uint16_t start, uint16_t end, uint16_t xn)
