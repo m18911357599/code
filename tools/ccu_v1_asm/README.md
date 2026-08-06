@@ -2,49 +2,67 @@
 
 基于 [cann/hcomm](https://gitcode.com/cann/hcomm) 的 **CcuV1** 定长微码（32B/`CcuInstr`）。
 
-- **主实现**：`c/`（C11，`-O3 -flto`，packed struct 零拷贝编解码）
-- **参考实现**：仓库内 Python 模块（便于对照；日常请用 C 版）
-
 ## 构建
 
 ```bash
 cd tools/ccu_v1_asm/c
-make -j
-# 产物: build/ccu_v1_asm
-make test   # 全 opcode 往返 + cmp 二进制
+make -j && make test
 ```
 
-## 使用
+## 命令
+
+| 命令 | 作用 |
+|------|------|
+| `assemble` / `as` | 数值操作数汇编 → `.bin` |
+| `disassemble` / `dis` | `.bin` → 汇编 |
+| `verify` | 数值汇编往返语义验证 |
+| `vasm` / `assemble-var` | **命名变量汇编** → `.bin` + **metainfo** |
+| `verify-vasm` | 变量汇编验证（bin == assemble(lowered)） |
 
 ```bash
-./build/ccu_v1_asm assemble   ../examples/all_opcodes.s -o out.bin
-./build/ccu_v1_asm disassemble out.bin -o out.dis.s
-./build/ccu_v1_asm verify     ../examples/all_opcodes.s
+# 数值版
+./build/ccu_v1_asm as ../examples/all_opcodes.s -o out.bin
+./build/ccu_v1_asm verify ../examples/all_opcodes.s
+
+# 变量版：自动分配/复用 ID，并写 metainfo
+./build/ccu_v1_asm vasm ../examples/vars_reuse.s \
+  -o out.bin -m out.meta.json --lowered out.lowered.s
+./build/ccu_v1_asm verify-vasm ../examples/vars_reuse.s
 ```
 
-`verify`：源 `.s` → `.bin` → `.dis.s`，再汇编；要求与源**语义一致**且二进制逐字节相同。
+## 变量汇编语法
 
-## 性能要点
+```asm
+# 声明（可省略，首次使用时按操作数字段自动推断类型）
+.xn  offset
+.gsa src
+.ms  slice0
+.cke done
+.ch  peer
+.var xn pinned_reg = 3   # 固定物理 id（pinned，不参与复用抢占该 id 的冲突区间）
 
-| 手段 | 说明 |
-|------|------|
-| packed `CcuV1Instr` | 与硬件/软件布局一致，memcpy 即编码 |
-| FNV-1a 助记符哈希 | O(1) mnemonic 查找 |
-| 单遍解析 | 原地扫描 `name=value`，无正则 |
-| mmap 读文件 | Linux 下减少 syscall |
-| `-O3 -flto -march=native` | 默认发布优化 |
+LOAD_IMD_TO_XN xn=offset, imm=0x1000, sec=0
+TRANS_LOC_MEM_TO_LOC_MS ms=slice0, gsa=src, xn=offset, len_xn=offset, ch=peer, \
+  clear=0, len_en=1, set_id=done, set_mask=0x1, wait_id=0, wait_mask=0
+```
 
-## 汇编语法
+- 资源操作数字段中的**标识符** → 变量（自动分配物理 id）
+- **数字字面量** → 直接编码（不进入分配器）
+- 字段→类型：`xn/xd/xm/len_xn/...`→xn，`gsa/gsad/...`→gsa，`ms/...`→ms，`set_id/wait_id/...`→cke，`ch`→ch，`sqe`→sqe
 
-与先前约定相同（命名操作数，`#` 注释）。示例见 `examples/all_opcodes.s`（29 条 opcode 全覆盖）。
+### ID 生命周期与复用
+
+对每个变量统计 `[live_start, live_end]`（首次引用～末次引用，指令下标）。按类型做 **线性扫描分配**：区间结束后 id 可被后续变量复用。
+
+### metainfo（JSON）
+
+描述 `name / type / id / pinned / live_start / live_end / use_count`，以及各资源 `limit` 与 `peak_used`。示例见 `make test` 生成的 `build/vars.meta.json`。
 
 ## 目录
 
 ```
-c/
-  include/ccu_v1_isa.h   # 指令布局 / opcode 表
-  include/ccu_v1_asm.h   # 汇编 API
-  src/isa.c asm.c cli.c
-  Makefile
-examples/all_opcodes.s
+c/include/ccu_v1_isa.h ccu_v1_asm.h ccu_v1_vasm.h
+c/src/isa.c asm.c vasm.c cli.c
+examples/all_opcodes.s vars_reuse.s
+python_ref/   # 可选参考实现
 ```
