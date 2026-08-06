@@ -7,6 +7,8 @@
  *   3. Call user main()             — each instr writes fields into ctx->inst
  *   4. ccu_v1_casm_end()
  *   5. ccu_v1_casm_write_file(...)  — fwrite packed 32B*N bytes
+ *
+ * Hot path uses assert (compiles out with -DNDEBUG); no null/error branches.
  */
 #ifndef CCU_V1_CASM_H
 #define CCU_V1_CASM_H
@@ -35,33 +37,31 @@ typedef struct {
     CcuV1Program program;
     CcuV1Instr *inst; /* current instruction slot (set by ccu_v1_casm_emit) */
     char errmsg[CCU_V1_CASM_ERRMSG];
-    int failed;
+    int failed; /* text-interpreter path only */
 } CcuV1CasmCtx;
 
 void ccu_v1_casm_init(CcuV1CasmCtx *ctx);
 void ccu_v1_casm_free(CcuV1CasmCtx *ctx);
 
 /* Install / clear thread-local current context (must wrap user main). */
-int ccu_v1_casm_begin(CcuV1CasmCtx *ctx);
+void ccu_v1_casm_begin(CcuV1CasmCtx *ctx);
 void ccu_v1_casm_end(void);
 CcuV1CasmCtx *ccu_v1_casm_current(void);
 
-/* begin → entry() → end. Returns -1 if entry set ctx->failed. */
-int ccu_v1_casm_run(CcuV1CasmCtx *ctx, void (*entry)(void));
+/* begin → entry() → end. */
+void ccu_v1_casm_run(CcuV1CasmCtx *ctx, void (*entry)(void));
 
 /**
  * Append one zeroed instruction, set header(type,code), point ctx->inst at it.
  * Intrinsics then write payload fields into ctx->inst->* directly.
  */
-int ccu_v1_casm_emit(CcuV1CasmCtx *ctx, uint8_t type, uint16_t code);
+void ccu_v1_casm_emit(CcuV1CasmCtx *ctx, uint8_t type, uint16_t code);
 
 /* fwrite program.items as raw 32B * count. */
-int ccu_v1_casm_write_file(const CcuV1CasmCtx *ctx, const char *path);
+void ccu_v1_casm_write_file(const CcuV1CasmCtx *ctx, const char *path);
 
-/**
- * Builtin: emit CTRL/LOOP and fill ctx->inst->loop fields.
- */
-int ccu_v1_casm_loop(CcuV1CasmCtx *ctx, uint16_t start, uint16_t end, uint16_t xn);
+/** Emit CTRL/LOOP and fill ctx->inst->loop fields. */
+void ccu_v1_casm_loop(CcuV1CasmCtx *ctx, uint16_t start, uint16_t end, uint16_t xn);
 
 /**
  * Generic dispatcher for the text interpreter path.

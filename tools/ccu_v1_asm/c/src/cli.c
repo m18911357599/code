@@ -508,11 +508,7 @@ static int cmd_casm(const char *in_path, const char *out_path, const char *lower
     }
 
     /* Direct write of packed instruction bytes. */
-    if (ccu_v1_casm_write_file(&ctx, out_path) != 0) {
-        fprintf(stderr, "error: cannot write %s\n", out_path);
-        ccu_v1_casm_free(&ctx);
-        return 2;
-    }
+    ccu_v1_casm_write_file(&ctx, out_path);
     printf("casm: %zu instructions -> %s (%zu bytes)\n", ctx.program.count, out_path,
            ctx.program.count * (size_t)CCU_V1_INSTR_SIZE);
     ccu_v1_casm_free(&ctx);

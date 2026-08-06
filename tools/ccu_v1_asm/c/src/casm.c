@@ -3,6 +3,7 @@
  */
 #include "ccu_v1_casm.h"
 
+#include <assert.h>
 #include <ctype.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -10,6 +11,7 @@
 
 void ccu_v1_casm_init(CcuV1CasmCtx *ctx)
 {
+    assert(ctx);
     ccu_v1_program_init(&ctx->program);
     ctx->inst = NULL;
     ctx->errmsg[0] = '\0';
@@ -18,6 +20,7 @@ void ccu_v1_casm_init(CcuV1CasmCtx *ctx)
 
 void ccu_v1_casm_free(CcuV1CasmCtx *ctx)
 {
+    assert(ctx);
     ccu_v1_program_free(&ctx->program);
     ctx->inst = NULL;
     ctx->errmsg[0] = '\0';
@@ -26,22 +29,16 @@ void ccu_v1_casm_free(CcuV1CasmCtx *ctx)
 
 static __thread CcuV1CasmCtx *g_casm_current;
 
-int ccu_v1_casm_begin(CcuV1CasmCtx *ctx)
+void ccu_v1_casm_begin(CcuV1CasmCtx *ctx)
 {
-    if (!ctx) {
-        return -1;
-    }
-    if (g_casm_current) {
-        snprintf(ctx->errmsg, sizeof(ctx->errmsg), "casm context already active");
-        ctx->failed = 1;
-        return -1;
-    }
+    assert(ctx);
+    assert(g_casm_current == NULL);
     g_casm_current = ctx;
-    return 0;
 }
 
 void ccu_v1_casm_end(void)
 {
+    assert(g_casm_current != NULL);
     g_casm_current = NULL;
 }
 
@@ -50,77 +47,55 @@ CcuV1CasmCtx *ccu_v1_casm_current(void)
     return g_casm_current;
 }
 
-int ccu_v1_casm_run(CcuV1CasmCtx *ctx, void (*entry)(void))
+void ccu_v1_casm_run(CcuV1CasmCtx *ctx, void (*entry)(void))
 {
-    if (!ctx || !entry) {
-        return -1;
-    }
-    if (ccu_v1_casm_begin(ctx) != 0) {
-        return -1;
-    }
+    assert(ctx);
+    assert(entry);
+    ccu_v1_casm_begin(ctx);
     entry();
     ccu_v1_casm_end();
-    return ctx->failed ? -1 : 0;
+    assert(!ctx->failed);
 }
 
-int ccu_v1_casm_write_file(const CcuV1CasmCtx *ctx, const char *path)
+void ccu_v1_casm_write_file(const CcuV1CasmCtx *ctx, const char *path)
 {
-    if (!ctx || !path) {
-        return -1;
-    }
+    assert(ctx);
+    assert(path);
     FILE *f = fopen(path, "wb");
-    if (!f) {
-        return -1;
-    }
-    /* Items are already packed CcuV1Instr (32B); write them directly. */
+    assert(f);
     size_t n = ctx->program.count;
     if (n > 0) {
-        if (fwrite(ctx->program.items, CCU_V1_INSTR_SIZE, n, f) != n) {
-            fclose(f);
-            return -1;
-        }
+        assert(ctx->program.items);
+        assert(fwrite(ctx->program.items, CCU_V1_INSTR_SIZE, n, f) == n);
     }
     fclose(f);
-    return 0;
 }
 
-int ccu_v1_casm_emit(CcuV1CasmCtx *ctx, uint8_t type, uint16_t code)
+void ccu_v1_casm_emit(CcuV1CasmCtx *ctx, uint8_t type, uint16_t code)
 {
-    if (!ctx) {
-        return -1;
-    }
-    if (ccu_v1_program_reserve(&ctx->program, ctx->program.count + 1) != 0) {
-        snprintf(ctx->errmsg, sizeof(ctx->errmsg), "oom appending instruction");
-        ctx->failed = 1;
-        ctx->inst = NULL;
-        return -1;
-    }
+    assert(ctx);
+    assert(ccu_v1_program_reserve(&ctx->program, ctx->program.count + 1) == 0);
     CcuV1Instr *inst = &ctx->program.items[ctx->program.count++];
     memset(inst, 0, sizeof(*inst));
     inst->header.raw = ccu_v1_make_header(type, code);
     ctx->inst = inst;
-    return 0;
 }
 
-static int append_instr(CcuV1CasmCtx *ctx, const CcuV1Instr *instr)
+static void append_instr(CcuV1CasmCtx *ctx, const CcuV1Instr *instr)
 {
-    if (ccu_v1_casm_emit(ctx, 0, 0) != 0) {
-        return -1;
-    }
-    /* Preserve caller-provided header+payload (used by text-lowered path). */
+    assert(ctx);
+    assert(instr);
+    ccu_v1_casm_emit(ctx, 0, 0);
     *ctx->inst = *instr;
-    return 0;
 }
 
-int ccu_v1_casm_loop(CcuV1CasmCtx *ctx, uint16_t start, uint16_t end, uint16_t xn)
+void ccu_v1_casm_loop(CcuV1CasmCtx *ctx, uint16_t start, uint16_t end, uint16_t xn)
 {
-    if (ccu_v1_casm_emit(ctx, CCU_V1_CTRL_TYPE, 0x0) != 0) {
-        return -1;
-    }
+    assert(ctx);
+    ccu_v1_casm_emit(ctx, CCU_V1_CTRL_TYPE, 0x0);
     ctx->inst->loop.start = start;
     ctx->inst->loop.end = end;
     ctx->inst->loop.xn = xn;
-    return 0;
 }
 
 static void name_to_mnemonic(const char *name, char *out, size_t out_sz)
@@ -181,8 +156,9 @@ int ccu_v1_casm_call(CcuV1CasmCtx *ctx, const char *name, const CcuV1CasmArg *ar
             snprintf(ctx->errmsg, sizeof(ctx->errmsg), "loop: argument out of u16 range");
             return -1;
         }
-        return ccu_v1_casm_loop(ctx, (uint16_t)args[0].scalar, (uint16_t)args[1].scalar,
-                                (uint16_t)args[2].scalar);
+        ccu_v1_casm_loop(ctx, (uint16_t)args[0].scalar, (uint16_t)args[1].scalar,
+                         (uint16_t)args[2].scalar);
+        return 0;
     }
 
     const CcuV1OpcodeDesc *desc = ccu_v1_lookup_mnemonic(mnem);
@@ -229,9 +205,9 @@ int ccu_v1_casm_call(CcuV1CasmCtx *ctx, const char *name, const CcuV1CasmArg *ar
         ccu_v1_program_free(&tmp);
         return -1;
     }
-    int rc = append_instr(ctx, &tmp.items[0]);
+    append_instr(ctx, &tmp.items[0]);
     ccu_v1_program_free(&tmp);
-    return rc;
+    return 0;
 }
 
 /* ---------------- C-style parser ---------------- */

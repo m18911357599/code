@@ -1,65 +1,47 @@
 /**
- * Instruction intrinsics: allocate ctx->inst and write payload fields directly.
- * No string formatting / emit_scalars / assembler round-trip.
+ * Instruction intrinsics: emit into ctx->inst and write payload fields.
+ * Preconditions via assert (elided with -DNDEBUG) — no null/error branches.
  */
 #include "ccu_v1_casm_api.h"
 
+#include <assert.h>
 #include <string.h>
 
-static CcuV1CasmCtx *require_ctx(void)
+static inline CcuV1CasmCtx *ctx_now(void)
 {
     CcuV1CasmCtx *ctx = ccu_v1_casm_current();
-    if (!ctx || ctx->failed) {
-        return NULL;
-    }
+    assert(ctx);
     return ctx;
-}
-
-/* type/code match isa.c opcode table — no mnemonic lookup on the hot path. */
-static int emit(CcuV1CasmCtx *ctx, uint8_t type, uint16_t code)
-{
-    if (ccu_v1_casm_emit(ctx, type, code) != 0) {
-        return -1;
-    }
-    return 0;
 }
 
 void load_sqeargs_to_gsa(uint16_t gsa, uint16_t sqe)
 {
-    CcuV1CasmCtx *ctx = require_ctx();
-    if (!ctx || emit(ctx, CCU_V1_LOAD_TYPE, 0x0) != 0) {
-        return;
-    }
+    CcuV1CasmCtx *ctx = ctx_now();
+    ccu_v1_casm_emit(ctx, CCU_V1_LOAD_TYPE, 0x0);
     ctx->inst->load_sqe_gsa.gsa = gsa;
     ctx->inst->load_sqe_gsa.sqe = sqe;
 }
 
 void load_sqeargs_to_xn(uint16_t xn, uint16_t sqe)
 {
-    CcuV1CasmCtx *ctx = require_ctx();
-    if (!ctx || emit(ctx, CCU_V1_LOAD_TYPE, 0x1) != 0) {
-        return;
-    }
+    CcuV1CasmCtx *ctx = ctx_now();
+    ccu_v1_casm_emit(ctx, CCU_V1_LOAD_TYPE, 0x1);
     ctx->inst->load_sqe_xn.xn = xn;
     ctx->inst->load_sqe_xn.sqe = sqe;
 }
 
 void load_imd_to_gsa(uint16_t gsa, uint64_t imm)
 {
-    CcuV1CasmCtx *ctx = require_ctx();
-    if (!ctx || emit(ctx, CCU_V1_LOAD_TYPE, 0x2) != 0) {
-        return;
-    }
+    CcuV1CasmCtx *ctx = ctx_now();
+    ccu_v1_casm_emit(ctx, CCU_V1_LOAD_TYPE, 0x2);
     ctx->inst->load_imd_gsa.gsa = gsa;
     ctx->inst->load_imd_gsa.imm = imm;
 }
 
 void load_imd_to_xn(uint16_t xn, uint64_t imm, uint16_t sec)
 {
-    CcuV1CasmCtx *ctx = require_ctx();
-    if (!ctx || emit(ctx, CCU_V1_LOAD_TYPE, 0x3) != 0) {
-        return;
-    }
+    CcuV1CasmCtx *ctx = ctx_now();
+    ccu_v1_casm_emit(ctx, CCU_V1_LOAD_TYPE, 0x3);
     ctx->inst->load_imd_xn.xn = xn;
     ctx->inst->load_imd_xn.imm = imm;
     ctx->inst->load_imd_xn.sec = sec;
@@ -67,10 +49,8 @@ void load_imd_to_xn(uint16_t xn, uint64_t imm, uint16_t sec)
 
 void load_gsa_xn(uint16_t gsad, uint16_t gsam, uint16_t xn)
 {
-    CcuV1CasmCtx *ctx = require_ctx();
-    if (!ctx || emit(ctx, CCU_V1_LOAD_TYPE, 0x4) != 0) {
-        return;
-    }
+    CcuV1CasmCtx *ctx = ctx_now();
+    ccu_v1_casm_emit(ctx, CCU_V1_LOAD_TYPE, 0x4);
     ctx->inst->load_gsa_xn.gsad = gsad;
     ctx->inst->load_gsa_xn.gsam = gsam;
     ctx->inst->load_gsa_xn.xn = xn;
@@ -78,10 +58,8 @@ void load_gsa_xn(uint16_t gsad, uint16_t gsam, uint16_t xn)
 
 void load_gsa_gsa(uint16_t gsad, uint16_t gsam, uint16_t gsan)
 {
-    CcuV1CasmCtx *ctx = require_ctx();
-    if (!ctx || emit(ctx, CCU_V1_LOAD_TYPE, 0x5) != 0) {
-        return;
-    }
+    CcuV1CasmCtx *ctx = ctx_now();
+    ccu_v1_casm_emit(ctx, CCU_V1_LOAD_TYPE, 0x5);
     ctx->inst->load_gsa_gsa.gsad = gsad;
     ctx->inst->load_gsa_gsa.gsam = gsam;
     ctx->inst->load_gsa_gsa.gsan = gsan;
@@ -89,10 +67,8 @@ void load_gsa_gsa(uint16_t gsad, uint16_t gsam, uint16_t gsan)
 
 void load_xx(uint16_t xd, uint16_t xm, uint16_t xn)
 {
-    CcuV1CasmCtx *ctx = require_ctx();
-    if (!ctx || emit(ctx, CCU_V1_LOAD_TYPE, 0x6) != 0) {
-        return;
-    }
+    CcuV1CasmCtx *ctx = ctx_now();
+    ccu_v1_casm_emit(ctx, CCU_V1_LOAD_TYPE, 0x6);
     ctx->inst->load_xx.xd = xd;
     ctx->inst->load_xx.xm = xm;
     ctx->inst->load_xx.xn = xn;
@@ -100,19 +76,13 @@ void load_xx(uint16_t xd, uint16_t xm, uint16_t xn)
 
 void loop(uint16_t start, uint16_t end, uint16_t xn)
 {
-    CcuV1CasmCtx *ctx = require_ctx();
-    if (!ctx) {
-        return;
-    }
-    (void)ccu_v1_casm_loop(ctx, start, end, xn);
+    ccu_v1_casm_loop(ctx_now(), start, end, xn);
 }
 
 void loop_group(uint16_t start_loop, uint16_t xn, uint16_t xm, uint16_t hiperf)
 {
-    CcuV1CasmCtx *ctx = require_ctx();
-    if (!ctx || emit(ctx, CCU_V1_CTRL_TYPE, 0x1) != 0) {
-        return;
-    }
+    CcuV1CasmCtx *ctx = ctx_now();
+    ccu_v1_casm_emit(ctx, CCU_V1_CTRL_TYPE, 0x1);
     ctx->inst->loop_group.start_loop = start_loop;
     ctx->inst->loop_group.xn = xn;
     ctx->inst->loop_group.xm = xm;
@@ -121,10 +91,8 @@ void loop_group(uint16_t start_loop, uint16_t xn, uint16_t xm, uint16_t hiperf)
 
 void set_cke(uint16_t clear, uint16_t set_id, uint16_t set_mask, uint16_t wait_id, uint16_t wait_mask)
 {
-    CcuV1CasmCtx *ctx = require_ctx();
-    if (!ctx || emit(ctx, CCU_V1_CTRL_TYPE, 0x2) != 0) {
-        return;
-    }
+    CcuV1CasmCtx *ctx = ctx_now();
+    ccu_v1_casm_emit(ctx, CCU_V1_CTRL_TYPE, 0x2);
     ctx->inst->set_cke.clear = clear & 1u;
     ctx->inst->set_cke.set_id = set_id;
     ctx->inst->set_cke.set_mask = set_mask;
@@ -134,10 +102,8 @@ void set_cke(uint16_t clear, uint16_t set_id, uint16_t set_mask, uint16_t wait_i
 
 void clear_cke(uint16_t clear, uint16_t clear_id, uint16_t clear_mask, uint16_t wait_id, uint16_t wait_mask)
 {
-    CcuV1CasmCtx *ctx = require_ctx();
-    if (!ctx || emit(ctx, CCU_V1_CTRL_TYPE, 0x4) != 0) {
-        return;
-    }
+    CcuV1CasmCtx *ctx = ctx_now();
+    ccu_v1_casm_emit(ctx, CCU_V1_CTRL_TYPE, 0x4);
     ctx->inst->clear_cke.clear = clear & 1u;
     ctx->inst->clear_cke.clear_id = clear_id;
     ctx->inst->clear_cke.clear_mask = clear_mask;
@@ -147,10 +113,8 @@ void clear_cke(uint16_t clear, uint16_t clear_id, uint16_t clear_mask, uint16_t 
 
 void jmp(uint16_t dst_xn, uint16_t cond_xn, uint32_t expect)
 {
-    CcuV1CasmCtx *ctx = require_ctx();
-    if (!ctx || emit(ctx, CCU_V1_CTRL_TYPE, 0x5) != 0) {
-        return;
-    }
+    CcuV1CasmCtx *ctx = ctx_now();
+    ccu_v1_casm_emit(ctx, CCU_V1_CTRL_TYPE, 0x5);
     ctx->inst->jmp.dst_xn = dst_xn;
     ctx->inst->jmp.cond_xn = cond_xn;
     ctx->inst->jmp.expect = expect;
@@ -159,10 +123,8 @@ void jmp(uint16_t dst_xn, uint16_t cond_xn, uint32_t expect)
 void trans_loc_mem_to_loc_ms(uint16_t ms, uint16_t gsa, uint16_t xn, uint16_t len_xn, uint16_t ch, uint16_t clear,
                              uint16_t len_en, uint16_t set_id, uint16_t set_mask, uint16_t wait_id, uint16_t wait_mask)
 {
-    CcuV1CasmCtx *ctx = require_ctx();
-    if (!ctx || emit(ctx, CCU_V1_TRANS_TYPE, 0x0) != 0) {
-        return;
-    }
+    CcuV1CasmCtx *ctx = ctx_now();
+    ccu_v1_casm_emit(ctx, CCU_V1_TRANS_TYPE, 0x0);
     ctx->inst->trans_mem_to_ms.ms = ms;
     ctx->inst->trans_mem_to_ms.gsa = gsa;
     ctx->inst->trans_mem_to_ms.xn = xn;
@@ -179,10 +141,8 @@ void trans_loc_mem_to_loc_ms(uint16_t ms, uint16_t gsa, uint16_t xn, uint16_t le
 void trans_rmt_mem_to_loc_ms(uint16_t ms, uint16_t gsa, uint16_t xn, uint16_t len_xn, uint16_t ch, uint16_t clear,
                              uint16_t len_en, uint16_t set_id, uint16_t set_mask, uint16_t wait_id, uint16_t wait_mask)
 {
-    CcuV1CasmCtx *ctx = require_ctx();
-    if (!ctx || emit(ctx, CCU_V1_TRANS_TYPE, 0x1) != 0) {
-        return;
-    }
+    CcuV1CasmCtx *ctx = ctx_now();
+    ccu_v1_casm_emit(ctx, CCU_V1_TRANS_TYPE, 0x1);
     ctx->inst->trans_mem_to_ms.ms = ms;
     ctx->inst->trans_mem_to_ms.gsa = gsa;
     ctx->inst->trans_mem_to_ms.xn = xn;
@@ -199,10 +159,8 @@ void trans_rmt_mem_to_loc_ms(uint16_t ms, uint16_t gsa, uint16_t xn, uint16_t le
 void trans_loc_ms_to_loc_mem(uint16_t gsa, uint16_t xn, uint16_t ms, uint16_t len_xn, uint16_t ch, uint16_t clear,
                              uint16_t len_en, uint16_t set_id, uint16_t set_mask, uint16_t wait_id, uint16_t wait_mask)
 {
-    CcuV1CasmCtx *ctx = require_ctx();
-    if (!ctx || emit(ctx, CCU_V1_TRANS_TYPE, 0x2) != 0) {
-        return;
-    }
+    CcuV1CasmCtx *ctx = ctx_now();
+    ccu_v1_casm_emit(ctx, CCU_V1_TRANS_TYPE, 0x2);
     ctx->inst->trans_ms_to_mem.gsa = gsa;
     ctx->inst->trans_ms_to_mem.xn = xn;
     ctx->inst->trans_ms_to_mem.ms = ms;
@@ -219,10 +177,8 @@ void trans_loc_ms_to_loc_mem(uint16_t gsa, uint16_t xn, uint16_t ms, uint16_t le
 void trans_loc_ms_to_rmt_mem(uint16_t gsa, uint16_t xn, uint16_t ms, uint16_t len_xn, uint16_t ch, uint16_t clear,
                              uint16_t len_en, uint16_t set_id, uint16_t set_mask, uint16_t wait_id, uint16_t wait_mask)
 {
-    CcuV1CasmCtx *ctx = require_ctx();
-    if (!ctx || emit(ctx, CCU_V1_TRANS_TYPE, 0x3) != 0) {
-        return;
-    }
+    CcuV1CasmCtx *ctx = ctx_now();
+    ccu_v1_casm_emit(ctx, CCU_V1_TRANS_TYPE, 0x3);
     ctx->inst->trans_ms_to_mem.gsa = gsa;
     ctx->inst->trans_ms_to_mem.xn = xn;
     ctx->inst->trans_ms_to_mem.ms = ms;
@@ -239,10 +195,8 @@ void trans_loc_ms_to_rmt_mem(uint16_t gsa, uint16_t xn, uint16_t ms, uint16_t le
 void trans_rmt_ms_to_loc_mem(uint16_t gsa, uint16_t xn, uint16_t ms, uint16_t len_xn, uint16_t ch, uint16_t clear,
                              uint16_t len_en, uint16_t set_id, uint16_t set_mask, uint16_t wait_id, uint16_t wait_mask)
 {
-    CcuV1CasmCtx *ctx = require_ctx();
-    if (!ctx || emit(ctx, CCU_V1_TRANS_TYPE, 0x4) != 0) {
-        return;
-    }
+    CcuV1CasmCtx *ctx = ctx_now();
+    ccu_v1_casm_emit(ctx, CCU_V1_TRANS_TYPE, 0x4);
     ctx->inst->trans_ms_to_mem.gsa = gsa;
     ctx->inst->trans_ms_to_mem.xn = xn;
     ctx->inst->trans_ms_to_mem.ms = ms;
@@ -259,10 +213,8 @@ void trans_rmt_ms_to_loc_mem(uint16_t gsa, uint16_t xn, uint16_t ms, uint16_t le
 void trans_loc_ms_to_loc_ms(uint16_t dst_ms, uint16_t src_ms, uint16_t len_xn, uint16_t ch, uint16_t clear,
                             uint16_t len_en, uint16_t set_id, uint16_t set_mask, uint16_t wait_id, uint16_t wait_mask)
 {
-    CcuV1CasmCtx *ctx = require_ctx();
-    if (!ctx || emit(ctx, CCU_V1_TRANS_TYPE, 0x5) != 0) {
-        return;
-    }
+    CcuV1CasmCtx *ctx = ctx_now();
+    ccu_v1_casm_emit(ctx, CCU_V1_TRANS_TYPE, 0x5);
     ctx->inst->trans_loc_ms_loc_ms.dst_ms = dst_ms;
     ctx->inst->trans_loc_ms_loc_ms.src_ms = src_ms;
     ctx->inst->trans_loc_ms_loc_ms.len_xn = len_xn;
@@ -278,10 +230,8 @@ void trans_loc_ms_to_loc_ms(uint16_t dst_ms, uint16_t src_ms, uint16_t len_xn, u
 void trans_rmt_ms_to_loc_ms(uint16_t loc_ms, uint16_t rmt_ms, uint16_t len_xn, uint16_t ch, uint16_t clear,
                             uint16_t len_en, uint16_t set_id, uint16_t set_mask, uint16_t wait_id, uint16_t wait_mask)
 {
-    CcuV1CasmCtx *ctx = require_ctx();
-    if (!ctx || emit(ctx, CCU_V1_TRANS_TYPE, 0x6) != 0) {
-        return;
-    }
+    CcuV1CasmCtx *ctx = ctx_now();
+    ccu_v1_casm_emit(ctx, CCU_V1_TRANS_TYPE, 0x6);
     ctx->inst->trans_rmt_ms_loc_ms.loc_ms = loc_ms;
     ctx->inst->trans_rmt_ms_loc_ms.rmt_ms = rmt_ms;
     ctx->inst->trans_rmt_ms_loc_ms.len_xn = len_xn;
@@ -298,10 +248,8 @@ void trans_loc_ms_to_rmt_ms(uint16_t rmt_ms, uint16_t loc_ms, uint16_t len_xn, u
                             uint16_t rmt_set_mask, uint16_t clear, uint16_t len_en, uint16_t set_id, uint16_t set_mask,
                             uint16_t wait_id, uint16_t wait_mask)
 {
-    CcuV1CasmCtx *ctx = require_ctx();
-    if (!ctx || emit(ctx, CCU_V1_TRANS_TYPE, 0x7) != 0) {
-        return;
-    }
+    CcuV1CasmCtx *ctx = ctx_now();
+    ccu_v1_casm_emit(ctx, CCU_V1_TRANS_TYPE, 0x7);
     ctx->inst->trans_loc_ms_rmt_ms.rmt_ms = rmt_ms;
     ctx->inst->trans_loc_ms_rmt_ms.loc_ms = loc_ms;
     ctx->inst->trans_loc_ms_rmt_ms.len_xn = len_xn;
@@ -321,10 +269,8 @@ void trans_rmt_mem_to_loc_mem(uint16_t loc_gsa, uint16_t loc_xn, uint16_t rmt_gs
                               uint16_t len_en, uint16_t reduce_en, uint16_t set_id, uint16_t set_mask, uint16_t wait_id,
                               uint16_t wait_mask)
 {
-    CcuV1CasmCtx *ctx = require_ctx();
-    if (!ctx || emit(ctx, CCU_V1_TRANS_TYPE, 0x8) != 0) {
-        return;
-    }
+    CcuV1CasmCtx *ctx = ctx_now();
+    ccu_v1_casm_emit(ctx, CCU_V1_TRANS_TYPE, 0x8);
     ctx->inst->trans_rmt_mem_loc_mem.loc_gsa = loc_gsa;
     ctx->inst->trans_rmt_mem_loc_mem.loc_xn = loc_xn;
     ctx->inst->trans_rmt_mem_loc_mem.rmt_gsa = rmt_gsa;
@@ -348,10 +294,8 @@ void trans_loc_mem_to_rmt_mem(uint16_t rmt_gsa, uint16_t rmt_xn, uint16_t loc_gs
                               uint16_t len_en, uint16_t reduce_en, uint16_t set_id, uint16_t set_mask, uint16_t wait_id,
                               uint16_t wait_mask)
 {
-    CcuV1CasmCtx *ctx = require_ctx();
-    if (!ctx || emit(ctx, CCU_V1_TRANS_TYPE, 0x9) != 0) {
-        return;
-    }
+    CcuV1CasmCtx *ctx = ctx_now();
+    ccu_v1_casm_emit(ctx, CCU_V1_TRANS_TYPE, 0x9);
     ctx->inst->trans_loc_mem_rmt_mem.rmt_gsa = rmt_gsa;
     ctx->inst->trans_loc_mem_rmt_mem.rmt_xn = rmt_xn;
     ctx->inst->trans_loc_mem_rmt_mem.loc_gsa = loc_gsa;
@@ -374,10 +318,8 @@ void trans_loc_mem_to_loc_mem(uint16_t dst_gsa, uint16_t dst_xn, uint16_t src_gs
                               uint16_t ch, uint16_t clear, uint16_t len_en, uint16_t set_id, uint16_t set_mask,
                               uint16_t wait_id, uint16_t wait_mask)
 {
-    CcuV1CasmCtx *ctx = require_ctx();
-    if (!ctx || emit(ctx, CCU_V1_TRANS_TYPE, 0xA) != 0) {
-        return;
-    }
+    CcuV1CasmCtx *ctx = ctx_now();
+    ccu_v1_casm_emit(ctx, CCU_V1_TRANS_TYPE, 0xA);
     ctx->inst->trans_loc_mem_loc_mem.dst_gsa = dst_gsa;
     ctx->inst->trans_loc_mem_loc_mem.dst_xn = dst_xn;
     ctx->inst->trans_loc_mem_loc_mem.src_gsa = src_gsa;
@@ -395,10 +337,8 @@ void trans_loc_mem_to_loc_mem(uint16_t dst_gsa, uint16_t dst_xn, uint16_t src_gs
 void sync_cke(uint16_t rmt_cke, uint16_t loc_cke, uint16_t loc_mask, uint16_t ch, uint16_t clear, uint16_t set_id,
               uint16_t set_mask, uint16_t wait_id, uint16_t wait_mask)
 {
-    CcuV1CasmCtx *ctx = require_ctx();
-    if (!ctx || emit(ctx, CCU_V1_TRANS_TYPE, 0xB) != 0) {
-        return;
-    }
+    CcuV1CasmCtx *ctx = ctx_now();
+    ccu_v1_casm_emit(ctx, CCU_V1_TRANS_TYPE, 0xB);
     ctx->inst->sync_cke.rmt_cke = rmt_cke;
     ctx->inst->sync_cke.loc_cke = loc_cke;
     ctx->inst->sync_cke.loc_mask = loc_mask;
@@ -413,10 +353,8 @@ void sync_cke(uint16_t rmt_cke, uint16_t loc_cke, uint16_t loc_mask, uint16_t ch
 void sync_gsa(uint16_t rmt_gsa, uint16_t loc_gsa, uint16_t ch, uint16_t rmt_set_id, uint16_t rmt_set_mask,
               uint16_t clear, uint16_t set_id, uint16_t set_mask, uint16_t wait_id, uint16_t wait_mask)
 {
-    CcuV1CasmCtx *ctx = require_ctx();
-    if (!ctx || emit(ctx, CCU_V1_TRANS_TYPE, 0xC) != 0) {
-        return;
-    }
+    CcuV1CasmCtx *ctx = ctx_now();
+    ccu_v1_casm_emit(ctx, CCU_V1_TRANS_TYPE, 0xC);
     ctx->inst->sync_gsa.rmt_gsa = rmt_gsa;
     ctx->inst->sync_gsa.loc_gsa = loc_gsa;
     ctx->inst->sync_gsa.ch = ch;
@@ -432,10 +370,8 @@ void sync_gsa(uint16_t rmt_gsa, uint16_t loc_gsa, uint16_t ch, uint16_t rmt_set_
 void sync_xn(uint16_t rmt_xn, uint16_t loc_xn, uint16_t ch, uint16_t rmt_set_id, uint16_t rmt_set_mask, uint16_t clear,
              uint16_t set_id, uint16_t set_mask, uint16_t wait_id, uint16_t wait_mask)
 {
-    CcuV1CasmCtx *ctx = require_ctx();
-    if (!ctx || emit(ctx, CCU_V1_TRANS_TYPE, 0xD) != 0) {
-        return;
-    }
+    CcuV1CasmCtx *ctx = ctx_now();
+    ccu_v1_casm_emit(ctx, CCU_V1_TRANS_TYPE, 0xD);
     ctx->inst->sync_xn.rmt_xn = rmt_xn;
     ctx->inst->sync_xn.loc_xn = loc_xn;
     ctx->inst->sync_xn.ch = ch;
@@ -451,10 +387,8 @@ void sync_xn(uint16_t rmt_xn, uint16_t loc_xn, uint16_t ch, uint16_t rmt_set_id,
 void add(CcuMs ms, uint16_t count, uint16_t cast, uint16_t dtype, uint16_t len_xn, uint16_t clear, uint16_t set_id,
          uint16_t set_mask, uint16_t wait_id, uint16_t wait_mask)
 {
-    CcuV1CasmCtx *ctx = require_ctx();
-    if (!ctx || emit(ctx, CCU_V1_REDUCE_TYPE, 0x0) != 0) {
-        return;
-    }
+    CcuV1CasmCtx *ctx = ctx_now();
+    ccu_v1_casm_emit(ctx, CCU_V1_REDUCE_TYPE, 0x0);
     memcpy(ctx->inst->add.ms, ms.v, sizeof(ms.v));
     ctx->inst->add.len_xn = len_xn;
     ctx->inst->add.clear = clear & 1u;
@@ -470,10 +404,8 @@ void add(CcuMs ms, uint16_t count, uint16_t cast, uint16_t dtype, uint16_t len_x
 void max(CcuMs ms, uint16_t count, uint16_t dtype, uint16_t len_xn, uint16_t clear, uint16_t set_id, uint16_t set_mask,
          uint16_t wait_id, uint16_t wait_mask)
 {
-    CcuV1CasmCtx *ctx = require_ctx();
-    if (!ctx || emit(ctx, CCU_V1_REDUCE_TYPE, 0x1) != 0) {
-        return;
-    }
+    CcuV1CasmCtx *ctx = ctx_now();
+    ccu_v1_casm_emit(ctx, CCU_V1_REDUCE_TYPE, 0x1);
     memcpy(ctx->inst->maxmin.ms, ms.v, sizeof(ms.v));
     ctx->inst->maxmin.len_xn = len_xn;
     ctx->inst->maxmin.clear = clear & 1u;
@@ -488,10 +420,8 @@ void max(CcuMs ms, uint16_t count, uint16_t dtype, uint16_t len_xn, uint16_t cle
 void min(CcuMs ms, uint16_t count, uint16_t dtype, uint16_t len_xn, uint16_t clear, uint16_t set_id, uint16_t set_mask,
          uint16_t wait_id, uint16_t wait_mask)
 {
-    CcuV1CasmCtx *ctx = require_ctx();
-    if (!ctx || emit(ctx, CCU_V1_REDUCE_TYPE, 0x2) != 0) {
-        return;
-    }
+    CcuV1CasmCtx *ctx = ctx_now();
+    ccu_v1_casm_emit(ctx, CCU_V1_REDUCE_TYPE, 0x2);
     memcpy(ctx->inst->maxmin.ms, ms.v, sizeof(ms.v));
     ctx->inst->maxmin.len_xn = len_xn;
     ctx->inst->maxmin.clear = clear & 1u;
