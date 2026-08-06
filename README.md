@@ -9,6 +9,5 @@ CCU / HCOMM 相关分析笔记与工具。
 ## 工具
 
 - [CCU V1 汇编器](tools/ccu_v1_asm/README.md)
-  - **C** 核心：`tools/ccu_v1_asm/c`
-  - **C++** API/CLI：`tools/ccu_v1_asm/cpp`（[与 C 对照文档](tools/ccu_v1_asm/cpp/docs/API_MAPPING.md)）
+  - C 实现：`tools/ccu_v1_asm/c`
   - 位置操作数、变量自动分配/复用、metainfo

@@ -2,27 +2,16 @@
 
 基于 [cann/hcomm](https://gitcode.com/cann/hcomm) 的 **CcuV1** 定长微码（32B/`CcuInstr`）。
 
-| 实现 | 路径 | 说明 |
-|------|------|------|
-| **C** | [`c/`](c/) | 高性能核心（解析 / 编码 / 变量分配） |
-| **C++** | [`cpp/`](cpp/) | C++ 风格 API/CLI，封装 C 核心；[API 对照文档](cpp/docs/API_MAPPING.md) |
+高性能 C 实现：[`c/`](c/)（解析 / 编码 / 变量分配 / CLI）。
 
-## 快速开始（C）
+## 快速开始
 
 ```bash
 cd tools/ccu_v1_asm/c
 make -j && make test
 ```
 
-## 快速开始（C++）
-
-```bash
-cd tools/ccu_v1_asm/cpp
-make -j && make test
-# 产物: build/ccu_v1_asm_cpp ；编码与 C 版逐字节一致
-```
-
-## 命令（C / C++ 相同）
+## 命令
 
 | 命令 | 作用 |
 |------|------|
@@ -58,6 +47,5 @@ LOAD_IMD_TO_XN offset, 0x1000, 0
 
 ```
 c/          C 核心 + CLI
-cpp/        C++ API/CLI + docs/API_MAPPING.md
 examples/   all_opcodes.s  vars_reuse.s
 ```

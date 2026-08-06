@@ -370,19 +370,11 @@ typedef struct {
 
 #pragma pack(pop)
 
-#ifdef __cplusplus
-static_assert(sizeof(CcuV1Instr) == CCU_V1_INSTR_SIZE, "CcuV1Instr must be 32 bytes");
-static_assert(sizeof(CcuV1Header) == 2, "header must be 2 bytes");
-static_assert(sizeof(CcuV1LoadImdToGsa) == CCU_V1_PAYLOAD_SIZE, "LoadImdToGsa payload");
-static_assert(sizeof(CcuV1Add) == CCU_V1_PAYLOAD_SIZE, "Add payload");
-static_assert(sizeof(CcuV1TransLocMemToRmtMem) == CCU_V1_PAYLOAD_SIZE, "LocMemToRmtMem payload");
-#else
 _Static_assert(sizeof(CcuV1Instr) == CCU_V1_INSTR_SIZE, "CcuV1Instr must be 32 bytes");
 _Static_assert(sizeof(CcuV1Header) == 2, "header must be 2 bytes");
 _Static_assert(sizeof(CcuV1LoadImdToGsa) == CCU_V1_PAYLOAD_SIZE, "LoadImdToGsa payload");
 _Static_assert(sizeof(CcuV1Add) == CCU_V1_PAYLOAD_SIZE, "Add payload");
 _Static_assert(sizeof(CcuV1TransLocMemToRmtMem) == CCU_V1_PAYLOAD_SIZE, "LocMemToRmtMem payload");
-#endif
 
 typedef enum {
     CCU_V1_OP_LOAD_SQEARGS_TO_GSA = 0,
