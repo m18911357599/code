@@ -76,7 +76,7 @@ void ccu_v1_casm_emit(CcuV1CasmCtx *ctx, uint8_t type, uint16_t code)
     assert(ctx);
     assert(ccu_v1_program_reserve(&ctx->program, ctx->program.count + 1) == 0);
     CcuV1Instr *inst = &ctx->program.items[ctx->program.count++];
-    memset(inst, 0, sizeof(*inst));
+    /* Slot already zeroed in program_reserve; only set header. */
     inst->header.raw = ccu_v1_make_header(type, code);
     ctx->inst = inst;
 }

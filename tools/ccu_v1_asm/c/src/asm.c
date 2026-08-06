@@ -27,7 +27,8 @@ int ccu_v1_program_reserve(CcuV1Program *p, size_t n)
     if (n <= p->capacity) {
         return 0;
     }
-    size_t cap = p->capacity ? p->capacity : 2048;
+    size_t old_cap = p->capacity;
+    size_t cap = old_cap ? old_cap : 2048;
     while (cap < n) {
         cap *= 2;
     }
@@ -35,6 +36,8 @@ int ccu_v1_program_reserve(CcuV1Program *p, size_t n)
     if (!ni) {
         return -1;
     }
+    /* Zero newly grown slots at allocation time (not per-emit). */
+    memset(ni + old_cap, 0, (cap - old_cap) * sizeof(CcuV1Instr));
     p->items = ni;
     p->capacity = cap;
     return 0;
