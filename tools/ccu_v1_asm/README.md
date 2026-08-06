@@ -41,6 +41,7 @@ void main()
 }
 ```
 
+完整覆盖全部 opcode 的例子：[`examples/loop_main.c`](examples/loop_main.c)（与 `all_opcodes.s` 操作数一致，`make test` 会 `cmp` 二者产出的 `.bin`）。
 - 入口：`void main()` / `int main()`（可写 `void` 形参）
 - 语句：`name(args...);`，`name` 为 ISA 助记符的小写形式（`LOOP` → `loop`）
 - `loop(start, end, xn)`：在上下文中填写 `CcuV1Loop` 载荷二进制（见 `ccu_v1_casm_loop`）

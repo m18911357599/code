@@ -36,8 +36,13 @@ assert a["live_end"] < b["live_start"], (a,b);\
 print("reuse check OK: phase_a/phase_b share xn id", a["id"])'
 	./build/ccu_v1_asm verify-casm ../examples/loop_main.c -w build/casm_verify
 	./build/ccu_v1_asm casm ../examples/loop_main.c -o build/loop.bin --lowered build/loop.lowered.s
+	./build/ccu_v1_asm as ../examples/all_opcodes.s -o build/all.bin
+	cmp build/loop.bin build/all.bin
 	@python3 -c 'from pathlib import Path; t=Path("build/loop.lowered.s").read_text();\
-assert "LOOP 0, 10, 11" in t, t; print("casm loop check OK")'
+ops=["LOAD_SQEARGS_TO_GSA","LOOP","TRANS_LOC_MEM_TO_RMT_MEM","SYNC_XN","ADD","MAX","MIN"];\
+missing=[o for o in ops if o not in t];\
+assert not missing, (missing, t); assert t.count("\n")+ (0 if t.endswith("\n") else 1) >= 29;\
+print("casm all-opcodes check OK:", t.strip().count(chr(10))+1, "lines")'
 	@echo "ALL C TESTS PASSED"
 
 clean:
