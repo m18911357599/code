@@ -1,14 +1,12 @@
 /**
  * C-style CCU V1 assembler.
  *
- * Source form:
- *   void main() {
- *       loop(0, 10, 11);           // fills LOOP binary into assembler context
- *       load_imd_to_xn(6, 0x1000, 0);
- *   }
- *
- * The assembler owns a CcuV1CasmCtx; builtins such as loop() write one
- * packed CcuV1Instr (32B) into that context.
+ * Binary generation flow for programs such as loop_main.c:
+ *   1. Create CcuV1CasmCtx          (before calling main)
+ *   2. ccu_v1_casm_begin(&ctx)
+ *   3. Call user main()             — each instr (loop, ...) fills packed binary
+ *   4. ccu_v1_casm_end()
+ *   5. ccu_v1_casm_write_file(...)  — write raw 32B*N bytes to file
  */
 #ifndef CCU_V1_CASM_H
 #define CCU_V1_CASM_H
@@ -36,10 +34,22 @@ typedef struct {
 typedef struct {
     CcuV1Program program;
     char errmsg[CCU_V1_CASM_ERRMSG];
+    int failed;
 } CcuV1CasmCtx;
 
 void ccu_v1_casm_init(CcuV1CasmCtx *ctx);
 void ccu_v1_casm_free(CcuV1CasmCtx *ctx);
+
+/* Install / clear thread-local current context (must wrap user main). */
+int ccu_v1_casm_begin(CcuV1CasmCtx *ctx);
+void ccu_v1_casm_end(void);
+CcuV1CasmCtx *ccu_v1_casm_current(void);
+
+/* begin → entry() → end. Returns -1 if entry set ctx->failed. */
+int ccu_v1_casm_run(CcuV1CasmCtx *ctx, void (*entry)(void));
+
+/* Encode program and write raw binary bytes to path. */
+int ccu_v1_casm_write_file(const CcuV1CasmCtx *ctx, const char *path);
 
 /**
  * Builtin: emit CTRL/LOOP binary into ctx.
@@ -54,8 +64,8 @@ int ccu_v1_casm_loop(CcuV1CasmCtx *ctx, uint16_t start, uint16_t end, uint16_t x
 int ccu_v1_casm_call(CcuV1CasmCtx *ctx, const char *name, const CcuV1CasmArg *args, int nargs);
 
 /**
- * Compile C-style text (void main() { ... }) into ctx->program.
- * Returns 0 on success; on failure fills ctx->errmsg.
+ * Compile C-style text (void main() { ... }) into ctx->program (interpreter).
+ * Native path for loop_main.c: compile as C + ccu_v1_casm_run + write_file.
  */
 int ccu_v1_casm_compile(const char *text, size_t text_len, CcuV1CasmCtx *ctx);
 

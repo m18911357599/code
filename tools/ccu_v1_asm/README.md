@@ -20,35 +20,43 @@ make -j && make test
 | `verify` | 数值汇编往返语义验证 |
 | `vasm` / `assemble-var` | **命名变量汇编** → `.bin` + **metainfo** |
 | `verify-vasm` | 变量汇编验证（bin == assemble(lowered)） |
-| `casm` / `assemble-c` | **C 风格源文件** → `.bin`（上下文内建填二进制） |
-| `verify-casm` | C 风格汇编验证 |
+| `casm` / `assemble-c` | **C 风格文本**解释 → `.bin` |
+| `verify-casm` | C 风格文本验证 |
+| `casm_host` | **原生编译** `loop_main.c`：建上下文 → 调 `main` → 写 `.bin` |
 
 ```bash
 ./build/ccu_v1_asm as ../examples/all_opcodes.s -o out.bin
-./build/ccu_v1_asm vasm ../examples/vars_reuse.s -o out.bin -m out.meta.json
-./build/ccu_v1_asm casm ../examples/loop_main.c -o out.bin --lowered out.s
+./build/casm_host -o out.bin   # 推荐：真正调用 main()
 ```
 
-## C 风格汇编（推荐书写方式）
+## C 风格汇编（原生执行）
 
-源文件像 C 一样写 `main`，汇编器维护 **上下文**；内建函数（如 `loop`）直接往上下文里填入 32B 指令二进制：
+`loop_main.c` 是真实 C：指令函数往**当前上下文**填 32B 二进制。
+
+生成流程（`casm_host`）：
+
+1. **创建上下文** `CcuV1CasmCtx`
+2. **`ccu_v1_casm_begin`**（调用 `main` 之前安装上下文）
+3. **调用 `main()`** — `loop` / `load_*` / … 在函数内填写指令二进制
+4. **`ccu_v1_casm_end`**
+5. **`ccu_v1_casm_write_file`** — 直接写二进制到文件
 
 ```c
-void main()
+#include "ccu_v1_casm_api.h"
+
+void main(void)
 {
-    loop(0, 10, 11);              /* → LOOP start=0 end=10 xn=11 */
+    loop(0, 10, 11);   /* 向上下文填写 LOOP 载荷二进制 */
     load_imd_to_xn(6, 0x1000, 0);
+    add(MS(0,1,2,0,0,0,0,0), 3, 1, 4, 13, 0, 1, 0x1, 2, 0x2);
 }
 ```
 
-完整覆盖全部 opcode 的例子：[`examples/loop_main.c`](examples/loop_main.c)（与 `all_opcodes.s` 操作数一致，`make test` 会 `cmp` 二者产出的 `.bin`）。
-- 入口：`void main()` / `int main()`（可写 `void` 形参）
-- 语句：`name(args...);`，`name` 为 ISA 助记符的小写形式（`LOOP` → `loop`）
-- `loop(start, end, xn)`：在上下文中填写 `CcuV1Loop` 载荷二进制（见 `ccu_v1_casm_loop`）
-- 其它 opcode 同样以函数调用形式发出
-- 列表操作数用 `{...}` 或 `[...]`（如 reduce 的 `ms`）
+构建：`loop_main.c` 以 `-Dmain=ccu_user_main` 编译，链入 `casm_host`。
 
-API：`c/include/ccu_v1_casm.h`（`CcuV1CasmCtx` / `ccu_v1_casm_loop` / `ccu_v1_casm_compile`）。
+完整 29 条 opcode：[`examples/loop_main.c`](examples/loop_main.c)（与 `all_opcodes.s` 二进制 `cmp` 一致）。
+
+API：`ccu_v1_casm.h` / `ccu_v1_casm_api.h`。
 
 ## 汇编语法（位置操作数）
 
@@ -70,6 +78,6 @@ LOAD_IMD_TO_XN offset, 0x1000, 0
 ## 目录
 
 ```
-c/          C 核心 + CLI
+c/          C 核心 + CLI + casm_host
 examples/   all_opcodes.s  vars_reuse.s  loop_main.c
 ```

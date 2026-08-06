@@ -1,17 +1,19 @@
 /*
  * C-style CCU V1 program covering every ISA opcode.
- * Operands match examples/all_opcodes.s so casm and numeric asm must cmp equal.
  *
- * Assembler context (CcuV1CasmCtx) accumulates packed 32B instructions;
- * loop() fills CcuV1Loop binary fields directly.
+ * Binary generation (casm_host):
+ *   create context → begin → call main() → each instr fills binary → write_file
+ *
+ * Operands match examples/all_opcodes.s (cmp equal binaries).
  */
+#include "ccu_v1_casm_api.h"
 
-void main()
+void main(void)
 {
     /* ---- LOAD ---- */
     load_sqeargs_to_gsa(1, 2);
     load_sqeargs_to_xn(3, 4);
-    load_imd_to_gsa(5, 0x1122334455667788);
+    load_imd_to_gsa(5, 0x1122334455667788ull);
     load_imd_to_xn(6, 0x1000, 0);
     load_gsa_xn(7, 8, 9);
     load_gsa_gsa(1, 2, 3);
@@ -43,7 +45,7 @@ void main()
     sync_xn(8, 9, 2, 10, 0x30, 0, 11, 0x31, 12, 0x32);
 
     /* ---- REDUCE ---- */
-    add({0, 1, 2, 0, 0, 0, 0, 0}, 3, 1, 4, 13, 0, 1, 0x1, 2, 0x2);
-    max({4, 5, 6, 7, 0, 0, 0, 0}, 4, 2, 14, 1, 3, 0x3, 4, 0x4);
-    min({8, 9, 10, 0, 0, 0, 0, 0}, 3, 1, 15, 0, 5, 0x5, 6, 0x6);
+    add(MS(0, 1, 2, 0, 0, 0, 0, 0), 3, 1, 4, 13, 0, 1, 0x1, 2, 0x2);
+    max(MS(4, 5, 6, 7, 0, 0, 0, 0), 4, 2, 14, 1, 3, 0x3, 4, 0x4);
+    min(MS(8, 9, 10, 0, 0, 0, 0, 0), 3, 1, 15, 0, 5, 0x5, 6, 0x6);
 }

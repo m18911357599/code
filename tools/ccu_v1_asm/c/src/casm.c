@@ -12,12 +12,74 @@ void ccu_v1_casm_init(CcuV1CasmCtx *ctx)
 {
     ccu_v1_program_init(&ctx->program);
     ctx->errmsg[0] = '\0';
+    ctx->failed = 0;
 }
 
 void ccu_v1_casm_free(CcuV1CasmCtx *ctx)
 {
     ccu_v1_program_free(&ctx->program);
     ctx->errmsg[0] = '\0';
+    ctx->failed = 0;
+}
+
+static __thread CcuV1CasmCtx *g_casm_current;
+
+int ccu_v1_casm_begin(CcuV1CasmCtx *ctx)
+{
+    if (!ctx) {
+        return -1;
+    }
+    if (g_casm_current) {
+        snprintf(ctx->errmsg, sizeof(ctx->errmsg), "casm context already active");
+        ctx->failed = 1;
+        return -1;
+    }
+    g_casm_current = ctx;
+    return 0;
+}
+
+void ccu_v1_casm_end(void)
+{
+    g_casm_current = NULL;
+}
+
+CcuV1CasmCtx *ccu_v1_casm_current(void)
+{
+    return g_casm_current;
+}
+
+int ccu_v1_casm_run(CcuV1CasmCtx *ctx, void (*entry)(void))
+{
+    if (!ctx || !entry) {
+        return -1;
+    }
+    if (ccu_v1_casm_begin(ctx) != 0) {
+        return -1;
+    }
+    entry();
+    ccu_v1_casm_end();
+    return ctx->failed ? -1 : 0;
+}
+
+int ccu_v1_casm_write_file(const CcuV1CasmCtx *ctx, const char *path)
+{
+    if (!ctx || !path) {
+        return -1;
+    }
+    uint8_t *bin = NULL;
+    size_t bin_len = 0;
+    if (ccu_v1_program_to_binary(&ctx->program, &bin, &bin_len) != 0) {
+        return -1;
+    }
+    FILE *f = fopen(path, "wb");
+    if (!f) {
+        free(bin);
+        return -1;
+    }
+    size_t nw = bin_len ? fwrite(bin, 1, bin_len, f) : 0;
+    fclose(f);
+    free(bin);
+    return (nw == bin_len) ? 0 : -1;
 }
 
 static int append_instr(CcuV1CasmCtx *ctx, const CcuV1Instr *instr)
@@ -199,6 +261,13 @@ static void skip_ws_comments(Parser *ps)
             }
             continue;
         }
+        /* Skip preprocessor lines (#include, ...) */
+        if (ps->p < ps->end && *ps->p == '#') {
+            while (ps->p < ps->end && *ps->p != '\n') {
+                ++ps->p;
+            }
+            continue;
+        }
         break;
     }
 }
@@ -278,7 +347,48 @@ static int parse_u64_lit(Parser *ps, uint64_t *out)
             v = v * 10u + (uint64_t)(*ps->p++ - '0');
         }
     }
+    /* Optional C integer suffixes: u, l, ull, ... */
+    while (ps->p < ps->end) {
+        char c = (char)(*ps->p | 32);
+        if (c == 'u' || c == 'l') {
+            ++ps->p;
+        } else {
+            break;
+        }
+    }
     *out = v;
+    return 0;
+}
+
+static int parse_list_body(Parser *ps, CcuV1CasmArg *arg, char close)
+{
+    arg->is_list = 1;
+    arg->list_n = 0;
+    skip_ws_comments(ps);
+    if (ps->p < ps->end && *ps->p == close) {
+        ++ps->p;
+        return 0;
+    }
+    for (;;) {
+        uint64_t v;
+        if (parse_u64_lit(ps, &v) != 0) {
+            return -1;
+        }
+        if (v > 0xffffu || arg->list_n >= CCU_V1_MS_MAX) {
+            snprintf(ps->ctx->errmsg, sizeof(ps->ctx->errmsg), "line %d: list element out of range", ps->line);
+            return -1;
+        }
+        arg->list[arg->list_n++] = (uint16_t)v;
+        skip_ws_comments(ps);
+        if (ps->p < ps->end && *ps->p == ',') {
+            ++ps->p;
+            continue;
+        }
+        break;
+    }
+    if (expect_char(ps, close) != 0) {
+        return -1;
+    }
     return 0;
 }
 
@@ -286,38 +396,15 @@ static int parse_arg(Parser *ps, CcuV1CasmArg *arg)
 {
     skip_ws_comments(ps);
     memset(arg, 0, sizeof(*arg));
+    /* MS(...) list helper used by native C API */
+    if (ps->p + 2 < ps->end && ps->p[0] == 'M' && ps->p[1] == 'S' && ps->p[2] == '(') {
+        ps->p += 3;
+        return parse_list_body(ps, arg, ')');
+    }
     if (ps->p < ps->end && (*ps->p == '{' || *ps->p == '[')) {
         char open = *ps->p++;
         char close = (open == '{') ? '}' : ']';
-        arg->is_list = 1;
-        arg->list_n = 0;
-        skip_ws_comments(ps);
-        if (ps->p < ps->end && *ps->p == close) {
-            ++ps->p;
-            return 0;
-        }
-        for (;;) {
-            uint64_t v;
-            if (parse_u64_lit(ps, &v) != 0) {
-                return -1;
-            }
-            if (v > 0xffffu || arg->list_n >= CCU_V1_MS_MAX) {
-                snprintf(ps->ctx->errmsg, sizeof(ps->ctx->errmsg), "line %d: list element out of range",
-                         ps->line);
-                return -1;
-            }
-            arg->list[arg->list_n++] = (uint16_t)v;
-            skip_ws_comments(ps);
-            if (ps->p < ps->end && *ps->p == ',') {
-                ++ps->p;
-                continue;
-            }
-            break;
-        }
-        if (expect_char(ps, close) != 0) {
-            return -1;
-        }
-        return 0;
+        return parse_list_body(ps, arg, close);
     }
     if (parse_u64_lit(ps, &arg->scalar) != 0) {
         return -1;

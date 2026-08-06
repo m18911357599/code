@@ -507,21 +507,14 @@ static int cmd_casm(const char *in_path, const char *out_path, const char *lower
         fclose(lf);
     }
 
-    uint8_t *bin = NULL;
-    size_t bin_len = 0;
-    if (ccu_v1_program_to_binary(&ctx.program, &bin, &bin_len) != 0) {
-        fprintf(stderr, "error: encode failed\n");
+    /* Direct write of packed instruction bytes. */
+    if (ccu_v1_casm_write_file(&ctx, out_path) != 0) {
+        fprintf(stderr, "error: cannot write %s\n", out_path);
         ccu_v1_casm_free(&ctx);
         return 2;
     }
-    if (write_file(out_path, bin, bin_len) != 0) {
-        fprintf(stderr, "error: cannot write %s: %s\n", out_path, strerror(errno));
-        free(bin);
-        ccu_v1_casm_free(&ctx);
-        return 2;
-    }
-    printf("casm: %zu instructions -> %s (%zu bytes)\n", ctx.program.count, out_path, bin_len);
-    free(bin);
+    printf("casm: %zu instructions -> %s (%zu bytes)\n", ctx.program.count, out_path,
+           ctx.program.count * (size_t)CCU_V1_INSTR_SIZE);
     ccu_v1_casm_free(&ctx);
     return 0;
 }
