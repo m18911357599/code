@@ -331,7 +331,7 @@ use_sdma = remote && segment_bytes >= 2MB
 
 ---
 
-## 8. 参考源码路径（cann/shmem）
+## 8. 参考源码与核心代码（cann/shmem）
 
 | 模块 | 路径 |
 | --- | --- |
@@ -342,6 +342,301 @@ use_sdma = remote && segment_bytes >= 2MB
 | SDMA demo | `examples/sdma/` |
 | NotifyWait | `examples/notifywait/` |
 | 双平面 MoE | `examples/dispatch/dispatch_doubleplane/` |
+
+### 8.1 Channel / SQE 结构体
+
+来源：`shmemi_device_sdma.h`
+
+```cpp
+struct stars_channel_info_t {
+    uint32_t sq_head;
+    uint32_t sq_tail;        // 软件维护的提交尾（offset +4）
+    uint64_t sq_base;        // SQ 缓冲区基地址（HBM）
+    uint64_t sq_reg_base;    // SQ 寄存器基地址（门铃 MMIO）
+    uint32_t sq_depth;
+    uint32_t sq_id;
+    uint32_t cq_id;
+    uint32_t logic_cq_id;
+    uint64_t cqe_addr;
+    uint32_t report_cqe_num;
+    uint32_t stream_id;
+    uint32_t dev_id;
+    uint8_t reserved[4];     // 对齐到 64 字节
+};
+
+struct stars_sqe_header_t {
+    uint8_t type : 6;        // SDMA=11, NOTIFY_RECORD=6
+    uint16_t res1 : 10;
+    uint16_t block_dim;
+    uint16_t rt_streamid;
+    uint16_t task_id;        // = sq_tail - sq_head
+};
+
+struct stars_sdma_sqe_t {
+    stars_sqe_header_t header;   // 0~7
+    uint32_t res3;               // 8~11
+    uint16_t res4;
+    uint8_t kernel_credit;       // 14: 数据 SQE 填 240
+    uint8_t ptr_mode : 1;        // 15: 0=直接地址
+    uint8_t res5 : 7;
+    uint32_t opcode : 8;         // 16: copy=0
+    uint32_t ie2 : 1;
+    uint32_t sssv : 1;           // src stream valid
+    uint32_t dssv : 1;           // dst stream valid
+    uint32_t sns : 1;
+    uint32_t dns : 1;
+    uint32_t qos : 4;            // HCCL QoS=6
+    uint32_t sro : 1;
+    uint32_t dro : 1;
+    uint32_t partid : 8;
+    uint32_t mpam : 1;
+    uint32_t res6 : 4;
+    uint16_t src_streamid;
+    uint16_t src_sub_streamid;
+    uint16_t dst_streamid;
+    uint16_t dst_sub_streamid;
+    uint32_t length;
+    uint32_t src_addr_low;
+    uint32_t src_addr_high;
+    uint32_t dst_addr_low;
+    uint32_t dst_addr_high;
+    uint8_t link_type;           // 填 255
+    uint8_t resvered[3];
+    uint32_t reslast[3];         // 对齐到 64B
+};
+
+// Doorbell 偏移：A2/A3=0x8，Ascend950(3510)=0x0
+#if defined(__NPU_ARCH__) && (__NPU_ARCH__ == 3510)
+constexpr uint32_t ACLSHMEM_STARS_SQ_TAIL_OFFSET = 0x0;
+#else
+constexpr uint32_t ACLSHMEM_STARS_SQ_TAIL_OFFSET = 0x8;
+#endif
+```
+
+### 8.2 填充 SDMA SQE
+
+来源：`shmem_device_sdma.hpp` → `aclshmemi_fill_sdma_sqe`
+
+```cpp
+ACLSHMEM_DEVICE void aclshmemi_fill_sdma_sqe(__gm__ stars_channel_info_t* channel_info,
+                                             __gm__ uint8_t* src, __gm__ uint8_t* dst,
+                                             uint32_t length, uint32_t sq_tail, uint32_t task_id)
+{
+    __gm__ stars_sdma_sqe_t *sqe =
+        (__gm__ stars_sdma_sqe_t *)(channel_info->sq_base);
+    sqe += (sq_tail % channel_info->sq_depth);
+
+    sqe->header.type = ACLSHMEM_SQE_TYPE_SDMA;   // 11
+    sqe->header.block_dim = 0;
+    sqe->header.rt_streamid = channel_info->stream_id;
+    sqe->header.task_id = task_id;
+
+    sqe->kernel_credit = ACLSHMEM_STARS_DEFAULT_KERNEL_CREDIT; // 240
+    sqe->ptr_mode = 0;
+
+    sqe->opcode = 0;
+    sqe->ie2 = 0;
+    sqe->sssv = 1U;
+    sqe->dssv = 1U;
+    sqe->sns = 1U;
+    sqe->dns = 1U;
+    sqe->qos = 6;   // HCCL QoS
+    sqe->partid = 0U;
+    sqe->mpam = 0;
+    sqe->length = length;
+
+    uint64_t src_addr = reinterpret_cast<uint64_t>(src);
+    uint64_t dst_addr = reinterpret_cast<uint64_t>(dst);
+    sqe->src_addr_low  = static_cast<uint32_t>(src_addr & 0xFFFFFFFF);
+    sqe->src_addr_high = static_cast<uint32_t>((src_addr >> 32) & 0xFFFFFFFF);
+    sqe->dst_addr_low  = static_cast<uint32_t>(dst_addr & 0xFFFFFFFF);
+    sqe->dst_addr_high = static_cast<uint32_t>((dst_addr >> 32) & 0xFFFFFFFF);
+    sqe->link_type = static_cast<uint8_t>(255U);
+}
+```
+
+### 8.3 Post Send：组 SQE → DCCI → 敲 DB
+
+来源：`aclshmemi_sdma_post_send`（核心片段）
+
+```cpp
+ACLSHMEM_DEVICE void aclshmemi_sdma_post_send(__gm__ uint8_t *recv_buffer,
+                                              __gm__ uint8_t *send_buffer,
+                                              uint64_t message_len,
+                                              AscendC::LocalTensor<uint32_t> &tmp_local,
+                                              uint32_t sync_id)
+{
+    __gm__ uint8_t *channel_base = aclshmemi_sdma_get_channel_base();
+    const auto cur_block_idx = AscendC::GetBlockIdx();
+
+    sdma_config_t config;
+    config.queue_num = 1;
+    config.block_bytes = 1024 * 1024;           // 1MB / SQE
+    config.per_core_bytes = message_len;
+    config.iter_num = (config.per_core_bytes + config.block_bytes - 1) / config.block_bytes;
+
+    __gm__ stars_channel_info_t *batch_write_channel_info =
+        (__gm__ stars_channel_info_t *)(channel_base) + cur_block_idx * config.queue_num;
+
+    // 1) 读软件 sq_tail（先 dcci，避免 stale）
+    uint32_t sq_tail[ACLSHMEM_MAX_AIV_PER_NPU] = {0};
+    for (uint32_t queue_id = 0U; queue_id < config.queue_num; ++queue_id) {
+        __gm__ stars_channel_info_t *channel_info = batch_write_channel_info + queue_id;
+        dcci_cacheline(((__gm__ uint8_t *)channel_info) + 4);
+        sq_tail[queue_id] = *((__gm__ uint32_t *)(((__gm__ uint8_t *)channel_info) + 4));
+    }
+
+    // 2) 按 1MB 分片填数据 SQE
+    aclshmemi_sdma_submit_data_sqes(batch_write_channel_info, send_buffer, recv_buffer,
+                                    config, sq_tail);
+
+    // 3) DCCI 刷 SQE 到 HBM，再敲 doorbell
+    auto item_size = config.iter_num * sizeof(stars_sdma_sqe_t);
+    for (uint8_t queue_id = 0; queue_id < config.queue_num; queue_id++) {
+        __gm__ stars_channel_info_t *channel_info = batch_write_channel_info + queue_id;
+
+        AscendC::GlobalTensor<uint8_t> write_info;
+        write_info.SetGlobalBuffer((__gm__ uint8_t *)(channel_info->sq_base), item_size);
+        AscendC::DataCacheCleanAndInvalid<uint8_t, AscendC::CacheLine::ENTIRE_DATA_CACHE,
+            AscendC::DcciDst::CACHELINE_OUT>(write_info);
+
+        // Ring Doorbell：写硬件 SQ Tail
+        aclshmemi_set_value<uint32_t>(
+            (__gm__ uint8_t *)(channel_info->sq_reg_base) + ACLSHMEM_STARS_SQ_TAIL_OFFSET,
+            sq_tail[queue_id], tmp_local, sync_id);
+        // 同步软件侧 sq_tail
+        aclshmemi_set_value<uint32_t>(
+            ((__gm__ uint8_t *)channel_info) + 4, sq_tail[queue_id], tmp_local, sync_id);
+    }
+    AscendC::PipeBarrier<PIPE_ALL>();
+}
+```
+
+`submit_data_sqes` 内每次：
+
+```cpp
+aclshmemi_fill_sdma_sqe(channel_info, src_addr, dst_addr, transfer_bytes,
+                        sq_tail[queue_idx],
+                        sq_tail[queue_idx] - channel_info->sq_head);
+sq_tail[queue_idx] = (sq_tail[queue_idx] + 1) % (channel_info->sq_depth);
+```
+
+### 8.4 Quiet：Flag SQE + Poll
+
+来源：`aclshmemi_sdma_submit_flag_sqes` / `aclshmemi_sdma_poll_for_completion`
+
+```cpp
+// 再提交一条 SDMA SQE：把 send flag(8B) DMA 到 remote_recv_workspace
+aclshmemi_fill_sdma_sqe(channel_info,
+    layout.send_workspace,
+    layout.remote_recv_workspace + queue_id * ACLSHMEM_SDMA_FLAG_LENGTH,
+    /*flag_size=*/8, sq_tail, sq_tail - channel_info->sq_head);
+
+sq_tail = (sq_tail + 1) % (channel_info->sq_depth);
+
+// DCCI + Ring Doorbell（同 post_send）
+aclshmemi_set_value<uint32_t>(
+    (__gm__ uint8_t *)(channel_info->sq_reg_base) + ACLSHMEM_STARS_SQ_TAIL_OFFSET,
+    sq_tail, tmp_local, sync_id);
+aclshmemi_set_value<uint32_t>(((__gm__ uint8_t *)channel_info) + 4, sq_tail, tmp_local, sync_id);
+
+// AIV 自旋等待 flag 非 0
+while (send_value == 0 && times < max_times /*1e6*/) {
+    copy_gm_to_gm<uint32_t>(local_recv_workspace, remote_recv_workspace, 1, tmp_local, sync_id);
+    dcci_cacheline(local_recv_workspace);
+    send_value = *((__gm__ uint32_t *)local_recv_workspace);
+    times++;
+}
+```
+
+### 8.5 Notify Record SQE
+
+来源：`aclshmemi_fill_notify_record_sqe` / `aclshmemi_stars_submit_notify_record`
+
+```cpp
+ACLSHMEM_DEVICE void aclshmemi_fill_notify_record_sqe(__gm__ stars_channel_info_t *channel_info,
+                                                      uint32_t sq_tail, uint32_t task_id,
+                                                      uint32_t notify_id)
+{
+    __gm__ stars_notify_sqe_t *sqe =
+        (__gm__ stars_notify_sqe_t *)(channel_info->sq_base);
+    sqe += (sq_tail % channel_info->sq_depth);
+
+    sqe->header.type = ACLSHMEM_SQE_TYPE_NOTIFY_RECORD; // 6
+    sqe->header.block_dim = 0;
+    sqe->header.rt_streamid = channel_info->stream_id;
+    sqe->header.task_id = task_id;
+    sqe->notify_id = notify_id;
+    sqe->kernel_credit = ACLSHMEM_DEFAULT_KERNEL_CREDIT; // 254
+}
+
+// 提交时同样：填 SQE → DCCI → 写 sq_reg_base+offset → 更新软件 sq_tail
+aclshmemi_set_value<uint32_t>(
+    (__gm__ uint8_t *)(channel_info->sq_reg_base) + ACLSHMEM_STARS_SQ_TAIL_OFFSET,
+    sq_tail, tmp_local, sync_id);
+```
+
+### 8.6 Host 控制面建链
+
+来源：`device_sdma_transport_manager.cpp` → `OpenDevice`
+
+```cpp
+Result SdmaTransportManager::OpenDevice(const TransportOptions& options)
+{
+    // 1) 按最大 AIV 数建 STARS stream（取 sq_id/cq_id/stream_id）
+    ACLSHMEM_CHECK_RET(CreateStarsStreams(ACLSHMEM_MAX_AIV_PER_NPU)); // 48
+
+    // 2) AIV/AICPU 共享 workspace
+    constexpr size_t workspace_size = 16 * 1024;
+    ACLSHMEM_CHECK_RET(MallocSdmaWorkspace(workspace_size));
+
+    // 3) Notify id 写入 workspace + 14KB
+    CreateNotifyIds();
+
+    // 4) 资源 H2D，并 launch AICPU 查询 STARS SQ 基址/门铃基址
+    ACLSHMEM_CHECK_RET(CopyHostOpResToDevice());
+    ACLSHMEM_CHECK_RET(
+        LaunchSdmaAicpuKernel(reinterpret_cast<uint64_t>(op_res_info_device_ptr_),
+                              op_res_info_.workspace_addr));
+    return ACLSHMEM_SUCCESS;
+}
+```
+
+`CreateStarsStreams` 关键片段：
+
+```cpp
+ACLSHMEM_CHECK_RET(aclrtCreateStreamWithConfig(&stream, 0, ACL_STREAM_DEVICE_USE_ONLY));
+aclrtStreamGetId(stream, &stream_id);
+DlRtApi::RtStreamGetSqid(stream, &sq_id);
+DlRtApi::RtStreamGetCqid(stream, &cq_id, &logic_cq_id);
+streams_[i].stream_id = stream_id;
+streams_[i].sq_id = sq_id;
+streams_[i].cq_id = cq_id;
+streams_[i].dev_id = die_id;
+```
+
+### 8.7 高阶 put 入口
+
+来源：`aclshmemx_sdma_put_nbi`
+
+```cpp
+template <typename T>
+ACLSHMEM_DEVICE void aclshmemx_sdma_put_nbi(__gm__ T *dst, __gm__ T *src, __ubuf__ T *buf,
+                                            uint32_t ub_size, uint32_t elem_size,
+                                            int pe, uint32_t sync_id)
+{
+    auto ptr = aclshmem_ptr(dst, pe);   // 对称地址 → 远端 VA
+
+    AscendC::LocalTensor<uint32_t> ub_tensor;
+    ub_tensor.address_.logicPos = static_cast<uint8_t>(AscendC::TPosition::VECOUT);
+    ub_tensor.address_.bufferAddr = reinterpret_cast<uint64_t>(buf);
+    ub_tensor.address_.dataLen = ub_size;
+
+    // put: 本地 src → 远端 ptr
+    aclshmemi_sdma_post_send((__gm__ uint8_t *)ptr, (__gm__ uint8_t *)src,
+                             elem_size * sizeof(T), ub_tensor, sync_id);
+}
+```
 
 ---
 
