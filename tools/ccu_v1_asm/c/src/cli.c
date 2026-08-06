@@ -8,6 +8,7 @@
  */
 #include "ccu_v1_asm.h"
 #include "ccu_v1_vasm.h"
+#include "ccu_v1_casm.h"
 
 #include <errno.h>
 #include <stdio.h>
@@ -475,6 +476,116 @@ static int cmd_verify_vasm(const char *in_path, const char *work_dir)
     return 0;
 }
 
+static int cmd_casm(const char *in_path, const char *out_path, const char *lowered_path)
+{
+    uint8_t *text = NULL;
+    size_t text_len = 0;
+    if (read_file(in_path, &text, &text_len) != 0) {
+        fprintf(stderr, "error: cannot read %s: %s\n", in_path, strerror(errno));
+        return 2;
+    }
+    CcuV1CasmCtx ctx;
+    ccu_v1_casm_init(&ctx);
+    if (ccu_v1_casm_compile((const char *)text, text_len, &ctx) != 0) {
+        fprintf(stderr, "error: %s\n", ctx.errmsg);
+        free(text);
+        ccu_v1_casm_free(&ctx);
+        return 2;
+    }
+    free(text);
+
+    if (lowered_path) {
+        FILE *lf = fopen(lowered_path, "wb");
+        if (!lf || ccu_v1_disassemble_program(&ctx.program, lf) != 0) {
+            fprintf(stderr, "error: cannot write lowered %s\n", lowered_path);
+            if (lf) {
+                fclose(lf);
+            }
+            ccu_v1_casm_free(&ctx);
+            return 2;
+        }
+        fclose(lf);
+    }
+
+    uint8_t *bin = NULL;
+    size_t bin_len = 0;
+    if (ccu_v1_program_to_binary(&ctx.program, &bin, &bin_len) != 0) {
+        fprintf(stderr, "error: encode failed\n");
+        ccu_v1_casm_free(&ctx);
+        return 2;
+    }
+    if (write_file(out_path, bin, bin_len) != 0) {
+        fprintf(stderr, "error: cannot write %s: %s\n", out_path, strerror(errno));
+        free(bin);
+        ccu_v1_casm_free(&ctx);
+        return 2;
+    }
+    printf("casm: %zu instructions -> %s (%zu bytes)\n", ctx.program.count, out_path, bin_len);
+    free(bin);
+    ccu_v1_casm_free(&ctx);
+    return 0;
+}
+
+static int cmd_verify_casm(const char *in_path, const char *work_dir)
+{
+    char work[512];
+    if (work_dir) {
+        snprintf(work, sizeof(work), "%s", work_dir);
+    } else {
+        char dir[512];
+        const char *slash = strrchr(in_path, '/');
+        if (slash) {
+            size_t n = (size_t)(slash - in_path);
+            if (n >= sizeof(dir)) {
+                n = sizeof(dir) - 1;
+            }
+            memcpy(dir, in_path, n);
+            dir[n] = '\0';
+            snprintf(work, sizeof(work), "%s/.ccu_v1_casm_verify", dir);
+        } else {
+            snprintf(work, sizeof(work), ".ccu_v1_casm_verify");
+        }
+    }
+    if (mkdir_p(work) != 0) {
+        fprintf(stderr, "error: cannot create work dir %s\n", work);
+        return 2;
+    }
+
+    char stem[256];
+    basename_stem(in_path, stem, sizeof(stem));
+    char bin_path[640], low_path[640], rebin_path[640];
+    path_join(work, stem, bin_path, sizeof(bin_path));
+    strncat(bin_path, ".bin", sizeof(bin_path) - strlen(bin_path) - 1);
+    path_join(work, stem, low_path, sizeof(low_path));
+    strncat(low_path, ".lowered.s", sizeof(low_path) - strlen(low_path) - 1);
+    path_join(work, stem, rebin_path, sizeof(rebin_path));
+    strncat(rebin_path, ".re.bin", sizeof(rebin_path) - strlen(rebin_path) - 1);
+
+    if (cmd_casm(in_path, bin_path, low_path) != 0) {
+        return 2;
+    }
+    if (cmd_assemble(low_path, rebin_path) != 0) {
+        return 2;
+    }
+    uint8_t *a = NULL, *b = NULL;
+    size_t al = 0, bl = 0;
+    if (read_file(bin_path, &a, &al) != 0 || read_file(rebin_path, &b, &bl) != 0) {
+        fprintf(stderr, "error: cannot read verify binaries\n");
+        free(a);
+        free(b);
+        return 2;
+    }
+    int ok = (al == bl && memcmp(a, b, al) == 0);
+    free(a);
+    free(b);
+    if (!ok) {
+        fprintf(stderr, "FAIL: casm binary != assemble(lowered)\n");
+        return 1;
+    }
+    printf("OK casm verify: binary == assemble(lowered)\n");
+    return 0;
+}
+
 static void usage(const char *argv0)
 {
     fprintf(stderr,
@@ -484,8 +595,10 @@ static void usage(const char *argv0)
             "  %s verify      <in.s> [-w workdir]\n"
             "  %s vasm        <in.s> -o <out.bin> [-m out.meta.json] [--lowered out.s]\n"
             "  %s verify-vasm <in.s> [-w workdir]\n"
-            "Aliases: as, dis\n",
-            argv0, argv0, argv0, argv0, argv0);
+            "  %s casm        <in.c> -o <out.bin> [--lowered out.s]\n"
+            "  %s verify-casm <in.c> [-w workdir]\n"
+            "Aliases: as, dis, assemble-c\n",
+            argv0, argv0, argv0, argv0, argv0, argv0, argv0);
 }
 
 int main(int argc, char **argv)
@@ -623,6 +736,59 @@ int main(int argc, char **argv)
             return 2;
         }
         return cmd_verify_vasm(in, work);
+    }
+    if (strcmp(cmd, "casm") == 0 || strcmp(cmd, "assemble-c") == 0) {
+        const char *in = NULL;
+        const char *out = NULL;
+        const char *lowered = NULL;
+        for (int i = 2; i < argc; ++i) {
+            if (strcmp(argv[i], "-o") == 0 || strcmp(argv[i], "--output") == 0) {
+                if (i + 1 >= argc) {
+                    usage(argv[0]);
+                    return 2;
+                }
+                out = argv[++i];
+            } else if (strcmp(argv[i], "--lowered") == 0) {
+                if (i + 1 >= argc) {
+                    usage(argv[0]);
+                    return 2;
+                }
+                lowered = argv[++i];
+            } else if (!in) {
+                in = argv[i];
+            } else {
+                usage(argv[0]);
+                return 2;
+            }
+        }
+        if (!in || !out) {
+            usage(argv[0]);
+            return 2;
+        }
+        return cmd_casm(in, out, lowered);
+    }
+    if (strcmp(cmd, "verify-casm") == 0) {
+        const char *in = NULL;
+        const char *work = NULL;
+        for (int i = 2; i < argc; ++i) {
+            if (strcmp(argv[i], "-w") == 0 || strcmp(argv[i], "--work-dir") == 0) {
+                if (i + 1 >= argc) {
+                    usage(argv[0]);
+                    return 2;
+                }
+                work = argv[++i];
+            } else if (!in) {
+                in = argv[i];
+            } else {
+                usage(argv[0]);
+                return 2;
+            }
+        }
+        if (!in) {
+            usage(argv[0]);
+            return 2;
+        }
+        return cmd_verify_casm(in, work);
     }
     usage(argv[0]);
     return 2;

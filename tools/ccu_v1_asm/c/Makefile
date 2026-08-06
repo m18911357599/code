@@ -4,7 +4,7 @@ CFLAGS  ?= -O3 -march=native -flto -Wall -Wextra -Werror -std=c11
 CFLAGS  += -Iinclude
 LDFLAGS ?= -flto
 
-SRCS := src/isa.c src/asm.c src/vasm.c src/cli.c
+SRCS := src/isa.c src/asm.c src/vasm.c src/casm.c src/cli.c
 OBJS := $(SRCS:src/%.c=build/%.o)
 
 .PHONY: all clean test install
@@ -14,7 +14,7 @@ all: build/ccu_v1_asm
 build:
 	mkdir -p build
 
-build/%.o: src/%.c include/ccu_v1_isa.h include/ccu_v1_asm.h include/ccu_v1_vasm.h | build
+build/%.o: src/%.c include/ccu_v1_isa.h include/ccu_v1_asm.h include/ccu_v1_vasm.h include/ccu_v1_casm.h | build
 	$(CC) $(CFLAGS) -c $< -o $@
 
 build/ccu_v1_asm: $(OBJS)
@@ -34,6 +34,10 @@ b=[v for v in m["variables"] if v["name"]=="phase_b"][0];\
 assert a["id"]==b["id"], (a,b);\
 assert a["live_end"] < b["live_start"], (a,b);\
 print("reuse check OK: phase_a/phase_b share xn id", a["id"])'
+	./build/ccu_v1_asm verify-casm ../examples/loop_main.c -w build/casm_verify
+	./build/ccu_v1_asm casm ../examples/loop_main.c -o build/loop.bin --lowered build/loop.lowered.s
+	@python3 -c 'from pathlib import Path; t=Path("build/loop.lowered.s").read_text();\
+assert "LOOP 0, 10, 11" in t, t; print("casm loop check OK")'
 	@echo "ALL C TESTS PASSED"
 
 clean:

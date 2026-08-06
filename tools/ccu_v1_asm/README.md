@@ -2,7 +2,7 @@
 
 基于 [cann/hcomm](https://gitcode.com/cann/hcomm) 的 **CcuV1** 定长微码（32B/`CcuInstr`）。
 
-高性能 C 实现：[`c/`](c/)（解析 / 编码 / 变量分配 / CLI）。
+高性能 C 实现：[`c/`](c/)（解析 / 编码 / 变量分配 / C 风格前端 / CLI）。
 
 ## 快速开始
 
@@ -20,11 +20,34 @@ make -j && make test
 | `verify` | 数值汇编往返语义验证 |
 | `vasm` / `assemble-var` | **命名变量汇编** → `.bin` + **metainfo** |
 | `verify-vasm` | 变量汇编验证（bin == assemble(lowered)） |
+| `casm` / `assemble-c` | **C 风格源文件** → `.bin`（上下文内建填二进制） |
+| `verify-casm` | C 风格汇编验证 |
 
 ```bash
 ./build/ccu_v1_asm as ../examples/all_opcodes.s -o out.bin
 ./build/ccu_v1_asm vasm ../examples/vars_reuse.s -o out.bin -m out.meta.json
+./build/ccu_v1_asm casm ../examples/loop_main.c -o out.bin --lowered out.s
 ```
+
+## C 风格汇编（推荐书写方式）
+
+源文件像 C 一样写 `main`，汇编器维护 **上下文**；内建函数（如 `loop`）直接往上下文里填入 32B 指令二进制：
+
+```c
+void main()
+{
+    loop(0, 10, 11);              /* → LOOP start=0 end=10 xn=11 */
+    load_imd_to_xn(6, 0x1000, 0);
+}
+```
+
+- 入口：`void main()` / `int main()`（可写 `void` 形参）
+- 语句：`name(args...);`，`name` 为 ISA 助记符的小写形式（`LOOP` → `loop`）
+- `loop(start, end, xn)`：在上下文中填写 `CcuV1Loop` 载荷二进制（见 `ccu_v1_casm_loop`）
+- 其它 opcode 同样以函数调用形式发出
+- 列表操作数用 `{...}` 或 `[...]`（如 reduce 的 `ms`）
+
+API：`c/include/ccu_v1_casm.h`（`CcuV1CasmCtx` / `ccu_v1_casm_loop` / `ccu_v1_casm_compile`）。
 
 ## 汇编语法（位置操作数）
 
@@ -47,5 +70,5 @@ LOAD_IMD_TO_XN offset, 0x1000, 0
 
 ```
 c/          C 核心 + CLI
-examples/   all_opcodes.s  vars_reuse.s
+examples/   all_opcodes.s  vars_reuse.s  loop_main.c
 ```

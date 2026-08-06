@@ -10,4 +10,4 @@ CCU / HCOMM 相关分析笔记与工具。
 
 - [CCU V1 汇编器](tools/ccu_v1_asm/README.md)
   - C 实现：`tools/ccu_v1_asm/c`
-  - 位置操作数、变量自动分配/复用、metainfo
+  - C 风格源（`void main() { loop(...); }`）、位置操作数、变量分配/复用、metainfo
