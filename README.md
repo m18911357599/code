@@ -8,6 +8,7 @@ CCU / HCOMM 相关分析笔记与工具。
 
 ## 工具
 
-- [CCU V1 汇编器（C）](tools/ccu_v1_asm/README.md)
-  - 数值汇编 / 反汇编 / verify
-  - **变量汇编 `vasm`**：命名资源、生命周期分析、ID 自动分配复用、输出 metainfo
+- [CCU V1 汇编器](tools/ccu_v1_asm/README.md)
+  - **C** 核心：`tools/ccu_v1_asm/c`
+  - **C++** API/CLI：`tools/ccu_v1_asm/cpp`（[与 C 对照文档](tools/ccu_v1_asm/cpp/docs/API_MAPPING.md)）
+  - 位置操作数、变量自动分配/复用、metainfo
