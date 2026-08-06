@@ -37,10 +37,11 @@ make -j && make test
 
 1. **创建上下文** `CcuV1CasmCtx`
 2. **`ccu_v1_casm_begin`**（调用 `main` 之前安装上下文）
-3. **调用 `main()`** — `loop` / `load_*` / … 在函数内填写指令二进制
+3. **调用 `main()`** — `loop` / `load_*` / … 经 `ccu_v1_casm_emit` 得到 `ctx->inst`，直接写载荷字段
 4. **`ccu_v1_casm_end`**
-5. **`ccu_v1_casm_write_file`** — 直接写二进制到文件
+5. **`ccu_v1_casm_write_file`** — `fwrite` 连续 32B 指令到文件
 
+无文本拼装 / `emit_scalars`；原生路径零助记符查找。
 ```c
 #include "ccu_v1_casm_api.h"
 

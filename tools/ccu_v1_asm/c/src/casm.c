@@ -11,6 +11,7 @@
 void ccu_v1_casm_init(CcuV1CasmCtx *ctx)
 {
     ccu_v1_program_init(&ctx->program);
+    ctx->inst = NULL;
     ctx->errmsg[0] = '\0';
     ctx->failed = 0;
 }
@@ -18,6 +19,7 @@ void ccu_v1_casm_init(CcuV1CasmCtx *ctx)
 void ccu_v1_casm_free(CcuV1CasmCtx *ctx)
 {
     ccu_v1_program_free(&ctx->program);
+    ctx->inst = NULL;
     ctx->errmsg[0] = '\0';
     ctx->failed = 0;
 }
@@ -66,46 +68,59 @@ int ccu_v1_casm_write_file(const CcuV1CasmCtx *ctx, const char *path)
     if (!ctx || !path) {
         return -1;
     }
-    uint8_t *bin = NULL;
-    size_t bin_len = 0;
-    if (ccu_v1_program_to_binary(&ctx->program, &bin, &bin_len) != 0) {
-        return -1;
-    }
     FILE *f = fopen(path, "wb");
     if (!f) {
-        free(bin);
         return -1;
     }
-    size_t nw = bin_len ? fwrite(bin, 1, bin_len, f) : 0;
+    /* Items are already packed CcuV1Instr (32B); write them directly. */
+    size_t n = ctx->program.count;
+    if (n > 0) {
+        if (fwrite(ctx->program.items, CCU_V1_INSTR_SIZE, n, f) != n) {
+            fclose(f);
+            return -1;
+        }
+    }
     fclose(f);
-    free(bin);
-    return (nw == bin_len) ? 0 : -1;
+    return 0;
+}
+
+int ccu_v1_casm_emit(CcuV1CasmCtx *ctx, uint8_t type, uint16_t code)
+{
+    if (!ctx) {
+        return -1;
+    }
+    if (ccu_v1_program_reserve(&ctx->program, ctx->program.count + 1) != 0) {
+        snprintf(ctx->errmsg, sizeof(ctx->errmsg), "oom appending instruction");
+        ctx->failed = 1;
+        ctx->inst = NULL;
+        return -1;
+    }
+    CcuV1Instr *inst = &ctx->program.items[ctx->program.count++];
+    memset(inst, 0, sizeof(*inst));
+    inst->header.raw = ccu_v1_make_header(type, code);
+    ctx->inst = inst;
+    return 0;
 }
 
 static int append_instr(CcuV1CasmCtx *ctx, const CcuV1Instr *instr)
 {
-    if (ccu_v1_program_reserve(&ctx->program, ctx->program.count + 1) != 0) {
-        snprintf(ctx->errmsg, sizeof(ctx->errmsg), "oom appending instruction");
+    if (ccu_v1_casm_emit(ctx, 0, 0) != 0) {
         return -1;
     }
-    ctx->program.items[ctx->program.count++] = *instr;
+    /* Preserve caller-provided header+payload (used by text-lowered path). */
+    *ctx->inst = *instr;
     return 0;
 }
 
 int ccu_v1_casm_loop(CcuV1CasmCtx *ctx, uint16_t start, uint16_t end, uint16_t xn)
 {
-    const CcuV1OpcodeDesc *desc = ccu_v1_lookup_mnemonic("LOOP");
-    if (!desc) {
-        snprintf(ctx->errmsg, sizeof(ctx->errmsg), "internal: LOOP opcode missing");
+    if (ccu_v1_casm_emit(ctx, CCU_V1_CTRL_TYPE, 0x0) != 0) {
         return -1;
     }
-    CcuV1Instr instr;
-    ccu_v1_instr_set_opcode(&instr, desc);
-    /* Fill LOOP payload binary fields directly. */
-    instr.loop.start = start;
-    instr.loop.end = end;
-    instr.loop.xn = xn;
-    return append_instr(ctx, &instr);
+    ctx->inst->loop.start = start;
+    ctx->inst->loop.end = end;
+    ctx->inst->loop.xn = xn;
+    return 0;
 }
 
 static void name_to_mnemonic(const char *name, char *out, size_t out_sz)
