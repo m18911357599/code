@@ -7,19 +7,56 @@
 
 ## 1. 编程模型
 
-### 1.1 硬件前提：异步多流水
+### 1.1 编程者视角的硬件模型：4 类并行单元构成多 Pipeline
 
-AI Core 内 Scalar 负责取指/译码/发射，把指令分发到各自独立的指令队列；Vector、Cube、MTE2/MTE3/MTE1、FixPipe 等单元**异步并行**执行。这是多 Pipeline 编程的硬件根基。
+从编程者角度，AI Core 可以简化为 **4 类执行单元**，它们各自持有独立的指令队列，**异步并行**推进——这就是“多 Pipeline”的全部含义：
 
-典型 Vector 数据路径：
+| 单元 | 角色 | 对应流水 |
+|------|------|----------|
+| **Scalar** | “指挥官”：取指/译码，把指令**顺序发射**到各单元的指令队列；自身也执行标量计算（GetValue 等） | PIPE_S |
+| **Vector** | 矢量计算，读写 UB | PIPE_V |
+| **Cube** | 矩阵计算，读写 L0A/L0B/L0C | PIPE_M |
+| **MTE** | 搬运引擎，细分为：MTE2（GM→UB/L1，搬入）、MTE3（UB→GM，搬出）、MTE1（L1→L0A/L0B）、FixPipe（L0C→GM/L1/UB） | PIPE_MTE2 / MTE3 / MTE1 / FIX |
+
+关键心智模型：
 
 ```
-GM --MTE2--> UB(VECIN) --PIPE_V--> UB(VECOUT) --MTE3--> GM
+                 ┌── Vector 指令队列 ──→ Vector 单元 ──┐
+Scalar 顺序发射 ─┼── Cube   指令队列 ──→ Cube   单元 ──┼── 各队列内部顺序执行
+                 └── MTE    指令队列 ──→ MTE    单元 ──┘    队列之间完全并行
 ```
 
-同一片 Local Memory 上若存在写后读 / 读后写依赖，就必须用同步约束时序。
+- **发射是串行的，执行是并行的**。Scalar 按程序顺序把指令丢进各队列后立即继续，不等待执行完成。
+- **同一队列内指令顺序执行**（但“开始执行”不等于“前一条已完成读写”，见 PipeBarrier）。
+- **不同队列之间没有任何默认顺序保证**——这既是并行性能的来源，也是所有同步问题的来源。
 
-### 1.2 Ascend C 推荐范式：TPipe + TQue
+典型 Vector 数据路径（三个单元接力访问同一块 UB）：
+
+```
+GM --MTE2--> UB(VECIN) --Vector--> UB(VECOUT) --MTE3--> GM
+```
+
+### 1.2 两个执行单元访问同一块 Buffer：必须同步
+
+由于队列间无顺序保证，只要 **2 个执行单元先后访问同一块 Buffer**，就存在数据竞争，必须由同步原语强制时序。两种依赖：
+
+- **写后读（先写完才能读）**：MTE2 写完 UB，Vector 才能读——否则读到半截数据。
+- **读后写（先读完才能覆写）**：Vector 还没读完，MTE2 不能往同一块 UB 写新数据——否则未读数据被冲掉。
+
+编程者可用的同步方式，按“谁访问同一块 Buffer”归类：
+
+| # | 同步方式 | 适用场景 | 谁来插 |
+|---|----------|----------|--------|
+| 1 | **TQue `EnQue`/`DeQue` + `AllocTensor`/`FreeTensor`** | 两个不同单元（不同流水）接力访问同一 Buffer；框架把 Set/Wait 藏在队列操作里 | 框架（推荐） |
+| 2 | **编译器自动同步** | LocalTensor 依赖关系清晰的部分场景 | 编译器 |
+| 3 | **SetFlag/WaitFlag（事件对）** | 两个不同流水 + 一块 Buffer，手动点对点同步；`HardEvent::MTE2_V` 即“V 等 MTE2” | 开发者（ISASI）/ TQueSync（跨代） |
+| 4 | **Mutex Lock/Unlock（950 新增）** | 把“这块 Buffer”抽象成一把锁，多个流水依次 Lock/Unlock 同一 MutexID | 开发者 |
+| 5 | **PipeBarrier** | **同一个单元**先后两条指令访问同一 Buffer（如 MTE2 两次搬运地址重叠）——注意同队列顺序执行≠读写已完成 | 开发者 |
+| 6 | **CrossCoreSetFlag/WaitFlag** | 访问同一块 Buffer 的两个单元不在同一个核（AIC 与 AIV 经 GM/直连通路交接） | 开发者/框架 |
+
+一句话概括编程者视角：**写算子 = 给 4 类并行单元排流水 + 在每一处“两个单元共享一块 Buffer”的交接点选一种同步方式**。方式 1（TQue）是默认答案，3/4/5 是手动兜底，6 处理核间。
+
+### 1.3 Ascend C 推荐范式：TPipe + TQue
 
 Ascend C 把核内计算拆成可并行 Stage（典型三段：`CopyIn` / `Compute` / `CopyOut`），用队列完成 Stage 间通信与同步：
 
@@ -53,7 +90,7 @@ for (...) {
 }
 ```
 
-### 1.3 Ascend 950（3510）对编程模型的扩展
+### 1.4 Ascend 950（3510）对编程模型的扩展
 
 相对 2201，950 在编程面上的关键变化：
 
