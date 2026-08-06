@@ -7,8 +7,8 @@ import sys
 from pathlib import Path
 from typing import List, Sequence, Tuple
 
-from .asm_text import format_program, parse_asm
-from .codec import Instruction, decode_program, encode_program
+from asm_text import format_program, parse_asm
+from codec import Instruction, decode_program, encode_program
 
 
 def assemble_file(src: Path, dst: Path) -> int:

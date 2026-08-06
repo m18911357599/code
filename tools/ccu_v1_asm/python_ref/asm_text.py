@@ -5,8 +5,8 @@ from __future__ import annotations
 import re
 from typing import Any, Dict, List, Sequence, Tuple
 
-from .codec import Instruction
-from .isa import BY_MNEMONIC
+from codec import Instruction
+from isa import BY_MNEMONIC
 
 _LINE_RE = re.compile(
     r"^\s*(?:(?P<label>[A-Za-z_][\w]*)\s*:)?\s*"

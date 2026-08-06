@@ -6,7 +6,7 @@ import struct
 from dataclasses import dataclass
 from typing import Any, Dict, List, Mapping, MutableMapping, Optional, Sequence, Tuple
 
-from .isa import (
+from isa import (
     BY_MNEMONIC,
     BY_OPCODE,
     INSTR_SIZE,

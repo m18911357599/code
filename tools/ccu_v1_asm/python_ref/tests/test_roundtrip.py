@@ -9,16 +9,16 @@ import tempfile
 import unittest
 from pathlib import Path
 
-ROOT = Path(__file__).resolve().parents[2]
+ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from ccu_v1_asm.asm_text import format_instruction, format_program, parse_asm
-from ccu_v1_asm.cli import verify_roundtrip
-from ccu_v1_asm.codec import decode_instruction, decode_program, encode_instruction, encode_program
-from ccu_v1_asm.isa import BY_MNEMONIC, INSTRS, INSTR_SIZE, make_header
+from asm_text import format_instruction, format_program, parse_asm
+from cli import verify_roundtrip
+from codec import decode_instruction, decode_program, encode_instruction, encode_program
+from isa import BY_MNEMONIC, INSTRS, INSTR_SIZE, make_header
 
-EXAMPLES = Path(__file__).resolve().parents[1] / "examples"
+EXAMPLES = Path(__file__).resolve().parents[2] / "examples"
 
 
 class TestHeader(unittest.TestCase):
@@ -87,7 +87,7 @@ class TestPayloadLayouts(unittest.TestCase):
 
 class TestRoundTrip(unittest.TestCase):
     def test_each_opcode_alone(self):
-        from ccu_v1_asm.codec import Instruction
+        from codec import Instruction
 
         for idef in INSTRS:
             ops = {}
