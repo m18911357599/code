@@ -4,7 +4,7 @@ CFLAGS  ?= -O3 -march=native -flto -Wall -Wextra -Werror -std=c11
 CFLAGS  += -Iinclude
 LDFLAGS ?= -flto
 
-LIB_SRCS := src/isa.c src/asm.c src/vasm.c src/casm.c src/casm_api.c
+LIB_SRCS := src/isa.c src/asm.c src/vasm.c src/casm.c
 LIB_OBJS := $(LIB_SRCS:src/%.c=build/%.o)
 CLI_OBJ  := build/cli.o
 

@@ -57,7 +57,7 @@ void main(void)
 
 完整 29 条 opcode：[`examples/loop_main.c`](examples/loop_main.c)（与 `all_opcodes.s` 二进制 `cmp` 一致）。
 
-API：`ccu_v1_casm.h` / `ccu_v1_casm_api.h`。
+API：`ccu_v1_casm.h` / `ccu_v1_casm_api.h`（指令接口均为 header `static inline`）。
 
 ## 汇编语法（位置操作数）
 
