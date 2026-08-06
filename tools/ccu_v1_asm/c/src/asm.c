@@ -27,7 +27,7 @@ int ccu_v1_program_reserve(CcuV1Program *p, size_t n)
     if (n <= p->capacity) {
         return 0;
     }
-    size_t cap = p->capacity ? p->capacity : 64;
+    size_t cap = p->capacity ? p->capacity : 2048;
     while (cap < n) {
         cap *= 2;
     }
