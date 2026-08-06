@@ -822,20 +822,32 @@ static int appendf(char *buf, size_t buf_sz, int *pos, const char *fmt, ...)
     return 0;
 }
 
-static void fmt_ms(char *tmp, size_t tmp_sz, const uint16_t ms[CCU_V1_MS_MAX])
+enum { FMT_ASM = 0, FMT_C = 1 };
+
+static void fmt_ms(char *tmp, size_t tmp_sz, const uint16_t ms[CCU_V1_MS_MAX], int style)
 {
     int pos = 0;
-    pos += snprintf(tmp + pos, tmp_sz - (size_t)pos, "[");
+    pos += snprintf(tmp + pos, tmp_sz - (size_t)pos, style == FMT_C ? "MS(" : "[");
     for (int i = 0; i < CCU_V1_MS_MAX; ++i) {
         if (i) {
             pos += snprintf(tmp + pos, tmp_sz - (size_t)pos, ",");
         }
         pos += snprintf(tmp + pos, tmp_sz - (size_t)pos, "%u", (unsigned)ms[i]);
     }
-    snprintf(tmp + pos, tmp_sz - (size_t)pos, "]");
+    snprintf(tmp + pos, tmp_sz - (size_t)pos, style == FMT_C ? ")" : "]");
 }
 
-int ccu_v1_format_instr(const CcuV1Instr *instr, char *buf, size_t buf_sz)
+static void mnemonic_to_c_name(const char *mnem, char *out, size_t out_sz)
+{
+    size_t i = 0;
+    for (; mnem[i] && i + 1 < out_sz; ++i) {
+        char c = mnem[i];
+        out[i] = (c >= 'A' && c <= 'Z') ? (char)(c - 'A' + 'a') : c;
+    }
+    out[i] = '\0';
+}
+
+static int format_instr_ex(const CcuV1Instr *instr, char *buf, size_t buf_sz, int style)
 {
     uint8_t type;
     uint16_t code;
@@ -846,14 +858,24 @@ int ccu_v1_format_instr(const CcuV1Instr *instr, char *buf, size_t buf_sz)
     }
     int pos = 0;
     int first = 1;
-    if (appendf(buf, buf_sz, &pos, "%s", desc->mnemonic) != 0) {
+    if (style == FMT_C) {
+        char cname[64];
+        mnemonic_to_c_name(desc->mnemonic, cname, sizeof(cname));
+        if (appendf(buf, buf_sz, &pos, "%s(", cname) != 0) {
+            return -1;
+        }
+    } else if (appendf(buf, buf_sz, &pos, "%s", desc->mnemonic) != 0) {
         return -1;
     }
 
 #define SEP()                                                                                                          \
     do {                                                                                                               \
-        if (appendf(buf, buf_sz, &pos, first ? " " : ", ") != 0)                                                       \
+        if (style == FMT_C) {                                                                                          \
+            if (!first && appendf(buf, buf_sz, &pos, ", ") != 0)                                                       \
+                return -1;                                                                                             \
+        } else if (appendf(buf, buf_sz, &pos, first ? " " : ", ") != 0) {                                              \
             return -1;                                                                                                 \
+        }                                                                                                              \
         first = 0;                                                                                                     \
     } while (0)
 #define U16(name, v)                                                                                                   \
@@ -873,8 +895,8 @@ int ccu_v1_format_instr(const CcuV1Instr *instr, char *buf, size_t buf_sz)
 #define MSLIST(name, msarr)                                                                                            \
     do {                                                                                                               \
         (void)(name);                                                                                                  \
-        char msbuf[128];                                                                                               \
-        fmt_ms(msbuf, sizeof(msbuf), msarr);                                                                           \
+        char msbuf[160];                                                                                               \
+        fmt_ms(msbuf, sizeof(msbuf), msarr, style);                                                                    \
         SEP();                                                                                                         \
         if (appendf(buf, buf_sz, &pos, "%s", msbuf) != 0)                                                              \
             return -1;                                                                                                 \
@@ -1128,10 +1150,25 @@ int ccu_v1_format_instr(const CcuV1Instr *instr, char *buf, size_t buf_sz)
 #undef U16
 #undef HEX
 #undef MSLIST
+    if (style == FMT_C) {
+        if (appendf(buf, buf_sz, &pos, ");") != 0) {
+            return -1;
+        }
+    }
     if (pos >= (int)buf_sz) {
         return -1;
     }
     return pos;
+}
+
+int ccu_v1_format_instr(const CcuV1Instr *instr, char *buf, size_t buf_sz)
+{
+    return format_instr_ex(instr, buf, buf_sz, FMT_ASM);
+}
+
+int ccu_v1_format_instr_c(const CcuV1Instr *instr, char *buf, size_t buf_sz)
+{
+    return format_instr_ex(instr, buf, buf_sz, FMT_C);
 }
 
 int ccu_v1_disassemble_program(const CcuV1Program *prog, FILE *out)
@@ -1144,6 +1181,26 @@ int ccu_v1_disassemble_program(const CcuV1Program *prog, FILE *out)
         if (fprintf(out, "%s\n", line) < 0) {
             return -1;
         }
+    }
+    return 0;
+}
+
+int ccu_v1_disassemble_c_api(const CcuV1Program *prog, FILE *out)
+{
+    char line[1024];
+    if (fprintf(out, "#include \"ccu_v1_casm_api.h\"\n\nvoid _entry(void)\n{\n") < 0) {
+        return -1;
+    }
+    for (size_t i = 0; i < prog->count; ++i) {
+        if (ccu_v1_format_instr_c(&prog->items[i], line, sizeof(line)) < 0) {
+            return -1;
+        }
+        if (fprintf(out, "    %s\n", line) < 0) {
+            return -1;
+        }
+    }
+    if (fprintf(out, "}\n") < 0) {
+        return -1;
     }
     return 0;
 }

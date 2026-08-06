@@ -30,8 +30,14 @@ int ccu_v1_assemble_text(const char *text, size_t text_len, CcuV1Program *out, c
 /* Format one instruction (canonical operand order). Returns bytes written (excl NUL) or -1. */
 int ccu_v1_format_instr(const CcuV1Instr *instr, char *buf, size_t buf_sz);
 
-/* Disassemble program into FILE. */
+/* Format one instruction as C API call, e.g. loop(0, 10, 11); */
+int ccu_v1_format_instr_c(const CcuV1Instr *instr, char *buf, size_t buf_sz);
+
+/* Disassemble program into classic asm text. */
 int ccu_v1_disassemble_program(const CcuV1Program *prog, FILE *out);
+
+/* Disassemble program as C API source with void _entry(void) { ... }. */
+int ccu_v1_disassemble_c_api(const CcuV1Program *prog, FILE *out);
 
 /* Encode/decode binary blob (must be multiple of 32). */
 int ccu_v1_program_from_binary(const uint8_t *data, size_t len, CcuV1Program *out, char *errmsg, size_t errmsg_sz);

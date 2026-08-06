@@ -446,15 +446,17 @@ static int parse_call_stmt(Parser *ps)
     return 0;
 }
 
-static int parse_main(Parser *ps)
+static int parse_entry(Parser *ps)
 {
     skip_ws_comments(ps);
     if (!match_kw(ps, "void") && !match_kw(ps, "int")) {
-        snprintf(ps->ctx->errmsg, sizeof(ps->ctx->errmsg), "line %d: expected void/int main()", ps->line);
+        snprintf(ps->ctx->errmsg, sizeof(ps->ctx->errmsg),
+                 "line %d: expected void/int _entry()/main()", ps->line);
         return -1;
     }
-    if (!match_kw(ps, "main")) {
-        snprintf(ps->ctx->errmsg, sizeof(ps->ctx->errmsg), "line %d: expected main", ps->line);
+    if (!match_kw(ps, "_entry") && !match_kw(ps, "main")) {
+        snprintf(ps->ctx->errmsg, sizeof(ps->ctx->errmsg),
+                 "line %d: expected _entry or main", ps->line);
         return -1;
     }
     if (expect_char(ps, '(') != 0) {
@@ -475,7 +477,7 @@ static int parse_main(Parser *ps)
     for (;;) {
         skip_ws_comments(ps);
         if (ps->p >= ps->end) {
-            snprintf(ps->ctx->errmsg, sizeof(ps->ctx->errmsg), "line %d: unexpected EOF in main", ps->line);
+            snprintf(ps->ctx->errmsg, sizeof(ps->ctx->errmsg), "line %d: unexpected EOF in entry", ps->line);
             return -1;
         }
         if (*ps->p == '}') {
@@ -489,7 +491,7 @@ static int parse_main(Parser *ps)
     skip_ws_comments(ps);
     if (ps->p < ps->end) {
         snprintf(ps->ctx->errmsg, sizeof(ps->ctx->errmsg),
-                 "line %d: trailing tokens after main", ps->line);
+                 "line %d: trailing tokens after entry", ps->line);
         return -1;
     }
     return 0;
@@ -508,7 +510,7 @@ int ccu_v1_casm_compile(const char *text, size_t text_len, CcuV1CasmCtx *ctx)
     }
 
     Parser ps = {.p = text, .end = text + text_len, .line = 1, .ctx = ctx};
-    if (parse_main(&ps) != 0) {
+    if (parse_entry(&ps) != 0) {
         ccu_v1_program_free(&ctx->program);
         return -1;
     }

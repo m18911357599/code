@@ -25,9 +25,9 @@ build/ccu_v1_asm: $(LIB_OBJS) $(CLI_OBJ)
 	$(CC) $(CFLAGS) $(LIB_OBJS) $(CLI_OBJ) -o $@ $(LDFLAGS)
 
 # Native C path for loop_main.c:
-#   create ctx → begin → call main → instr fill binary → write_file
+#   create ctx → begin → call _entry → instr fill binary → write_file
 build/loop_main.o: $(EXAMPLES)/loop_main.c include/ccu_v1_casm_api.h | build
-	$(CC) $(CFLAGS) -Dmain=ccu_user_main -c $(EXAMPLES)/loop_main.c -o $@
+	$(CC) $(CFLAGS) -c $(EXAMPLES)/loop_main.c -o $@
 
 build/casm_host: src/casm_host.c build/loop_main.o $(LIB_OBJS)
 	$(CC) $(CFLAGS) src/casm_host.c build/loop_main.o $(LIB_OBJS) -o $@ $(LDFLAGS)
@@ -35,8 +35,9 @@ build/casm_host: src/casm_host.c build/loop_main.o $(LIB_OBJS)
 test: build/ccu_v1_asm build/casm_host
 	./build/ccu_v1_asm verify ../examples/all_opcodes.s -w build/verify_out
 	./build/ccu_v1_asm as ../examples/all_opcodes.s -o build/all.bin
-	./build/ccu_v1_asm dis build/all.bin -o build/all.dis.s
-	./build/ccu_v1_asm as build/all.dis.s -o build/all.re.bin
+	# Disassemble to C API (_entry) and reassemble via casm
+	./build/ccu_v1_asm dis build/all.bin -o build/all.dis.c
+	./build/ccu_v1_asm casm build/all.dis.c -o build/all.re.bin
 	cmp build/all.bin build/all.re.bin
 	./build/ccu_v1_asm verify-vasm ../examples/vars_reuse.s -w build/vasm_verify
 	./build/ccu_v1_asm vasm ../examples/vars_reuse.s -o build/vars.bin -m build/vars.meta.json --lowered build/vars.lowered.s
@@ -46,7 +47,7 @@ b=[v for v in m["variables"] if v["name"]=="phase_b"][0];\
 assert a["id"]==b["id"], (a,b);\
 assert a["live_end"] < b["live_start"], (a,b);\
 print("reuse check OK: phase_a/phase_b share xn id", a["id"])'
-	# Native: create ctx → call main → write binary file
+	# Native: create ctx → call _entry → write binary file
 	./build/casm_host -o build/loop.bin
 	cmp build/loop.bin build/all.bin
 	# Text interpreter path still accepts the same source

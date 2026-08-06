@@ -3,12 +3,10 @@
  *
  * Flow:
  *   1. create context
- *   2. begin (install context)  — before calling main
- *   3. call user main()         — each instruction fills binary into context
+ *   2. begin (install context)  — before calling _entry
+ *   3. call user _entry()       — each instruction fills binary into context
  *   4. end
  *   5. write binary directly to file
- *
- * Build user program with: -Dmain=ccu_user_main
  */
 #include "ccu_v1_casm_api.h"
 
@@ -34,8 +32,8 @@ int main(int argc, char **argv)
     CcuV1CasmCtx ctx;
     ccu_v1_casm_init(&ctx);
 
-    /* create context → begin → call main (instr write ctx->inst) → end */
-    ccu_v1_casm_run(&ctx, ccu_user_main);
+    /* create context → begin → call _entry (instr write ctx->inst) → end */
+    ccu_v1_casm_run(&ctx, _entry);
 
     /* write packed instruction bytes directly to file */
     if (ccu_v1_casm_write_file(&ctx, out_path) != 0) {

@@ -5,10 +5,12 @@
  *
  * Usage:
  *   #include "ccu_v1_casm_api.h"
- *   void main(void) { loop(0, 10, 11); ... }
+ *   void _entry(void) { loop(0, 10, 11); ... }
  *
  * Host (casm_host) does:
- *   create ctx → begin → call main (as ccu_user_main) → end → write_file
+ *   create ctx → begin → call _entry → end → write_file
+ *
+ * Disassembler (`dis`) emits the same C API shape with void _entry(void).
  */
 #ifndef CCU_V1_CASM_API_H
 #define CCU_V1_CASM_API_H
@@ -29,8 +31,8 @@ typedef struct {
 
 #define MS(...) ((CcuMs){.v = {__VA_ARGS__}})
 
-/* User entry: compile loop_main.c with -Dmain=ccu_user_main */
-void ccu_user_main(void);
+/* User program entry (casm_host / disassemble output). */
+void _entry(void);
 
 static inline CcuV1CasmCtx *ctx_now(void)
 {

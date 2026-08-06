@@ -3,7 +3,7 @@
  *
  * Usage:
  *   ccu_v1_asm assemble   <in.s> -o <out.bin>
- *   ccu_v1_asm disassemble <in.bin> -o <out.s>
+ *   ccu_v1_asm disassemble <in.bin> -o <out.c>
  *   ccu_v1_asm verify     <in.s> [-w workdir]
  */
 #include "ccu_v1_asm.h"
@@ -189,14 +189,14 @@ static int cmd_disassemble(const char *in_path, const char *out_path)
         ccu_v1_program_free(&prog);
         return 2;
     }
-    if (ccu_v1_disassemble_program(&prog, out) != 0) {
+    if (ccu_v1_disassemble_c_api(&prog, out) != 0) {
         fprintf(stderr, "error: disassemble failed\n");
         fclose(out);
         ccu_v1_program_free(&prog);
         return 2;
     }
     fclose(out);
-    printf("disassembled %zu instructions -> %s\n", prog.count, out_path);
+    printf("disassembled %zu instructions -> %s (C API, _entry)\n", prog.count, out_path);
     ccu_v1_program_free(&prog);
     return 0;
 }
@@ -584,7 +584,7 @@ static void usage(const char *argv0)
     fprintf(stderr,
             "Usage:\n"
             "  %s assemble    <in.s> -o <out.bin>\n"
-            "  %s disassemble <in.bin> -o <out.s>\n"
+            "  %s disassemble <in.bin> -o <out.c>\n"
             "  %s verify      <in.s> [-w workdir]\n"
             "  %s vasm        <in.s> -o <out.bin> [-m out.meta.json] [--lowered out.s]\n"
             "  %s verify-vasm <in.s> [-w workdir]\n"

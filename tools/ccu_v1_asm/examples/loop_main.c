@@ -2,13 +2,14 @@
  * C-style CCU V1 program covering every ISA opcode.
  *
  * Binary generation (casm_host):
- *   create context → begin → call main() → each instr fills binary → write_file
+ *   create context → begin → call _entry() → each instr fills binary → write_file
  *
  * Operands match examples/all_opcodes.s (cmp equal binaries).
+ * Disassembler (`dis`) regenerates this shape with void _entry(void).
  */
 #include "ccu_v1_casm_api.h"
 
-void main(void)
+void _entry(void)
 {
     /* ---- LOAD ---- */
     load_sqeargs_to_gsa(1, 2);
