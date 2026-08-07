@@ -1,7 +1,8 @@
-# PyTorch 算子特征分类、API 特征与竞品分析
+# PyTorch 内置底层算子：按核心功能分类、API 特征与竞品分析
 
-> 范围：以 **PyTorch ATen / TensorIterator / native_functions** 为基准，对算子计算特征、API 形态、动态 shape / 非对齐 / padding 处理特征做分类，并与 **CUDA 手写、Triton、AscendC、SIMD-Tile(128B)** 做竞品对比（竞分）。  
-> 相关文档：[SIMD-Tile × PyTorch Pattern](../../docs/design/cpp26_simd_tile128_pytorch_dynshape.md)（若已合入）、[AscendC npu_arch Feature](../../docs/design/npu_arch_kernel_operator_feature_simplify.md)（若已合入）。
+> 范围：以 ATen `native_functions.yaml` 及量化/稀疏等命名空间为对象，覆盖业界常称的 **约三千量级** 内置底层算子（见 §1.1）。  
+> 本文按 **核心功能** 重新分类；Pattern 统一用 **两位数字编号**；每类给出典型算子与备注。  
+> 对照维度：API 形态、动态 shape / 非对齐 / padding，以及 CUDA / Triton / AscendC / SIMD-Tile(128B) 竞分。
 
 ---
 
@@ -9,411 +10,589 @@
 
 | 维度 | 结论 |
 |---|---|
-| **算子分类主轴** | 按 **数据依赖图 + 访存/并行模式** 分 8 大类：Elemwise / Broadcast / Reduce / Layout(Concat·Transpose·Copy) / Index / Matmul / Conv / DynOut；复合算子（Norm/Softmax/SDPA）视为组合或专用 |
-| **API 特征主轴** | 按 **谁负责 shape/stride/尾块** 分 4 层：用户 Python API → Schema/Dispatch → Iterator/Plan → Backend Kernel；竞分关键在 **中间层是否吸收动态与非对齐** |
-| **动态 shape** | PyTorch 热路径默认 **运行时 shape + 一次 plan**；编译路径（Inductor/Export）再加符号约束；与 AscendC「静态 tiling 优先」形成最大差异 |
-| **非对齐 / 尾块** | PyTorch 用 **vectorized 整块 + scalar/unrolled 尾**；Triton 用 **mask tile**；AscendC 常受 **32B/512B 对齐与 Pad** 约束；SIMD-Tile 以 **128B 整块 + 至多一次尾块** 对齐 PyTorch 语义 |
-| **Padding** | 框架层多为 **逻辑广播/对齐（不物化）**；硬件层（NPU UB/Cube、部分 Triton 后端）易出现 **隐式 pad → 带宽膨胀**；竞分要区分「语义 pad」与「硬件 pad」 |
-| **选型建议** | 通用 EW/Bcast/Reduce：**跟 PyTorch TensorIterator 语义**；峰值 GEMM/Conv/Attn：**领域库**；NPU 落地：**上层 PyTorch 友好 + 下层 AscendC 能力显式** |
+| **分类主轴** | 按 **核心功能** 分为 **Pattern 01–28**（逐元素、规约、填充、量化、卷积、矩阵乘等），不以字母代号 |
+| **规模** | schema 约 **2500+**，唯一基名约 **1500+**；计入 inplace / out / 重载 / quantized·sparse·foreach 后常称 **~3000–3500** |
+| **实现主路径** | **01–06、14–16** 多走 TensorIterator；**07–12、19、22–23** 多为固定维/领域核；**25–26** 含数据依赖动态输出 |
+| **API** | 用户声明式 API → Schema/Dispatch → Plan/Iterator → Backend；竞分关键在中间层是否吸收动态与非对齐 |
+| **Dyn / Align / Pad** | 语义 Pad（07）≠ 向量尾填充 ≠ 硬件对齐 Pad；短尾轴在 NPU 上易被隐式 pad |
+| **选型** | 通用 01/05/14：**跟 PyTorch 语义**；09/10/12 峰值：**领域库**；NPU：**上层 PT 友好 + 下层能力显式** |
 
 ---
 
-## 1. 分析框架
+## 1. 规模与编号约定
 
-### 1.1 三个正交轴
+### 1.1 「约 3500 个」怎么理解
+
+| 统计口径 | 数量级（main 线量级） | 说明 |
+|---|---|---|
+| `native_functions.yaml` 的 `- func:` schema | **~2500+** | 含 overload（如 `add.Tensor` / `add.Scalar`） |
+| 唯一算子基名 | **~1500+** | 去掉 `.overload` 后的名字 |
+| + inplace / out / 复合变体观感 | **~2000–3000** | 同一功能多入口 |
+| + `quantized` / `sparse` / `_foreach_*` 等 | 常称 **~3000–3500** | 本文「三千量级」所指 |
+
+分类对象是 **功能族**，不是把 3500 个 schema 逐条枚举；每类用 **典型算子 + 备注** 代表该族。
+
+### 1.2 Pattern 编号规则
 
 ```text
-轴 A  计算/访存 Pattern   →  算子分类（§2）
-轴 B  API / 责任边界      →  API 特征分类（§3）
-轴 C  形状·对齐·填充策略  →  DynShape / Align / Pad（§4）
+Pattern NN   = 核心功能大类（两位数字，稳定编号）
+NN.M         = 可选子类（一位小数编号）
 ```
 
-竞分（§5）在同一用例上对 A/B/C 打分，避免「拿手写 CUDA GEMM 比 AscendC Add」这类错位对比。
+示例：`07` = 填充类；`07.1` = 常数填充；`05.2` = Arg 规约。
 
-### 1.2 与官方 ATen tags 的关系
+后文 API / 动态 shape / 竞分均引用这些数字编号。
 
-`aten/src/ATen/native/tags.yaml` 给出的是 **编译/导出语义标签**，不是完整计算分类：
+### 1.3 与官方 ATen tags 的关系
 
-| 官方 tag | 本文映射 |
+| 官方 tag | 对应 Pattern |
 |---|---|
-| `pointwise` | Elemwise（含隐式 Broadcast） |
-| `reduction` | Reduce |
-| `dynamic_output_shape` | DynOut（输出 shape 依赖 **数据值**） |
-| `data_dependent_output` | 非 Tensor 输出依赖数据（如 `item`） |
-| `inplace` / `out` / `view_copy` / `inplace_view` | API 形态（§3），不是计算 Pattern |
-| `needs_*_strides` / `flexible_layout` | 布局契约（§4.2） |
+| `pointwise` | 01、02、03（含隐式广播） |
+| `reduction` | 05（及部分 11/22 内规约） |
+| `dynamic_output_shape` | 26（及 25 中部分） |
+| `inplace` / `out` / `view_copy` | API 形态（§3），不是功能类 |
 
-**缺口**：官方 tags **没有** 单独的 `broadcast` / `concat` / `transpose` / `conv` / `matmul`。Broadcast 被折叠进 `pointwise`；Layout/Matmul/Conv 靠 schema 与实现路径识别。本文补全工程分类。
+官方 tags **没有** 填充 / 量化 / 卷积 / 矩阵乘等功能标签，需本文补全。
 
 ---
 
-## 2. 算子特征分析与分类
+## 2. 按核心功能的 Pattern 分类总表
 
-### 2.1 分类总表
-
-| 类别 ID | 名称 | 定义（数据依赖） | 访存特征 | 并行特征 | PyTorch 代表 |
-|---|---|---|---|---|---|
-| **E** | Elemwise / Pointwise | 输出 `[i]` 只依赖各输入广播后的同址元素 | 流式、可 coalesced | 完全数据并行 | `add/mul/relu/clamp/where` |
-| **B** | Broadcast（显式刻画） | 同 E，但输入 `stride_eff` 含 0 | 多输入步长不一致 | 输出主导迭代 | `x+bias`、`[B,1,K]+[B,H,K]` |
-| **R** | Reduce | 多输入元素 → 少输出；含结合律聚合 | 写冲突 / 局部累加 | 树归约 / 分块归约 | `sum/mean/amax/argmax` |
-| **L** | Layout | 不改（或仅拷贝）数值，改 shape/stride/拼接 | 搬移带宽 bound | 可按段并行 | `reshape/transpose/permute/cat/stack/contiguous/copy_` |
-| **I** | Index / Indirect | 地址由索引张量决定 | gather/scatter、不规则 | 冲突敏感 | `index_select/gather/scatter/index_add` |
-| **M** | Matmul / 线性代数 | `(i,k)×(k,j)` 收缩 | 分块复用、高算术密度 | MMA / 库 | `mm/bmm/addmm/linear` |
-| **C** | Conv / 滑窗 | 局部邻域加权 | im2col 或专用滑窗 | 通道/空间并行 | `conv1d/2d/3d`、`avg_pool` |
-| **D** | DynOut | 输出 shape/长度依赖 **输入数值** | 两阶段（count→write） | 前缀和/compact | `nonzero/unique/masked_select` |
-
-复合算子（不单列新「第一类」，但实现常专用）：
-
-| 复合 | 分解 | 为何常专用 |
-|---|---|---|
-| Softmax / LogSoftmax | R(max) → E(sub/exp) → R(sum) → E(div) | 数值稳定 + 融合带宽 |
-| LayerNorm / RMSNorm | R → E | 多遍归约与广播融合 |
-| SDPA / FlashAttn | 分块 M + Softmax + 在线合并 | IO 感知算法 |
-| EmbeddingBag | I + 可选 R | 稀疏写冲突 |
-
-### 2.2 子类细化
-
-#### 2.2.1 Elemwise（E）
-
-| 子类 | 特征 | 例 |
-|---|---|---|
-| E0 同形连续 | 全 operand unit-stride，同 numel | `a+b` contiguous |
-| E1 谓词/选择 | 额外 mask 或 blend | `where`、`clamp` |
-| E2 类型提升 | compute dtype ≠ 某输入 dtype | `int32 + float` |
-| E3 就地 | 写回 `self` | `add_` |
-
-**关键特征**：无跨元素依赖 → TensorIterator 可任意切块与重排维；尾块只需一次。
-
-#### 2.2.2 Broadcast（B）
-
-| 子类 | 特征 | 例 |
-|---|---|---|
-| B0 标量 / 0-stride | 一侧为 scalar 或 `numel=1` | `x + 1.0` |
-| B1 可 collapse | 相邻维合并后降为 E0/B0 | `[B,1,K]+[B,H,K]` 合并 |
-| B2 通用 | 任意 `stride_eff`，含中间维广播 | 任意 `expand` 后运算 |
-
-**关键特征**：输出 shape = broadcast(inputs)；输入 **不物化 expand**（stride=0），除非后端强制 materialize。
-
-#### 2.2.3 Reduce（R）
-
-| 子类 | 特征 | 例 |
-|---|---|---|
-| R0 全维 | 输出标量或空 shape | `x.sum()` |
-| R1 内维（连续轴） | 沿最快维归约 | `sum(-1)` |
-| R2 外/中间维 | 需重排或跨步累加 | `sum(0)` |
-| R3 短内维 | `inner * sizeof(T)` 小于向量宽 | 特征维=3 的 sum |
-| R4 Arg-reduce | 携带 index | `argmax` |
-| R5 扫描型 | 有序前缀依赖 | `cumsum`（半 reduce） |
-
-**关键特征**：需 **中性元**（0、+inf…）填无效 lane；结合律决定可否乱序并行。
-
-#### 2.2.4 Layout（L）
-
-| 子类 | 特征 | 例 |
-|---|---|---|
-| L0 View / 元数据 | 不搬数据 | `view`、`transpose`（可 view 时） |
-| L1 Materialize copy | 必须搬数据 | `contiguous`、`clone`、`permute` 打断时 |
-| L2 Concat / Split | 多段沿轴拼接/切开 | `cat`、`split`、`chunk` |
-| L3 Pack / Pad（语义） | 显式填充到目标 shape | `nn.utils.rnn.pad_sequence`、`F.pad` |
-
-**关键特征**：`cat` = 多段独立 copy（每段各自尾块）；`transpose` 热路径常走 **分块转置**，边缘用 gather/scalar。
-
-#### 2.2.5 Index（I）
-
-| 子类 | 特征 | 例 |
-|---|---|---|
-| I0 Gather | 读间接 | `gather`、`index_select` |
-| I1 Scatter | 写间接；冲突策略 | `scatter`、`index_add` |
-| I2 Masked | 布尔压缩/填充 | `masked_fill`、`masked_select`(→D) |
-
-#### 2.2.6 Matmul（M） / Conv（C） / DynOut（D）
-
-| 类 | 子特征 | 对中间层含义 |
-|---|---|---|
-| M | 分块 (BM,BN,BK)、epilogue 融合 bias/act | **不宜** 走通用 TensorIterator map |
-| C | stride/pad/dilation、groups、im2col vs 直接卷积 | pad 是 **算法参数**，不是向量尾块 |
-| D | 输出长度未知 → 两阶段或上限缓冲 | 与「静态 shape 假设」冲突最大 |
-
-### 2.3 特征维度矩阵（用于实现选型）
-
-| 特征维度 | E | B | R | L | I | M | C | D |
-|---|---|---|---|---|---|---|---|---|
-| 输出 shape 由输入 shape 决定 | Y | Y | Y | Y | 部分 | Y | Y | **N（由数据）** |
-| 可无序并行 | Y | Y | 部分 | Y | 写冲突时 N | 分块内有序 | 分块内有序 | 二阶段 |
-| 适合通用向量 map | **Y** | **Y** | 部分 | copy 时 Y | N | N | N | N |
-| 对对齐敏感度 | 中 | 中 | 高（短内维） | 低–中 | 高 | **很高** | **很高** | 中 |
-| 典型瓶颈 | 带宽 | 带宽+地址 | 带宽/同步 | 带宽 | 延迟/冲突 | 算力 | 算力+带宽 | 同步+原子 |
-
-### 2.4 Pattern 组合（真实模型里的算子）
-
-| 组合 | 例 | 实现策略 |
-|---|---|---|
-| B→E | `Linear` bias、`x+γ` | BroadcastPlan → elementwise |
-| R→B→E | LayerNorm 简化 | 两遍 R + E；或专用核 |
-| L→E | channels_last 后 EW | 先 layout 契约，再 E |
-| M→E | GEMM + bias + GELU | epilogue 融合 |
-| I→R | embedding bag | 专用稀疏核 |
-| Mask→D | `masked_select` | DynOut |
-
----
-
-## 3. API 特征分析与分类
-
-### 3.1 四层 API 栈（PyTorch）
-
-```text
-L3  用户 API          torch.add / Tensor.add / F.conv2d / nn.Linear
-L2  Schema + Dispatch  native_functions.yaml → 按 device/dtype/layout 分发
-L1  迭代与计划         TensorIterator / Structured kernels / meta
-L0  Backend 核         CPU vec / CUDA / XPU / 私有 NPU / cuBLAS…
-```
-
-**竞分核心**：哪一层吃掉「动态 shape、广播、尾块、对齐」。PyTorch 的优势在 **L1 默认吃掉**；AscendC 更多暴露在 **L0**；Triton 把 L1 的一部分编译进 mask/tile。
-
-### 3.2 按责任边界分类
-
-| API 类 | 谁算 shape | 谁处理广播 | 谁处理尾块/对齐 | 代表 |
+| Pattern | 核心功能 | 定义（一句话） | 规模感（基名量级） | 典型访存/并行 |
 |---|---|---|---|---|
-| **A1 声明式算子** | 框架 | 框架 | 框架 | `torch.add`、`torch.sum` |
-| **A2 Out 变体** | 调用方预分配 out | 框架校验 | 框架 | `torch.add(a,b,out=c)` |
-| **A3 Inplace** | 不变 | 受限广播 | 框架 | `a.add_(b)` |
-| **A4 Structured / meta** | meta 函数 | schema | 不进核 | PT2 / Export |
-| **A5 Iterator 核 API** | Iterator build | Iterator | `cpu_kernel_vec` 整块+尾 | ATen native |
-| **A6 领域库 API** | 调用方/包装 | 包装层 | 库内部 tiling | `addmm`→GEMM、SDPA |
-| **A7 可编程核 DSL** | 用户写 tile | 用户 mask | 用户/编译器 | Triton、手写 CUDA、AscendC |
+| **01** | 逐元素算术 | 同址（广播后）二元/一元数值运算 | 很大 | 带宽；完全并行 |
+| **02** | 比较 / 逻辑 / 选择 | 比较、位运算、`where` 类 | 大 | 同 01 |
+| **03** | 激活与非线性 | 逐点非线性；常可与 01/09/10 融合 | 中 | 同 01 |
+| **04** | 广播与维扩展 | 逻辑扩展 shape，默认不拷贝 | 中 | 0-stride / 物化 |
+| **05** | 规约 | 多→少；沿 dim 聚合 | 大 | 树归约 / 分块 |
+| **06** | 扫描与累积 | 有序前缀依赖 | 小 | 难乱序 |
+| **07** | 填充 | 边界/长度语义 Pad | 中 | 搬移 + 边界写 |
+| **08** | 池化 | 滑窗降采样 / 反池化 | 中 | 固定维；空间并行 |
+| **09** | 卷积 | 局部加权；含转置卷积 | 中 | 高算术密度 |
+| **10** | 矩阵乘与线性代数 | GEMM / 分解 / 求解 | 大 | MMA / 库 |
+| **11** | 归一化 | BN / LN / GN / RMSNorm 等 | 中 | 规约+广播融合 |
+| **12** | Softmax / Attention | Softmax、SDPA、MHA | 中 | 融合 IO 感知 |
+| **13** | 索引 / 散射 / Embedding | 间接读写 | 大 | gather/scatter |
+| **14** | 布局变换 | view / transpose / reshape 等 | 很大 | 元数据或搬移 |
+| **15** | 拼接与分割 | cat / stack / split | 中 | 分段 copy |
+| **16** | 拷贝与类型转换 | clone / to / cast | 中 | 带宽 |
+| **17** | 工厂与创建 | 无输入或仅 shape 造张量 | 中 | 写填充 |
+| **18** | 随机与 Dropout | 采样、噪声、dropout | 中 | RNG + 逐点 |
+| **19** | 量化 | quantize / dequant / fake_quant | 中 | 量纲变换+整数核 |
+| **20** | 稀疏 | COO/CSR 等稀疏格式与算子 | 中 | 间接、压缩 |
+| **21** | FFT / 信号 | 频域变换 | 小–中 | 专用库 |
+| **22** | 损失函数 | 训练目标 | 中 | 常含规约 |
+| **23** | 上采样与插值 | upsample / grid_sample | 中 | 固定维插值 |
+| **24** | Nested / Jagged | 变长序列结构 | 小–中 | 偏移+填充交互 |
+| **25** | 排序 / TopK / Unique | 比较网络、选择 | 小–中 | 不规则 |
+| **26** | 数据依赖动态输出 | 输出 shape 依赖 **数值** | 小 | 两阶段 |
+| **27** | 特殊函数 | `special.*`、高阶数学 | 中 | 多为 01 变体 |
+| **28** | 元信息 / 控制 / 辅助 | size、device、assert、autograd 钩子 | 中 | 非计算主路径 |
 
-### 3.3 按编程模型分类（跨产品）
-
-| 模型 | 抽象粒度 | 动态 shape 写法 | 典型产品 |
-|---|---|---|---|
-| **标量语义 + 运行时 plan** | 每元素 lambda | 自然：任意 `n` | PyTorch TensorIterator、SIMD-Tile L0 |
-| **线程网格** | thread/warp | `if (i < n)` | CUDA |
-| **Tile + mask** | 程序实例 × BLOCK | `tl.load(..., mask=)` | Triton |
-| **显式缓冲 + 指令 API** | LocalTensor / DataCopy / Pipe | 常需 tiling 规划 | AscendC |
-| **逻辑向量量子** | 128B tile + 尾块 | 框架分流整块/尾块 | SIMD-Tile |
-
-### 3.4 PyTorch 算子 API 形态特征
-
-| 特征 | 说明 | 对后端含义 |
-|---|---|---|
-| **重载族** | 函数式 / 方法 / inplace / out | 同一计算核，多入口 |
-| **类型提升** | 二元 op 的 dtype promote | compute dtype 决定向量 lane |
-| **广播隐式** | 用户不写 expand | 后端必须支持 0-stride 或先 materialize |
-| **dim 规范** | 负维、多维 reduce、keepdim | ReducePlan 规范化 |
-| **布局宽容** | 多数 EW 接受非 contiguous | Iterator reorder/coalesce |
-| **Factory + 计算分离** | `empty` 再 `copy_` / out | 便于内存池 |
-| **复合模块** | `nn.Linear` = M + B + 可选 E | 融合机会在编译器 |
-
-### 3.5 API 易用性相关的可度量特征
-
-| 度量 | 含义 | PyTorch 倾向 |
-|---|---|---|
-| 用户可见对齐约束 | 是否要求 `n % VL == 0` | **无**（API 契约） |
-| 尾块是否手写 | 用户是否写 epilogue | **否** |
-| Broadcast 是否显式 | 是否先 `expand` | **否**（可隐式） |
-| 动态 rank 支持 | 任意维数 | EW/Reduce：**是**（Iterator）；Triton 核：**难** |
-| 专用算子入口 | GEMM 是否伪装成 EW | **否**（`addmm` 等） |
+复合模块（`nn.Linear`、`nn.MultiheadAttention`）由上表 Pattern **组合** 而成，不单开编号。
 
 ---
 
-## 4. 动态 Shape、非对齐、Padding 处理特征
+## 3. 各类详解：子类、典型算子、备注
 
-### 4.1 动态 Shape：三层含义（必须拆开）
+### Pattern 01 — 逐元素算术
 
-| 层级 | 含义 | PyTorch 行为 | 竞品常见行为 |
+| 子类 | 含义 | 典型算子 | 备注 |
 |---|---|---|---|
-| **S1 运行时可变长度** | 每次 forward `N/H/W` 不同 | Eager：每次 build Iterator；无重新 codegen | CUDA：grid 随 `N`；Triton：常要 constexpr tile + mask；AscendC：tiling 重算或走动态模板 |
-| **S2 符号动态（编译）** | `SymInt` / 守卫 | PT2：符号化 + 守卫失败再编译 | Inductor/Triton 特化；导出需约束 |
-| **S3 数据依赖动态** | 输出长度看数值 | `dynamic_output_shape`；两阶段或同步 | 多数 DSL 不友好，需 host 协作 |
+| **01.1** 二元算术 | `+/-/×/÷` 等 | `add`、`sub`、`mul`、`div`、`remainder`、`pow`、`atan2`、`hypot` | 默认支持广播与类型提升；TensorIterator 主力 |
+| **01.2** 一元算术 | 逐点变换 | `neg`、`abs`、`reciprocal`、`sqrt`、`rsqrt`、`exp`、`log`、`sin`/`cos` | 与 27 有重叠；实现仍按 pointwise |
+| **01.3** 三元组合 | 乘加类 | `addcmul`、`addcdiv`、`lerp` | 易融合进 10 的 epilogue |
+| **01.4** Foreach 变体 | 列表逐元素 | `_foreach_add`、`_foreach_mul`、… | 优化器步进；并行提交多 tensor |
 
-**特征标签建议（实现侧）**：
+**实现备注**：热路径 = 整块向量 + 标量/窄向量尾；非 contiguous 先 reorder/coalesce。
+
+---
+
+### Pattern 02 — 比较 / 逻辑 / 选择
+
+| 子类 | 典型算子 | 备注 |
+|---|---|---|
+| **02.1** 比较 | `eq`、`ne`、`lt`、`le`、`gt`、`ge`、`isnan`、`isinf`、`isfinite` | 输出常为 bool |
+| **02.2** 位/逻辑 | `bitwise_and`/`or`/`xor`、`logical_and`、`__lshift__` | 整数/bool 路径 |
+| **02.3** 选择 | `where`、`clamp`、`clamp_min`/`max`、`nan_to_num`、`maximum`、`minimum` | `where` = 谓词 blend；尾块需 mask |
+
+---
+
+### Pattern 03 — 激活与非线性
+
+| 子类 | 典型算子 | 备注 |
+|---|---|---|
+| **03.1** 经典激活 | `relu`、`leaky_relu`、`elu`、`selu`、`celu`、`threshold` | 常与 09/10 融合（Conv-ReLU） |
+| **03.2** 现代激活 | `gelu`、`silu`/`swish`、`mish`、`hardswish`、`hardsigmoid`、`hardtanh` | Transformer / CNN 高频 |
+| **03.3** 饱和/收缩 | `sigmoid`、`tanh`、`softplus`、`softshrink`、`hardshrink`、`glu` | Softmax 前常用 sigmoid/tanh |
+| **03.4** 带参数 | `prelu`、`rrelu` | 额外权重；非纯 01 |
+
+---
+
+### Pattern 04 — 广播与维扩展
+
+| 子类 | 典型算子 | 备注 |
+|---|---|---|
+| **04.1** 逻辑广播 | `expand`、`expand_as`、`broadcast_to`、`broadcast_tensors`、`broadcast_shapes` | **默认不物化**；stride=0 |
+| **04.2** 重复物化 | `repeat`、`tile`、`repeat_interleave` | 真正拷贝；与 04.1 成本不同 |
+| **04.3** 隐式广播 | （无独立 API） | 发生在 01/02/03 的 TI build 中 |
+
+**备注**：竞分时常把 04 从 01 拆出——后端是否支持 0-stride 决定要不要先 materialize。
+
+---
+
+### Pattern 05 — 规约
+
+| 子类 | 典型算子 | 备注 |
+|---|---|---|
+| **05.1** 数值规约 | `sum`、`prod`、`mean`、`nansum`、`nanmean`、`norm`、`linalg.vector_norm`、`logsumexp`、`count_nonzero` | keepdim / dim / 多维 reduce |
+| **05.2** Arg 规约 | `argmax`、`argmin`、`amax`、`amin`、`aminmax` | 携带 index 或值；尾块禁无效 idx |
+| **05.3** 逻辑规约 | `all`、`any` | bool 中性元不同 |
+| **05.4** 统计规约 | `std`、`var`、`median`、`quantile`、`mode` | 有的两遍扫描；`quantile` 更复杂 |
+| **05.5** 全局标量 | `trace`（方阵）、无 dim 的 `sum()` | 可看作全维 05.1 |
+
+**子特征备注**：
+
+- **05.a 内维规约**：`sum(-1)`，连续 load 友好  
+- **05.b 外/中维**：`sum(0)`，常需换轴或跨步累加  
+- **05.c 短内维**：如 K=3，向量利用率低；宜多行打包，忌硬件盲目 pad  
+
+---
+
+### Pattern 06 — 扫描与累积
+
+| 典型算子 | 备注 |
+|---|---|
+| `cumsum`、`cumprod`、`cummax`、`cummin`、`logcumsumexp` | 沿 dim **有序**；不可随意乱序并行；与 05 不同 |
+
+---
+
+### Pattern 07 — 填充（Pad）
+
+| 子类 | 典型算子 | 备注 |
+|---|---|---|
+| **07.1** 常值填充 | `constant_pad_nd`、`F.pad(..., mode='constant')`、`zero_`、`fill_`、`masked_fill` | **语义 Pad**：改变有效区域外的值 |
+| **07.2** 边界反射/复制 | `reflection_pad1d/2d/3d`、`replication_pad*`、`circular_pad*` | 卷积/分割任务常用 |
+| **07.3** 序列填充 | `nn.utils.rnn.pad_sequence`、`pad_packed_sequence`、`_pad_packed_sequence` | 与 24 Nested 交互 |
+| **07.4** 矩阵三角填充 | `tril`、`triu`、`tril_`、`triu_` | 按三角掩码写 |
+
+**重要区分（竞分常用）**：
+
+| 名称 | 是否改数值语义 | 例 |
+|---|---|---|
+| 语义 Pad（本 Pattern） | 是 | `F.pad`、conv 的 padding 参数 |
+| 广播拉伸 | 否（逻辑） | 04 + 01 |
+| 向量尾填充 | 否（写回 mask） | 实现细节 |
+| **硬件对齐 Pad** | 否，但耗带宽 | NPU UB 尾轴 pad 到 32B/512B |
+
+---
+
+### Pattern 08 — 池化
+
+| 子类 | 典型算子 | 备注 |
+|---|---|---|
+| **08.1** Max/Avg/Lp | `max_pool2d`、`avg_pool2d`、`lp_pool2d`、`*_pool1d/3d` | 固定 1–3D；含 indices 的 max_pool |
+| **08.2** Adaptive | `adaptive_avg_pool2d`、`adaptive_max_pool2d` | 输出尺寸指定；实现与普通池化不同 |
+| **08.3** 反池化 | `max_unpool2d` | 依赖 08.1 的 indices |
+| **08.4** Fractional | `fractional_max_pool2d` | 随机/分数步长 |
+
+---
+
+### Pattern 09 — 卷积
+
+| 子类 | 典型算子 | 备注 |
+|---|---|---|
+| **09.1** 标准卷积 | `convolution`、`conv1d/2d/3d`、`_convolution` | 统一入口；padding 为 **算法参数**（语义） |
+| **09.2** 转置/深度可分 | `conv_transpose*`、`_conv_depthwise2d` | 上采样通路；与 23 不同 |
+| **09.3** 后端专用 | `cudnn_convolution`、`miopen_convolution`、`slow_conv*` | 分发到库；用户通常不直接调 |
+| **09.4** im2col | `im2col`、`col2im` | 卷积折叠到 10；调试/后备路径 |
+
+**备注**：不宜用通用 01 模型硬写；与 07 的 pad、08 的窗口模式相关但实现独立。
+
+---
+
+### Pattern 10 — 矩阵乘与线性代数
+
+| 子类 | 典型算子 | 备注 |
+|---|---|---|
+| **10.1** GEMM 族 | `mm`、`bmm`、`addmm`、`baddbmm`、`addbmm`、`matmul`、`tensordot`、`einsum` | 训练/推理算力主力；epilogue 可融 01/03 |
+| **10.2** 向量积 | `dot`、`vdot`、`ger`、`inner`、`outer`、`addr` | 小规模或构建块 |
+| **10.3** 分解/求解 | `linalg.svd`、`linalg.qr`、`linalg.cholesky`、`linalg.solve`、`triangular_solve`、`lu_*` | 数值库路径 |
+| **10.4** 量化/低比特 GEMM | `_int_mm`、`_dyn_quant_matmul_4bit`、`_weight_int4pack_mm` | 与 19 交界；专用核 |
+| **10.5** 分组/稀疏 MM | `_grouped_mm`、`_cslt_sparse_mm`、`_sparse_semi_structured_linear` | 与 20 交界 |
+
+---
+
+### Pattern 11 — 归一化
+
+| 典型算子 | 备注 |
+|---|---|
+| `native_batch_norm`、`batch_norm`、`native_layer_norm`、`layer_norm`、`native_group_norm`、`group_norm`、`instance_norm`、`rms_norm`、`normalize` | 内部 = **05 规约 + 01/04 仿射**；实现几乎总是融合专用核 |
+
+---
+
+### Pattern 12 — Softmax / Attention
+
+| 子类 | 典型算子 | 备注 |
+|---|---|---|
+| **12.1** Softmax | `softmax`、`log_softmax`、`_softmax`、`_safe_softmax` | 数值稳定：max-sub → exp → sum → div |
+| **12.2** SDPA / Flash | `scaled_dot_product_attention`、`_flash_attention_forward`、`_efficient_attention_forward`、`_cudnn_attention_forward` | IO 感知；动态序列长度敏感 |
+| **12.3** MHA 包装 | `_native_multi_head_attention` | 组合 10+12+13 |
+
+---
+
+### Pattern 13 — 索引 / 散射 / Embedding
+
+| 子类 | 典型算子 | 备注 |
+|---|---|---|
+| **13.1** Gather | `gather`、`index_select`、`take`、`take_along_dim`、`index` | 读间接；难向量化 |
+| **13.2** Scatter | `scatter`、`scatter_add`、`scatter_reduce`、`index_add`、`index_put`、`put_` | 写冲突；需原子或确定性策略 |
+| **13.3** Masked | `masked_select`、`masked_scatter`、`masked_fill` | `masked_select` → 亦属 26 |
+| **13.4** Embedding | `embedding`、`embedding_bag`、`_embedding_bag` | 查表 + 可选 05；稀疏梯度 |
+| **13.5** 搜索桶 | `bucketize`、`searchsorted`、`one_hot` | 半有序索引 |
+
+---
+
+### Pattern 14 — 布局变换
+
+| 子类 | 典型算子 | 备注 |
+|---|---|---|
+| **14.1** 元数据 View | `view`、`reshape`（可 view 时）、`expand`、`transpose`/`permute`（可 view）、`squeeze`/`unsqueeze`、`as_strided`、`select`、`narrow`、`diagonal` | `inplace_view` / view 语义；尽量零拷贝 |
+| **14.2** 物化转置/重排 | `contiguous`、`permute` 打断时、`transpose` 拷贝路径、`movedim` | 分块转置；边缘 gather |
+| **14.3** 展平/折叠 | `flatten`、`unflatten`、`unfold` | `unfold` 有重叠窗，偏 08/09 预备 |
+| **14.4** view_copy 族 | `*_copy`（如 `transpose_copy`、`permute_copy`） | 功能化 IR / Export 用 |
+
+---
+
+### Pattern 15 — 拼接与分割
+
+| 子类 | 典型算子 | 备注 |
+|---|---|---|
+| **15.1** 拼接 | `cat`、`concat`、`stack`、`hstack`/`vstack`/`dstack`、`column_stack` | **分段 copy**；每段独立尾块 |
+| **15.2** 分割 | `split`、`split_with_sizes`、`chunk`、`tensor_split`、`unbind`、`hsplit`/`vsplit` | 多为 view 或分段 view |
+| **15.3** 块对角等 | `block_diag` | 隐式零填充区域 ↔ 与 07 相关 |
+
+---
+
+### Pattern 16 — 拷贝与类型转换
+
+| 子类 | 典型算子 | 备注 |
+|---|---|---|
+| **16.1** 拷贝 | `clone`、`copy_`、`_to_copy`、`_copy_from` | 保 dtype 或随 `to` |
+| **16.2** dtype/device | `to`、`type_as`、`_autocast_to_*_precision`、历史 `_cast_*` | 涉及拷贝+转换 |
+| **16.3** 别名 | `alias`、`detach`、`detach_` | 元数据；非数据面 |
+
+---
+
+### Pattern 17 — 工厂与创建
+
+| 子类 | 典型算子 | 备注 |
+|---|---|---|
+| **17.1** 空/常量 | `empty`、`zeros`、`ones`、`full`、`empty_like`、`zeros_like` | 无 tensor 输入或 like |
+| **17.2** 序列 | `arange`、`linspace`、`logspace`、`eye`、`range`（legacy） | 索引生成常用 |
+| **17.3** 窗函数 | `bartlett_window`、`hann_window`、`hamming_window`、`kaiser_window` | 与 21 配合 |
+| **17.4** 量化工厂 | `_empty_affine_quantized`、`_empty_per_channel_affine_quantized` | 归属 17 创建、服务 19 |
+
+---
+
+### Pattern 18 — 随机与 Dropout
+
+| 子类 | 典型算子 | 备注 |
+|---|---|---|
+| **18.1** 分布采样 | `rand`、`randn`、`randint`、`normal`、`uniform_`、`bernoulli`、`poisson`、`multinomial` | `Generator` 控制；nondeterministic 标签 |
+| **18.2** Dropout | `dropout`、`native_dropout`、`alpha_dropout`、`feature_dropout` | 训练图高频；与 01 融合可能 |
+
+---
+
+### Pattern 19 — 量化
+
+| 子类 | 典型算子 | 备注 |
+|---|---|---|
+| **19.1** 量/反量 | `quantize_per_tensor`、`quantize_per_channel`、`dequantize` | 进出整型表示 |
+| **19.2** Fake quant | `fake_quantize_per_tensor_affine`、`_fake_quantize_learnable_*`、`choose_qparams_*` | QAT；可反传 |
+| **19.3** Q 张量元数据 | `q_scale`、`q_zero_point`、`q_per_channel_scales`、`int_repr` | 读量化参数 |
+| **19.4** 量化计算核 | `quantized::conv2d`、`quantized::linear`、`_int_mm` 等 | 常挂独立 namespace / DispatchKey；与 09/10 功能对应的整数实现 |
+
+**备注**：功能上「量化」既是 **dtype/数值域变换（19.1–19.3）**，也是 **同构算子的整数后端（19.4）**。
+
+---
+
+### Pattern 20 — 稀疏
+
+| 典型算子 | 备注 |
+|---|---|
+| `to_sparse`、`to_dense`、`sparse_coo_tensor`、`_to_sparse_csr/csc/bsr/bsc`、稀疏 `mm`/`add`、`_sparse_semi_structured_*` | shape 规则含 sparse/dense 维；与 10/13 交界 |
+
+---
+
+### Pattern 21 — FFT / 信号
+
+| 典型算子 | 备注 |
+|---|---|
+| `_fft_c2c`、`_fft_r2c`、`_fft_c2r`、`fft.*`、`stft`、`istft`、`fftfreq` | 多调 MKL / cuFFT / pocketfft；计划缓存（`_cufft_*`）属辅助 |
+
+---
+
+### Pattern 22 — 损失函数
+
+| 典型算子 | 备注 |
+|---|---|
+| `nll_loss`、`cross_entropy`、`mse_loss`、`l1_loss`、`smooth_l1_loss`、`binary_cross_entropy`、`kl_div`、`ctc_loss`、`triplet_margin_loss`、`hinge_embedding_loss` | 内部常 **01/05/13 组合**；CTC 等更专用 |
+
+---
+
+### Pattern 23 — 上采样与插值
+
+| 典型算子 | 备注 |
+|---|---|
+| `upsample_nearest2d`、`upsample_bilinear2d`、`upsample_bicubic2d`、`upsample_trilinear3d`、`_upsample_*_aa`、`grid_sampler_2d/3d`、`affine_grid` | 固定维；与 09.2 转置卷积不同路径 |
+
+---
+
+### Pattern 24 — Nested / Jagged
+
+| 典型算子 | 备注 |
+|---|---|
+| `_nested_from_padded`、`_nested_tensor_*`、`_jagged_to_padded_dense_forward`、`_pack_padded_sequence` | **变长** 与 07 填充互转；动态 shape 友好表示 |
+
+---
+
+### Pattern 25 — 排序 / TopK / Unique
+
+| 子类 | 典型算子 | 备注 |
+|---|---|---|
+| **25.1** 排序选择 | `sort`、`argsort`、`topk`、`kthvalue`、`msort` | 比较网络；dim 指定 |
+| **25.2** Unique / 成员 | `unique`、`unique_consecutive`、`_unique2`、`isin` | `unique` 输出长度数据依赖 → 亦标 26 |
+
+---
+
+### Pattern 26 — 数据依赖动态输出
+
+| 典型算子 | 备注 |
+|---|---|
+| `nonzero`、`masked_select`、`unique`（长度）、`syncronized` 类 compact | 官方 tag：`dynamic_output_shape`；实现常 **两阶段 count → write**；meta/导出受限 |
+
+---
+
+### Pattern 27 — 特殊函数
+
+| 典型算子 | 备注 |
+|---|---|
+| `special.erf`、`erfc`、`erfinv`、`lgamma`、`digamma`、`polygamma`、`i0`、`sinc`、`xlogy` | 数学特殊函数；实现形态同 01，单独成类便于库映射 |
+
+---
+
+### Pattern 28 — 元信息 / 控制 / 辅助
+
+| 子类 | 典型算子 | 备注 |
+|---|---|---|
+| **28.1** 查询 | `size`、`stride`、`dim`、`numel`、`is_floating_point`、`device`、`layout` | 非数据面 |
+| **28.2** 断言/调试 | `_assert_async`、`_assert_tensor_metadata`、`_foobar` | 图安全/测试 |
+| **28.3** Autograd 辅助 | `_backward`、`requires_grad_`、AMP `_amp_*` | 训练基础设施 |
+
+---
+
+## 4. Pattern 交叉与组合（真实模型）
+
+| 组合 | 例 | Pattern 链 |
+|---|---|---|
+| Linear | `F.linear` | 10 →（可选 01 bias）→（可选 03） |
+| Conv-BN-ReLU | CNN 块 | 09 → 11 → 03 |
+| LayerNorm | Transformer | 11（内含 05+01） |
+| SDPA | Attention | 10 + 12（+ 18 dropout） |
+| Embedding + sum | `embedding_bag` | 13 → 05 |
+| Pad + Pack | RNN batch | 07 ↔ 24 |
+| QDQ + Conv | PTQ/QAT | 19 → 09/19.4 |
+
+---
+
+## 5. API 特征分类（仍用数字编号引用）
+
+### 5.1 四层责任栈
 
 ```text
-DynLen      : 长度运行时可知，不依赖元素值          → E/B/R/L/M/C 主体
-DynRank     : 维数不固定                            → Iterator 强；DSL 弱
-DynOutData  : 输出 shape 依赖数据                   → D 类
-SymShape    : 编译期符号维                          → PT2 / Export
+L3  用户 API         torch.*/Tensor.*/F.*/nn.*
+L2  Schema+Dispatch  native_functions.yaml
+L1  Plan/Iterator    TensorIterator / meta / structured
+L0  Backend          CPU vec / CUDA / 库 / NPU / Triton…
 ```
 
-### 4.2 非对齐：三类「不对齐」
-
-| 类型 | 定义 | PyTorch 处理 | 风险 |
+| API 类 | 编号 | 谁处理 shape/广播/尾块 | 覆盖 Pattern |
 |---|---|---|---|
-| **U1 长度非向量整除** | `n % lanes != 0` | 整块向量核 + 标量/窄向量尾循环 | 尾块占比高时效率降 |
-| **U2 地址未对齐** | ptr % align ≠ 0 | CPU：unaligned load 或先标量对齐到边界；GPU：多数自然宽 load 可容忍 | 部分 NPU 指令硬要求对齐 |
-| **U3 步长非连续** | `stride != 1`（元素） | reorder + coalesce；否则 strided loop / 先 contiguous | 隐式 `contiguous()` 引入额外拷贝 |
+| 声明式算子 | **A1** | 框架 L1 | 01–06、14–16 为主 |
+| out 变体 | **A2** | 调用方备缓冲 + 框架校验 | 多数计算类 |
+| inplace | **A3** | 受限广播 | 01–03、07.1 等 |
+| 领域库入口 | **A4** | 库内 tiling | 09、10、12、21 |
+| 可编程 DSL | **A5** | 用户 mask/tile | 自研核；不限 |
 
-TensorIterator 关键手段：
+### 5.2 API 形态 × Pattern
 
-1. `compute_shape` → broadcast 后的计算 shape  
-2. `compute_strides` → 字节步长  
-3. `reorder_dimensions` → 快维优先  
-4. `coalesce_dimensions` → 合并可合并维（降维到接近 1D）  
-5. 向量核处理主循环；剩余走 scalar
+| 特征 | 强相关 Pattern | 备注 |
+|---|---|---|
+| 隐式广播 | 01–03、04 | 用户不写 expand |
+| dim/keepdim | 05、06、11、25 | 负维规范化 |
+| padding 参数 | 07、09、08 | 语义 pad |
+| scale/zero_point | 19 | 量化契约 |
+| Generator | 18 | 随机可复现 |
+| 动态输出 | 26、25.2、13.3 | 导出需小心 |
 
-### 4.3 Padding：语义 Pad vs 硬件 Pad
+---
 
-| 种类 | 谁引入 | 是否改变数值语义 | 例 |
+## 6. 动态 Shape、非对齐、Padding（按 Pattern）
+
+### 6.1 动态 Shape 三层
+
+| 层级 | 含义 | 高发 Pattern |
+|---|---|---|
+| **S1** 运行时长度可变 | 每次 forward 的 N/H/W 变 | 01–16、09–12 |
+| **S2** 符号维（编译） | SymInt / 守卫 | PT2 全图；09/10 特化敏感 |
+| **S3** 数据依赖输出 | 输出长度看数值 | **26**、25.2、13.3 |
+
+### 6.2 非对齐三类
+
+| 类型 | 含义 | 高发 Pattern |
+|---|---|---|
+| **U1** 长度非向量整除 | `n % lanes != 0` | 01–03、05、16 |
+| **U2** 地址未对齐 | ptr 不对齐 | 01、16；部分 NPU 硬约束 |
+| **U3** 非连续 stride | 需 strided 或先 contiguous | 14 之后接 01；13 |
+
+### 6.3 各 Pattern 处方（摘要）
+
+| Pattern | Dyn | Align / 尾块 | Pad |
 |---|---|---|---|
-| **P-Sem 语义填充** | 用户 / 算法 API | **是**（或明确忽略区） | `F.pad`、conv 的 padding、sequence pad |
-| **P-Bcast 逻辑拉伸** | 广播规则 | 否（不物化） | size=1 维 stride=0 |
-| **P-Vec 向量尾填充** | 向量化实现 | 否（写回时 mask 掉） | 尾块中性元；禁止泄漏到输出 |
-| **P-HW 硬件对齐填充** | 后端/编译器 | 否，但 **带宽/算力膨胀** | Ascend UB 尾轴 pad 到 32B/512B；部分 Triton-Ascend 自动 pad |
+| 01–03 | S1 每次按 numel 切 | U1 尾块；热路径无谓词整块 | 仅向量尾（非语义） |
+| 04 | 重算 stride_eff | 0-stride 地址生成 | 逻辑拉伸，勿过早物化 |
+| 05 | plan {outer,reduce,inner} | 05.c 短内维打包 | 尾 lane 中性元 |
+| 07 | pad 宽度可动态 | 边界写 | **语义 Pad** |
+| 08–09、23 | 空间尺寸 S1/S2 | 库内对齐 | 算法 padding ≠ 硬件 pad |
+| 10 | MNK 动态 | 分块对齐到 MMA | 库内 P-HW |
+| 12 | 序列长动态 | tile 对齐 | mask 或 pad 到 tile（注意语义） |
+| 13 | 索引长动态 | gather 难对齐 | 一般无 |
+| 15 | 段长各异 | **每段** 自有尾块 | 段间不强制 pad |
+| 19 | 同对应浮点算子 | 整型向量宽可能不同 | qparams 与对齐解耦 |
+| 24 | 变长本质 | 与 07 互转 | padded ↔ nested |
+| 26 | **S3** | compact 尾块 | 上界缓冲≈软 pad |
 
-**竞分要点**：PyTorch API **不把 P-HW 暴露给用户**；NPU 栈若在 lowering 中自动 P-HW，短尾轴（如 `..., 3`）会出现「逻辑很小、物理很大」的性能坑——需 transpose / 借轴 / 改 layout 规避。
-
-### 4.4 各类算子的 Dyn / Align / Pad 处方
-
-| 类别 | 动态 shape | 非对齐 | Padding |
-|---|---|---|---|
-| E | 每次按 `numel` 切块 | U1 尾块；U2 unaligned 快/慢路径 | 仅 P-Vec |
-| B | 重算 `stride_eff` + collapse | 同 E；广播维 stride=0 | P-Bcast；忌过早 materialize |
-| R | plan `{outer,reduce,inner}` | R3 短内维：多行打包或转置 | 尾 lane 中性元（P-Vec） |
-| L-cat | 每段独立长度 | 每段自有尾块 | 段间无强制 pad |
-| L-transpose | 任意 M×N | 分块；边缘块 | 块内可 P-Vec |
-| I | 索引长度动态 | gather 难向量化 | 一般无 pad |
-| M/C | 动态 MNK / NHW | 库内 tiling；要求 L1/L0 对齐 | Conv：**P-Sem**；库内 **P-HW** |
-| D | **S3** | compact 尾块 | 上界缓冲 ≈ 软 pad |
-
-### 4.5 推荐契约（对接自研后端 / SIMD-Tile）
+### 6.4 推荐契约
 
 ```text
-1. 对外 API：不要求 nbytes % 128 == 0，不要求用户写 mask
-2. 对内 lowering：整块满向量量子 + 至多一次尾块（T-Mask / T-Split）
-3. P-HW 不得泄漏为 Python 可见的数值改变
-4. 短内维 Reduce / 短尾轴 EW：优先 layout 变换，再考虑硬件 pad
-5. DynOut：显式两阶段 API，不伪装成 pointwise
-6. GEMM/Conv：领域 API；只复用「分块边界 / epilogue / 尾块」约定
+1. API 不要求用户保证 nbytes % VL == 0
+2. 07 语义 Pad 与硬件对齐 Pad 必须在文档/下层分开
+3. 05.c / 短尾轴：优先 layout 变换，再考虑硬件 pad
+4. 26：显式两阶段，不伪装成 01
+5. 09/10/12：领域 API；只复用分块与尾块约定
 ```
 
 ---
 
-## 5. 竞品分析（竞分）
+## 7. 竞品分析（竞分）
 
-### 5.1 对比对象
+### 7.1 对象
 
 | 对象 | 定位 |
 |---|---|
-| **PyTorch ATen + TensorIterator** | 行业参照：声明式 + 运行时 plan |
-| **CUDA 手写** | 性能上限与控制力参照 |
-| **Triton** | Tile DSL；Inductor 默认 codegen 之一 |
-| **AscendC Basic API** | NPU 显式存储层级与向量/Cube API |
-| **SIMD-Tile (128B)** | 以 128B 为逻辑量子的可移植编写模型 |
+| PyTorch ATen + TensorIterator | 功能覆盖与语义参照 |
+| CUDA 手写 | 性能与控制力上限 |
+| Triton | Tile + mask DSL |
+| AscendC | NPU 显式存储/向量/Cube |
+| SIMD-Tile (128B) | 逻辑 128B 量子的可移植模型 |
 
-### 5.2 评分标准（1–5）
+### 7.2 分项（1–5）
 
 | 分项 | 含义 |
 |---|---|
-| C1 算子覆盖表达力 | 8 大类是否都能自然表达 |
-| C2 API 心智负担 | 用户要懂多少硬件/尾块/对齐 |
-| C3 动态 shape（S1） | 任意长度是否少特化 |
-| C4 非对齐/尾块 | 框架是否默认正确且不太慢 |
-| C5 Pad 可控性 | 能否避免隐式 P-HW 坑 |
-| C6 性能表达力 | 打满硬件的能力（管道/MMA/多缓冲） |
-| C7 与 PyTorch 语义对齐度 | 广播/类型提升/inplace 等 |
+| C1 | Pattern 01–28 表达覆盖 |
+| C2 | API 心智负担 |
+| C3 | S1 动态长度 |
+| C4 | U1/U2 尾块与对齐 |
+| C5 | Pad 可控（尤其反硬件隐式 pad） |
+| C6 | 性能表达力 |
+| C7 | 与 PyTorch 功能语义对齐 |
 
-### 5.3 总评矩阵
+### 7.3 总评
 
-| 分项 | PyTorch TI | CUDA 手写 | Triton | AscendC | SIMD-Tile |
+| 分项 | PyTorch | CUDA 手写 | Triton | AscendC | SIMD-Tile |
 |---|---|---|---|---|---|
-| C1 表达力 | **5** | 5 | 3–4（DynOut/任意 stride 弱） | 4 | 4（M/C/D 走专用） |
-| C2 心智负担 | **5** | 2 | 3–4 | 2–3 | **4–5** |
-| C3 动态 shape | **5** | 4 | 3–4（tile/mask） | 3（tiling/对齐） | **4–5** |
-| C4 尾块/对齐 | **5** | 3 | 4（mask） | 2–3（32B/512B） | **4–5** |
-| C5 Pad 可控 | **5**（少隐式 P-HW） | 4 | 3–4（后端相关） | **2–3**（易自动 pad） | 4（禁止 API 级 pad） |
-| C6 性能表达 | 3–4（靠后端） | **5** | 4（规则核强） | **5** | 3（通用核） |
-| C7 PT 语义对齐 | **5** | 2（需自建） | 3 | 2–3 | **4–5**（目标对齐 TI） |
+| C1 | **5** | 5 | 3–4 | 4 | 4（09/10/12/26 走专用） |
+| C2 | **5** | 2 | 3–4 | 2–3 | **4–5** |
+| C3 | **5** | 4 | 3–4 | 3 | **4–5** |
+| C4 | **5** | 3 | 4 | 2–3 | **4–5** |
+| C5 | **5** | 4 | 3–4 | 2–3 | 4 |
+| C6 | 3–4 | **5** | 4 | **5** | 3 |
+| C7 | **5** | 2 | 3 | 2–3 | **4–5** |
 
-### 5.4 分 Pattern 竞分
+### 7.4 分 Pattern 竞分要点
 
-| Pattern | 最易用 | 性能上限常见归属 | 备注 |
+| Pattern | 最易用 | 性能常归属 | 备注 |
 |---|---|---|---|
-| E0/E1 Elemwise | PyTorch / SIMD-Tile | CUDA / AscendC 管道 | Triton 对任意 rank/stride 不友好 |
-| B Broadcast | PyTorch | 同 E；小输入可先 materialize | AscendC 常显式扩或高阶 API |
-| R1 内维 Reduce | PyTorch / CUB | CUB / AscendC Reduce | 短内维三者都要技巧 |
-| R2/R3 | PyTorch plan | 手写/转置后 R1 | AscendC 短轴 pad 风险高 |
-| L2 Concat | PyTorch | memcpy 带宽 | 各段独立尾块 |
-| L1 Transpose | 库 / 专用 | 手写分块 | 边缘块决定复杂度 |
-| I Gather/Scatter | 接近 | 硬件原子/冲突 | DSL 表达接近，优化难 |
-| M/C | **库 API**（三方皆然） | cuBLAS / Cube | 不要用通用 EW 模型硬写 |
-| D DynOut | PyTorch 两阶段 | 手写 compact | Triton/AscendC 均别扭 |
-| 融合 Norm/SDPA | 专用 API | Flash/厂商库 | 竞分应比领域 API |
+| 01–03 | PyTorch / SIMD-Tile | CUDA / AscendC 管道 | Triton 任意 rank/stride 弱 |
+| 05 | PyTorch | CUB / AscendC Reduce | 05.c 三者都要技巧 |
+| 07 | PyTorch | 带宽 | 与硬件 pad 勿混 |
+| 08–09、23 | 库 API | cuDNN / Cube | 固定维友好 |
+| 10 | **库** | cuBLAS / Cube | 禁止用 01 硬写打满 |
+| 12 | 专用 API | Flash / 厂商库 | 比领域 API，不比裸循环 |
+| 13 | 接近 | 原子/冲突硬件 | DSL 表达接近 |
+| 15 | PyTorch | memcpy | 分段尾块 |
+| 19 | PyTorch 量化栈 | oneDNN / 厂商 Q 核 | 19.4 强绑定后端 |
+| 24 | PyTorch Nested | 定制 | 与 07 互转成本 |
+| 26 | PyTorch 两阶段 | 手写 compact | Triton/AscendC 均别扭 |
 
-### 5.5 动态 Shape × 尾块：同一用例对照
+### 7.5 同一用例
 
-用例：`out = a + b`，`a,b` 长度 `N` 运行时可变，且 `N % lanes != 0`。
+**用例 A**：`a+b`，长度 `N` 动态且 `N % lanes != 0`（Pattern **01**）
 
-| 栈 | 写法要点 | 尾块 |
+| 栈 | 尾块策略 |
+|---|---|
+| PyTorch | 向量主循环 + 标量尾 |
+| CUDA | `i < N` 或向量+边界 |
+| Triton | tile + `mask` |
+| AscendC | repeat/mask；注意 UB 对齐 |
+| SIMD-Tile | 满 128B 无谓词 + **至多一次** 尾块 |
+
+**用例 B**：`sum(dim=-1)`，`K=3`（Pattern **05**，05.c）
+
+| 栈 | 风险 | 较优 |
 |---|---|---|
-| PyTorch | 用户无感知；Iterator 建 plan | `cpu_kernel_vec`：向量主循环 + 标量尾 |
-| CUDA | `grid-stride` + `if (i < N)` | 线程谓词；或向量 load + 边界标量 |
-| Triton | `for` 超 tile + `mask = offs < N` | **整块也可能带 mask**（除非特化末 tile） |
-| AscendC | Tiling 算 `repeat`/`mask`；注意 UB 对齐 | 常配合 `SetMask` / 尾轴 pad |
-| SIMD-Tile | `lanes=128/sizeof(T)`；满 128B 无谓词 | **至多一次** mask/epilogue |
+| AscendC | 尾轴硬件 pad 膨胀 | 借轴/转置 |
+| SIMD-Tile / PT | 利用率低 | 多行打包 |
 
-用例：`sum(dim=-1)`，`K=3`（短内维）。
+### 7.6 落地建议
 
-| 栈 | 风险 | 较优策略 |
-|---|---|---|
-| PyTorch | 向量利用率低 | 多行打包 / 换轴 |
-| Triton | BLOCK 过大浪费 | 调 BLOCK、多行 |
-| AscendC | **P-HW 把 K pad 到 32B/512B** | 借轴转置、避免尾轴为 3 |
-| SIMD-Tile | 几乎全尾块 | `ShortInner` 打包进 128B |
-
-### 5.6 API 特征竞分（责任落点）
-
-```text
-用户要写的「额外概念」越多，C2 越低：
-
-PyTorch:   几乎 0（shape/broadcast/尾块全隐式）
-SIMD-Tile: 0 于 L0 API；框架知 128B
-Triton:    BLOCK、mask、constexpr 特化
-CUDA:      grid/block、索引、同步、对齐
-AscendC:   Pipe、LocalTensor、DataCopy、对齐、多级存储
-```
-
-### 5.7 对自研/NPU 落地的竞分结论
-
-1. **对齐 PyTorch 的是「语义与中间层」**，不是对齐 CUDA 线程模型：优先具备 Iterator/Plan 级的 Broadcast·Reduce·尾块处理。  
-2. **AscendC 的优势在 C6**，短板在 C3/C4/C5；应用层应提供 PyTorch 风格包装，把 P-HW 与 tiling 关在 lowering 内，并治理短尾轴。  
-3. **Triton 适合规则 tile 核与融合**；不适合作为「任意 stride / 任意 rank」的 ATen 通用后端唯一方案。  
-4. **SIMD-Tile** 适合作为 CPU/多后端的 **E/B/R/L 编写契约**，与 PyTorch Pattern 同构；M/C/D 保持领域 API。  
-5. 竞分表上的「赢」应分场景：  
-   - 通用算子正确性与动态 shape → **PyTorch / SIMD-Tile**  
-   - 峰值矩阵与管道 → **CUDA 库 / AscendC Cube+Pipe**  
-   - 快速融合实验 → **Triton**
+1. 中间层按 **Pattern 01–28** 建路由，而不是按产品名 `#ifdef`。  
+2. **01/04/05/14/15/16** 对齐 TensorIterator 语义；**09/10/12/21** 对齐领域库。  
+3. **07 vs 硬件 pad**、**19 量化**、**26 DynOut** 是 NPU 竞分差异最大的三类，需单独能力开关与测试集。  
+4. SIMD-Tile 适合作为 01–06、14–16 的编写契约；与本文数字 Pattern 一一对应即可落地。
 
 ---
 
-## 6. 附录
+## 8. 附录
 
-### 6.1 术语
+### 8.1 术语
 
 | 术语 | 含义 |
 |---|---|
-| Elemwise / Pointwise | 逐元素；ATen tag 名 `pointwise` |
-| stride_eff | 广播后有效步长（广播维为 0） |
-| lanes | 一向量步的元素数；SIMD-Tile 下为 `128/sizeof(T)` |
-| P-HW | 硬件对齐引起的隐式 padding |
-| DynOut | 输出 shape 依赖输入数据值 |
+| Pattern NN | 本文核心功能编号 |
+| schema | `native_functions.yaml` 中一条 `- func:` |
+| 语义 Pad | Pattern 07；改变填充区数值约定 |
+| 硬件 Pad | 后端对齐引入的额外元素，不改变对外语义但影响性能 |
+| DynOut | Pattern 26 |
 
-### 6.2 参考
+### 8.2 参考
 
-- PyTorch `aten/src/ATen/native/tags.yaml`（`pointwise` / `reduction` / `dynamic_output_shape` 等）  
-- PyTorch TensorIterator（`TensorIterator.h` / Wiki: How to use TensorIterator）  
-- native_functions.yaml schema 与 Dispatch  
-- Triton programming model（tile + mask）；Triton-Ascend 对齐/自动 pad 说明  
-- AscendC Basic API（`kernel_operator_*`、DataCopy、向量 Mask、Cube）  
-- 本仓库相关设计：SIMD-Tile 128B Pattern；npu_arch feature 简化  
+- `aten/src/ATen/native/native_functions.yaml`、`tags.yaml`  
+- TensorIterator 文档与实现  
+- ezyang: *A brief taxonomy of PyTorch operators by shape behavior*（按 shape 行为的另一正交分类）  
+- PyTorch Quantization / Sparse / NestedTensor 文档  
+- Triton、AscendC Basic API、SIMD-Tile(128B) 设计  
 
-### 6.3 文档维护
+### 8.3 维护
 
 | 变更 | 动作 |
 |---|---|
-| 新增算子大类 | 更新 §2.1 表与 §2.3 矩阵 |
-| 后端对齐策略变化 | 更新 §4.3 / §5.5 |
-| 合入 SIMD-Tile / AscendC 文档 | 修正文首相对链接 |
+| 新增功能族 | 追加 Pattern 29+；不复用已有数字 |
+| 算子迁类 | 改 §3 典型列表与备注，更新交叉表 §4 |
+| 统计口径变化 | 更新 §1.1 |
 
 ---
 
-*文档目标：给出可落地的算子/API/动态形状特征分类，以及与主流编程栈的竞品对照，供算子库与 NPU 中间层选型使用。*
+*本文以核心功能 + 数字 Pattern 重新组织 PyTorch 三千量级底层算子，并保留 API、动态形状与竞分结论，供算子库与 NPU 中间层对照使用。*
