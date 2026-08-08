@@ -762,7 +762,7 @@ notes:  # 如 “NCCL wait 默认为 stream-order，非 Host-block”
 | 算子迁类 | 改 §3 典型列表与备注，更新交叉表 §4 |
 | 同步语义变更 | 更新 §7 特征矩阵与 Host-block / stream-order 注记 |
 | SIMT/SIMD 映射变更 | 更新 §3.0 助记表与各 Pattern 末列 |
-| **SIMD 硬件原语变更** | 更新 §3.0.1、相关 Pattern 备注、**§8.4 原型** |
+| **SIMD 硬件原语变更** | 更新 §3.0.1、相关 Pattern 备注、**§8.4 原型**、总表「特殊指令」与 **s_SIMD′** |
 | 统计口径变化 | 更新 §1.1 |
 
 ### 8.4 SIMD 指令原型（可移植伪接口）
