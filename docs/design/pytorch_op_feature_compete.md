@@ -1,8 +1,8 @@
-# PyTorch 内置底层算子：按核心功能分类、API 特征与竞品分析
+# PyTorch 内置底层算子：按核心功能分类、API 特征与同步特征
 
-> 范围：以 ATen `native_functions.yaml` 及量化/稀疏等命名空间为对象，覆盖业界常称的 **约三千量级** 内置底层算子（见 §1.1）。  
+> 范围：以 ATen `native_functions.yaml` 及量化/稀疏/分布式等命名空间为对象，覆盖业界常称的 **约三千量级** 内置底层算子（见 §1.1）。  
 > 本文按 **核心功能** 重新分类；Pattern 统一用 **两位数字编号**；每类给出典型算子与备注。  
-> 对照维度：API 形态、动态 shape / 非对齐 / padding，以及 CUDA / Triton / AscendC / SIMD-Tile(128B) 竞分。
+> 对照维度：API 形态、动态 shape / 非对齐 / padding，以及 **同步算子特征提取（Pattern 29）**。
 
 ---
 
@@ -10,12 +10,12 @@
 
 | 维度 | 结论 |
 |---|---|
-| **分类主轴** | 按 **核心功能** 分为 **Pattern 01–28**（逐元素、规约、填充、量化、卷积、矩阵乘等），不以字母代号 |
-| **规模** | schema 约 **2500+**，唯一基名约 **1500+**；计入 inplace / out / 重载 / quantized·sparse·foreach 后常称 **~3000–3500** |
-| **实现主路径** | **01–06、14–16** 多走 TensorIterator；**07–12、19、22–23** 多为固定维/领域核；**25–26** 含数据依赖动态输出 |
-| **API** | 用户声明式 API → Schema/Dispatch → Plan/Iterator → Backend；竞分关键在中间层是否吸收动态与非对齐 |
+| **分类主轴** | 按 **核心功能** 分为 **Pattern 01–29**（逐元素、规约、填充、量化、卷积、矩阵乘、**同步** 等），不以字母代号 |
+| **规模** | schema 约 **2500+**，唯一基名约 **1500+**；计入 inplace / out / 重载 / quantized·sparse·foreach / c10d 后常称 **~3000–3500** |
+| **实现主路径** | **01–06、14–16** 多走 TensorIterator；**07–12、19、22–23** 多为固定维/领域核；**25–26** 含数据依赖动态输出；**29** 走运行时/通信后端 |
+| **API** | 用户声明式 API → Schema/Dispatch → Plan/Iterator → Backend；中间层吸收动态与非对齐 |
 | **Dyn / Align / Pad** | 语义 Pad（07）≠ 向量尾填充 ≠ 硬件对齐 Pad；短尾轴在 NPU 上易被隐式 pad |
-| **选型** | 通用 01/05/14：**跟 PyTorch 语义**；09/10/12 峰值：**领域库**；NPU：**上层 PT 友好 + 下层能力显式** |
+| **同步** | 同步不是计算 Pattern，而是 **执行序约束**；需按阻塞域（Host/Device/Stream/Rank）与序关系（happens-before）提取特征 |
 
 ---
 
@@ -41,7 +41,7 @@ NN.M         = 可选子类（一位小数编号）
 
 示例：`07` = 填充类；`07.1` = 常数填充；`05.2` = Arg 规约。
 
-后文 API / 动态 shape / 竞分均引用这些数字编号。
+后文 API / 动态 shape / 同步特征均引用这些数字编号。
 
 ### 1.3 与官方 ATen tags 的关系
 
@@ -88,6 +88,7 @@ NN.M         = 可选子类（一位小数编号）
 | **26** | 数据依赖动态输出 | 输出 shape 依赖 **数值** | 小 | 两阶段 |
 | **27** | 特殊函数 | `special.*`、高阶数学 | 中 | 多为 01 变体 |
 | **28** | 元信息 / 控制 / 辅助 | size、device、assert、autograd 钩子 | 中 | 非计算主路径 |
+| **29** | 同步 / 序约束 | Host·Device·Stream·跨 Rank 等待与屏障 | 中 | 不改数值；约束执行序 |
 
 复合模块（`nn.Linear`、`nn.MultiheadAttention`）由上表 Pattern **组合** 而成，不单开编号。
 
@@ -137,7 +138,7 @@ NN.M         = 可选子类（一位小数编号）
 | **04.2** 重复物化 | `repeat`、`tile`、`repeat_interleave` | 真正拷贝；与 04.1 成本不同 |
 | **04.3** 隐式广播 | （无独立 API） | 发生在 01/02/03 的 TI build 中 |
 
-**备注**：竞分时常把 04 从 01 拆出——后端是否支持 0-stride 决定要不要先 materialize。
+**备注**：实现选型时常把 04 从 01 拆出——后端是否支持 0-stride 决定要不要先 materialize。
 
 ---
 
@@ -176,7 +177,7 @@ NN.M         = 可选子类（一位小数编号）
 | **07.3** 序列填充 | `nn.utils.rnn.pad_sequence`、`pad_packed_sequence`、`_pad_packed_sequence` | 与 24 Nested 交互 |
 | **07.4** 矩阵三角填充 | `tril`、`triu`、`tril_`、`triu_` | 按三角掩码写 |
 
-**重要区分（竞分常用）**：
+**重要区分（实现与对齐常用）**：
 
 | 名称 | 是否改数值语义 | 例 |
 |---|---|---|
@@ -387,8 +388,25 @@ NN.M         = 可选子类（一位小数编号）
 | 子类 | 典型算子 | 备注 |
 |---|---|---|
 | **28.1** 查询 | `size`、`stride`、`dim`、`numel`、`is_floating_point`、`device`、`layout` | 非数据面 |
-| **28.2** 断言/调试 | `_assert_async`、`_assert_tensor_metadata`、`_foobar` | 图安全/测试 |
+| **28.2** 断言/调试 | `_assert_async`、`_assert_tensor_metadata`、`_foobar` | 图安全/测试；`_assert_async` 亦带 **29** 序依赖语义 |
 | **28.3** Autograd 辅助 | `_backward`、`requires_grad_`、AMP `_amp_*` | 训练基础设施 |
+
+---
+
+### Pattern 29 — 同步 / 序约束
+
+> 同步算子 **通常不改变张量数值**，而是建立 **happens-before**。特征提取见 §7。
+
+| 子类 | 典型 API / 算子 | 备注 |
+|---|---|---|
+| **29.1** Host↔Device 全同步 | `torch.cuda.synchronize` / `torch.npu.synchronize`、`Stream.synchronize`、`.item()` / `.cpu()` 隐式同步 | CPU 线程阻塞到指定 device/stream 完成 |
+| **29.2** 跨 Stream 序 | `Event.record` / `Event.wait` / `Stream.wait_event` / `Stream.wait_stream` | 设备侧序；默认 **不** 阻塞 Host |
+| **29.3** 张量–流绑定 | `record_stream` | ATen schema 有显式条目；缓存分配器跨流复用安全 |
+| **29.4** 图/编译依赖令牌 | `_make_dep_token`、`_functional_assert_async`、带 `dep_token` 的 constrain | 把副作用变成 SSA 边，供 Inductor/Export |
+| **29.5** 集合通信完成 | `Work.wait` / `Work.synchronize`、`barrier`、`async_op=False` 路径 | **Host-block** vs **stream-order** 必须拆开（见 §7.3） |
+| **29.6** P2P 通信序 | `send`/`recv`（同步语义）、`isend`/`irecv` + `wait` | CUDA+NCCL 上常为 stream 序，易被误读成 Host 阻塞 |
+| **29.7** 隐式同步点 | 非 `non_blocking` 的 D2H、跨设备 `copy_`、部分 view 失败路径 | 无独立算子名，但特征上等同 29.1 |
+| **29.8** 核内同步（后端） | `__syncthreads`、AscendC `PipeBarrier`/`SetFlag`/`WaitFlag` | 不在 Python ATen 面；lowering 时与 29.2 对照 |
 
 ---
 
@@ -403,6 +421,8 @@ NN.M         = 可选子类（一位小数编号）
 | Embedding + sum | `embedding_bag` | 13 → 05 |
 | Pad + Pack | RNN batch | 07 ↔ 24 |
 | QDQ + Conv | PTQ/QAT | 19 → 09/19.4 |
+| 通信–计算重叠 | async allreduce + compute + wait | 10/01 ∥ **29.5** → **29.5 wait** |
+| 多流通用 | copy 到侧流 + event 回主流 | 16 + **29.2/29.3** |
 
 ---
 
@@ -424,6 +444,7 @@ L0  Backend          CPU vec / CUDA / 库 / NPU / Triton…
 | inplace | **A3** | 受限广播 | 01–03、07.1 等 |
 | 领域库入口 | **A4** | 库内 tiling | 09、10、12、21 |
 | 可编程 DSL | **A5** | 用户 mask/tile | 自研核；不限 |
+| 运行时同步/通信 | **A6** | 用户或框架显式 wait | **29**（Stream/Event/c10d） |
 
 ### 5.2 API 形态 × Pattern
 
@@ -435,6 +456,7 @@ L0  Backend          CPU vec / CUDA / 库 / NPU / Triton…
 | scale/zero_point | 19 | 量化契约 |
 | Generator | 18 | 随机可复现 |
 | 动态输出 | 26、25.2、13.3 | 导出需小心 |
+| Stream / Event / Work | 29 | 序约束；常无 Tensor 输出 |
 
 ---
 
@@ -472,6 +494,7 @@ L0  Backend          CPU vec / CUDA / 库 / NPU / Triton…
 | 19 | 同对应浮点算子 | 整型向量宽可能不同 | qparams 与对齐解耦 |
 | 24 | 变长本质 | 与 07 互转 | padded ↔ nested |
 | 26 | **S3** | compact 尾块 | 上界缓冲≈软 pad |
+| 29 | 一般不改 shape | 与对齐无关 | 不引入语义 Pad；通信缓冲对齐另计 |
 
 ### 6.4 推荐契约
 
@@ -481,87 +504,103 @@ L0  Backend          CPU vec / CUDA / 库 / NPU / Triton…
 3. 05.c / 短尾轴：优先 layout 变换，再考虑硬件 pad
 4. 26：显式两阶段，不伪装成 01
 5. 09/10/12：领域 API；只复用分块与尾块约定
+6. 29：文档与实现必须标明阻塞域（Host / Stream / Rank），禁止把 stream-order 写成 Host 同步
 ```
 
 ---
 
-## 7. 竞品分析（竞分）
+## 7. 同步算子特征提取
 
-### 7.1 对象
+同步类（Pattern **29**）与 01–28 正交：**不描述“算什么”，而描述“何时可见/何时可继续”**。特征提取按下表维度做，便于中间层路由、图捕获与 NPU Pipe 映射。
 
-| 对象 | 定位 |
-|---|---|
-| PyTorch ATen + TensorIterator | 功能覆盖与语义参照 |
-| CUDA 手写 | 性能与控制力上限 |
-| Triton | Tile + mask DSL |
-| AscendC | NPU 显式存储/向量/Cube |
-| SIMD-Tile (128B) | 逻辑 128B 量子的可移植模型 |
+### 7.1 特征维度（提取模板）
 
-### 7.2 分项（1–5）
-
-| 分项 | 含义 |
-|---|---|
-| C1 | Pattern 01–28 表达覆盖 |
-| C2 | API 心智负担 |
-| C3 | S1 动态长度 |
-| C4 | U1/U2 尾块与对齐 |
-| C5 | Pad 可控（尤其反硬件隐式 pad） |
-| C6 | 性能表达力 |
-| C7 | 与 PyTorch 功能语义对齐 |
-
-### 7.3 总评
-
-| 分项 | PyTorch | CUDA 手写 | Triton | AscendC | SIMD-Tile |
-|---|---|---|---|---|---|
-| C1 | **5** | 5 | 3–4 | 4 | 4（09/10/12/26 走专用） |
-| C2 | **5** | 2 | 3–4 | 2–3 | **4–5** |
-| C3 | **5** | 4 | 3–4 | 3 | **4–5** |
-| C4 | **5** | 3 | 4 | 2–3 | **4–5** |
-| C5 | **5** | 4 | 3–4 | 2–3 | 4 |
-| C6 | 3–4 | **5** | 4 | **5** | 3 |
-| C7 | **5** | 2 | 3 | 2–3 | **4–5** |
-
-### 7.4 分 Pattern 竞分要点
-
-| Pattern | 最易用 | 性能常归属 | 备注 |
+| 特征 ID | 名称 | 取值空间 | 提取问题 |
 |---|---|---|---|
-| 01–03 | PyTorch / SIMD-Tile | CUDA / AscendC 管道 | Triton 任意 rank/stride 弱 |
-| 05 | PyTorch | CUB / AscendC Reduce | 05.c 三者都要技巧 |
-| 07 | PyTorch | 带宽 | 与硬件 pad 勿混 |
-| 08–09、23 | 库 API | cuDNN / Cube | 固定维友好 |
-| 10 | **库** | cuBLAS / Cube | 禁止用 01 硬写打满 |
-| 12 | 专用 API | Flash / 厂商库 | 比领域 API，不比裸循环 |
-| 13 | 接近 | 原子/冲突硬件 | DSL 表达接近 |
-| 15 | PyTorch | memcpy | 分段尾块 |
-| 19 | PyTorch 量化栈 | oneDNN / 厂商 Q 核 | 19.4 强绑定后端 |
-| 24 | PyTorch Nested | 定制 | 与 07 互转成本 |
-| 26 | PyTorch 两阶段 | 手写 compact | Triton/AscendC 均别扭 |
+| **F1** | 阻塞域 | `Host` / `Device` / `Stream` / `Rank` / `Graph` | 谁在等待？ |
+| **F2** | 作用域 | `current_stream` / `named_stream` / `device_all` / `process_group` / `p2p_peer` | 等的范围有多大？ |
+| **F3** | 序关系 | `HB`（happens-before）/ `barrier`（多方汇合）/ `token`（SSA 依赖） | 建立何种偏序？ |
+| **F4** | 同步粒度 | `full_device` / `stream` / `event` / `work_item` / `kernel_block` | 粒度越粗气泡越大 |
+| **F5** | 可见性 | `memory_visible` / `progress_only` | 是否保证内存对等待方可见（通常 HB ⇒ 可见） |
+| **F6** | 异步可分性 | `fused`（调用即等）/ `split`（发起 + 显式 wait） | 能否与计算重叠 |
+| **F7** | 超时/可查询 | `blocking` / `timed_wait` / `query` | 是否可轮询或带 timeout |
+| **F8** | 图捕获兼容 | `allowed` / `forbidden` / `record_only` | CUDA Graph / 图模式能否记录 |
+| **F9** | 数值副作用 | `none` / `comm_buffer` / `assert_only` | 是否改用户张量（纯同步应为 none） |
+| **F10** | 隐式触发 | `explicit` / `implicit_on_copy` / `implicit_on_read` | API 是否在名字里暴露同步 |
 
-### 7.5 同一用例
+### 7.2 子类 × 特征矩阵
 
-**用例 A**：`a+b`，长度 `N` 动态且 `N % lanes != 0`（Pattern **01**）
+| 子类 | F1 阻塞域 | F2 作用域 | F3 序 | F4 粒度 | F6 可分 | F8 图捕获 | 典型入口 |
+|---|---|---|---|---|---|---|---|
+| **29.1** Host↔Device | Host | device / stream | HB | device 或 stream | fused | 常 forbidden（host sync） | `cuda.synchronize`、`stream.synchronize` |
+| **29.2** 跨 Stream | Device（流） | event / stream | HB | event | split（record/wait） | record/wait 节点可进图 | `Event`、`wait_stream` |
+| **29.3** record_stream | —（注解） | tensor↔stream | 分配器序 | tensor | — | 需一致记录 | `record_stream` |
+| **29.4** dep_token | Graph/编译 | token 边 | token HB | op 边 | split（token 传递） | **为图设计** | `_make_dep_token`、functional assert |
+| **29.5** 集合通信 wait | Host 或 Stream | process_group | barrier / HB | work | split（async_op） | capture 时禁 host sync | `Work.wait`、`barrier` |
+| **29.6** P2P | Host 或 Stream | peer rank | HB | work | `isend/irecv` 可分 | 同 29.5 | `send/recv`、`isend/irecv` |
+| **29.7** 隐式同步 | Host | 触发该次拷贝的流 | HB | stream/device | fused（藏在 copy） | 图内需改成显式 | `.item()`、同步 `copy_` |
+| **29.8** 核内同步 | Device 线程块/Pipe | block / pipe | HB / barrier | block 或硬件 pipe | 核内 fused | 核内原语 | `__syncthreads`、`PipeBarrier` |
 
-| 栈 | 尾块策略 |
-|---|---|
-| PyTorch | 向量主循环 + 标量尾 |
-| CUDA | `i < N` 或向量+边界 |
-| Triton | tile + `mask` |
-| AscendC | repeat/mask；注意 UB 对齐 |
-| SIMD-Tile | 满 128B 无谓词 + **至多一次** 尾块 |
+### 7.3 关键语义：Host-block vs Stream-order
 
-**用例 B**：`sum(dim=-1)`，`K=3`（Pattern **05**，05.c）
+同一 API 名在不同后端可表示两种完全不同的 F1：
 
-| 栈 | 风险 | 较优 |
+| 语义 | 含义 | 后果 |
 |---|---|---|
-| AscendC | 尾轴硬件 pad 膨胀 | 借轴/转置 |
-| SIMD-Tile / PT | 利用率低 | 多行打包 |
+| **Host-block** | CPU 线程等到 GPU/通信完成 | Python 后续代码所见内存已就绪；易串行化 |
+| **Stream-order** | 仅当前 CUDA/NPU stream 等待某 event/work | CPU 可继续；必须在同设备流序上消费结果 |
 
-### 7.6 落地建议
+**提取规则**：
 
-1. 中间层按 **Pattern 01–28** 建路由，而不是按产品名 `#ifdef`。  
-2. **01/04/05/14/15/16** 对齐 TensorIterator 语义；**09/10/12/21** 对齐领域库。  
-3. **07 vs 硬件 pad**、**19 量化**、**26 DynOut** 是 NPU 竞分差异最大的三类，需单独能力开关与测试集。  
-4. SIMD-Tile 适合作为 01–06、14–16 的编写契约；与本文数字 Pattern 一一对应即可落地。
+1. 标注每个 29.x API 的默认语义（NCCL 上 `Work.wait` / 部分 P2P 常为 stream-order）。  
+2. `barrier(async_op=False)` 路径若声称同步，应核对其是否真正 Host-block。  
+3. 图捕获期间：Host-block（`cudaStreamSynchronize` / `Event.synchronize`）通常 **非法或无意义** → F8=`forbidden`。  
+4. 通信–计算重叠：发起侧 F6=`split`，消费前必须有匹配的 wait（29.5/29.2）。
+
+### 7.4 ATen / 运行时中的显式锚点
+
+| 锚点 | 所在层 | 提取要点 |
+|---|---|---|
+| `record_stream(Tensor, Stream)` | ATen schema | 唯一直接进 `native_functions` 的流注解算子；F9=`none`，服务分配器 |
+| `_assert_async` / `_functional_assert_async` | ATen | 设备侧断言；functional 版用 `dep_token` 把断言纳入 29.4 |
+| `_make_dep_token` | ATen | 纯序载体；无数值 |
+| `torch.cuda.Event/Stream`、`torch.npu.*` | 运行时绑定 | 不在 yaml 功能表，但属 Pattern 29 用户面 |
+| `torch.distributed.*` + `Work` | c10d | 集体/P2P；完成协议走 29.5/29.6 |
+| `non_blocking=True` 的 `copy_` / `to` | 16 + 29 | **缺少** 显式 wait 时，后续 Host 读触发 29.7 |
+
+### 7.5 与计算 Pattern 的耦合点
+
+| 计算侧 | 同步特征如何挂接 |
+|---|---|
+| 01–16 单流默认 | 依赖默认流隐式序；多流时需补 29.2/29.3 |
+| 10/12 长核 | 侧流通信用 29.5 split，主流算完再 wait |
+| 16 D2H | 默认同刻 29.7；profiling 时应标为隐式同步 |
+| 26 DynOut | 常被迫 Host 同步拿长度（F1=Host，F10=implicit） |
+| 19 量化参数读取 | `q_scale` 等若落 Host，可能隐式同步 |
+
+### 7.6 特征提取检查清单（落地）
+
+对每个同步相关 API / IR 节点填写：
+
+```text
+name:
+subclass: 29.x
+F1_block_domain: Host | Stream | Device | Rank | Graph
+F2_scope: ...
+F3_relation: HB | barrier | token
+F4_granularity: ...
+F6_async: fused | split
+F8_graph: allowed | forbidden | record_only
+F9_side_effect: none | ...
+F10_implicit: explicit | implicit_on_copy | implicit_on_read
+notes:  # 如 “NCCL wait 默认为 stream-order，非 Host-block”
+```
+
+映射建议：
+
+- 中间层 IR：显式节点 `Sync` / `Wait` / `RecordEvent` / `CommWork`，禁止靠隐式 D2H 表达序。  
+- NPU lowering：29.2 ↔ Event/Stream；29.8 ↔ `PipeBarrier` / `SetFlag`/`WaitFlag`；29.5 ↔ HCCL/HCOMM work + 明确 Host vs 设备序。  
+- 与 CCU / fullmesh 文档对照时：旗标 poll、RDMA Complete 属于 **29.5/29.6** 的设备侧完成协议，不是 05 规约。
 
 ---
 
@@ -576,23 +615,28 @@ L0  Backend          CPU vec / CUDA / 库 / NPU / Triton…
 | 语义 Pad | Pattern 07；改变填充区数值约定 |
 | 硬件 Pad | 后端对齐引入的额外元素，不改变对外语义但影响性能 |
 | DynOut | Pattern 26 |
+| Host-block | CPU 线程等待设备/通信完成 |
+| Stream-order | 仅流队列上的 happens-before，不阻塞 Host |
+| dep_token | 编译图中的显式序依赖载体（29.4） |
 
 ### 8.2 参考
 
-- `aten/src/ATen/native/native_functions.yaml`、`tags.yaml`  
+- `aten/src/ATen/native/native_functions.yaml`、`tags.yaml`（含 `record_stream`、`_assert_async`、`_make_dep_token`）  
 - TensorIterator 文档与实现  
 - ezyang: *A brief taxonomy of PyTorch operators by shape behavior*（按 shape 行为的另一正交分类）  
+- PyTorch CUDA Stream/Event 文档；c10d `Work.wait` / `barrier` Host vs stream 语义讨论  
 - PyTorch Quantization / Sparse / NestedTensor 文档  
-- Triton、AscendC Basic API、SIMD-Tile(128B) 设计  
+- AscendC `PipeBarrier` / `SetFlag` / `WaitFlag`；集合通信完成旗标  
 
 ### 8.3 维护
 
 | 变更 | 动作 |
 |---|---|
-| 新增功能族 | 追加 Pattern 29+；不复用已有数字 |
+| 新增功能族 | 追加 Pattern 30+；不复用已有数字 |
 | 算子迁类 | 改 §3 典型列表与备注，更新交叉表 §4 |
+| 同步语义变更 | 更新 §7 特征矩阵与 Host-block / stream-order 注记 |
 | 统计口径变化 | 更新 §1.1 |
 
 ---
 
-*本文以核心功能 + 数字 Pattern 重新组织 PyTorch 三千量级底层算子，并保留 API、动态形状与竞分结论，供算子库与 NPU 中间层对照使用。*
+*本文以核心功能 + 数字 Pattern 组织 PyTorch 三千量级底层算子，并提取同步算子（Pattern 29）的阻塞域与序关系特征，供算子库与 NPU 中间层对照使用。*
