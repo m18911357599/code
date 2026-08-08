@@ -4,7 +4,7 @@
 > **核心主题**: L2 Cache 持久化访问控制机制  
 > **主要资料来源**: NVIDIA 官方 CUDA Programming Guide《L2 Cache Control》章节  
 > **资料来源链接**: https://docs.nvidia.com/cuda/cuda-programming-guide/04-special-topics/l2-cache-control.html  
-> **本地路径**: `d:/github/a.md`（仓库镜像：`d/github/a.md`）
+> **仓库路径**: `docs/cuda/a.md`
 
 ---
 
