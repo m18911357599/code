@@ -59,37 +59,39 @@ NN.M         = 可选子类（一位小数编号）
 
 ## 2. 按核心功能的 Pattern 分类总表
 
-| Pattern | 核心功能 | 定义（一句话） | 规模感（基名量级） | 典型访存/并行 |
-|---|---|---|---|---|
-| **01** | 逐元素算术 | 同址（广播后）二元/一元数值运算 | 很大 | 带宽；完全并行 |
-| **02** | 比较 / 逻辑 / 选择 | 比较、位运算、`where` 类 | 大 | 同 01 |
-| **03** | 激活与非线性 | 逐点非线性；常可与 01/09/10 融合 | 中 | 同 01 |
-| **04** | 广播与维扩展 | 逻辑扩展 shape，默认不拷贝 | 中 | 0-stride / 物化 |
-| **05** | 规约 | 多→少；沿 dim 聚合 | 大 | 树归约 / 分块 |
-| **06** | 扫描与累积 | 有序前缀依赖 | 小 | 难乱序 |
-| **07** | 填充 | 边界/长度语义 Pad | 中 | 搬移 + 边界写 |
-| **08** | 池化 | 滑窗降采样 / 反池化 | 中 | 固定维；空间并行 |
-| **09** | 卷积 | 局部加权；含转置卷积 | 中 | 高算术密度 |
-| **10** | 矩阵乘与线性代数 | GEMM / 分解 / 求解 | 大 | MMA / 库 |
-| **11** | 归一化 | BN / LN / GN / RMSNorm 等 | 中 | 规约+广播融合 |
-| **12** | Softmax / Attention | Softmax、SDPA、MHA | 中 | 融合 IO 感知 |
-| **13** | 索引 / 散射 / Embedding | 间接读写 | 大 | gather/scatter |
-| **14** | 布局变换 | view / transpose / reshape 等 | 很大 | 元数据或搬移 |
-| **15** | 拼接与分割 | cat / stack / split | 中 | 分段 copy |
-| **16** | 拷贝与类型转换 | clone / to / cast | 中 | 带宽 |
-| **17** | 工厂与创建 | 无输入或仅 shape 造张量 | 中 | 写填充 |
-| **18** | 随机与 Dropout | 采样、噪声、dropout | 中 | RNG + 逐点 |
-| **19** | 量化 | quantize / dequant / fake_quant | 中 | 量纲变换+整数核 |
-| **20** | 稀疏 | COO/CSR 等稀疏格式与算子 | 中 | 间接、压缩 |
-| **21** | FFT / 信号 | 频域变换 | 小–中 | 专用库 |
-| **22** | 损失函数 | 训练目标 | 中 | 常含规约 |
-| **23** | 上采样与插值 | upsample / grid_sample | 中 | 固定维插值 |
-| **24** | Nested / Jagged | 变长序列结构 | 小–中 | 偏移+填充交互 |
-| **25** | 排序 / TopK / Unique | 比较网络、选择 | 小–中 | 不规则 |
-| **26** | 数据依赖动态输出 | 输出 shape 依赖 **数值** | 小 | 两阶段 |
-| **27** | 特殊函数 | `special.*`、高阶数学 | 中 | 多为 01 变体 |
-| **28** | 元信息 / 控制 / 辅助 | size、device、assert、autograd 钩子 | 中 | 非计算主路径 |
-| **29** | 同步 / 序约束 | Host·Device·Stream·跨 Rank 等待与屏障 | 中 | 不改数值；约束执行序 |
+> **亲 SIMT/SIMD**：该类更贴哪套并行模型（详解见 §3）。`双亲`=两者都易写；`偏 SIMT/偏 SIMD`=一方明显更顺；`亲 MMA`=峰值靠矩阵加速单元而非通用 SIMD；`N/A`=无数据面向量化。
+
+| Pattern | 核心功能 | 定义（一句话） | 规模感 | 典型访存/并行 | 亲 SIMT/SIMD |
+|---|---|---|---|---|---|
+| **01** | 逐元素算术 | 同址（广播后）二元/一元数值运算 | 很大 | 带宽；完全并行 | **双亲** |
+| **02** | 比较 / 逻辑 / 选择 | 比较、位运算、`where` 类 | 大 | 同 01 | **双亲** |
+| **03** | 激活与非线性 | 逐点非线性；常可与 01/09/10 融合 | 中 | 同 01 | **双亲**（超越函数 SIMD 略降） |
+| **04** | 广播与维扩展 | 逻辑扩展 shape，默认不拷贝 | 中 | 0-stride / 物化 | **偏 SIMT**（通用广播）；标量广播 SIMD 亦易 |
+| **05** | 规约 | 多→少；沿 dim 聚合 | 大 | 树归约 / 分块 | **双亲中**（SIMT 靠 warp reduce；SIMD 靠 `vreduce`） |
+| **06** | 扫描与累积 | 有序前缀依赖 | 小 | 难乱序 | **偏 SIMT**（扫描原语）；SIMD 需 `vscan` |
+| **07** | 填充 | 边界/长度语义 Pad | 中 | 搬移 + 边界写 | **偏 SIMT**（边界分支）；常值填充 SIMD 易 |
+| **08** | 池化 | 滑窗降采样 / 反池化 | 中 | 固定维；空间并行 | **偏 SIMT**；沿轴可 SIMD |
+| **09** | 卷积 | 局部加权；含转置卷积 | 中 | 高算术密度 | **亲 MMA**（非裸 SIMD） |
+| **10** | 矩阵乘与线性代数 | GEMM / 分解 / 求解 | 大 | MMA / 库 | **亲 MMA**；小向量积可 SIMD |
+| **11** | 归一化 | BN / LN / GN / RMSNorm 等 | 中 | 规约+广播融合 | **双亲中**（05+01 组合） |
+| **12** | Softmax / Attention | Softmax、SDPA、MHA | 中 | 融合 IO 感知 | Softmax **双亲中**；SDPA **亲 MMA** |
+| **13** | 索引 / 散射 / Embedding | 间接读写 | 大 | gather/scatter | **偏 SIMT**；SIMD 需 gather/scatter |
+| **14** | 布局变换 | view / transpose / reshape 等 | 很大 | 元数据或搬移 | view **N/A**；物化转置 **偏 SIMD**（`vtranspose`） |
+| **15** | 拼接与分割 | cat / stack / split | 中 | 分段 copy | **双亲**（分段 copy） |
+| **16** | 拷贝与类型转换 | clone / to / cast | 中 | 带宽 | **双亲** |
+| **17** | 工厂与创建 | 无输入或仅 shape 造张量 | 中 | 写填充 | **双亲** |
+| **18** | 随机与 Dropout | 采样、噪声、dropout | 中 | RNG + 逐点 | **偏 SIMT**；有向量 RNG 则双亲 |
+| **19** | 量化 | quantize / dequant / fake_quant | 中 | 量纲变换+整数核 | QDQ **双亲**；Q-GEMM **亲 MMA** |
+| **20** | 稀疏 | COO/CSR 等稀疏格式与算子 | 中 | 间接、压缩 | **偏 SIMT** |
+| **21** | FFT / 信号 | 频域变换 | 小–中 | 专用库 | **亲库**（非通用 SIMT/SIMD map） |
+| **22** | 损失函数 | 训练目标 | 中 | 常含规约 | **偏 SIMT/双亲中**（01+05）；CTC 低 |
+| **23** | 上采样与插值 | upsample / grid_sample | 中 | 固定维插值 | **偏 SIMT**（邻域 gather） |
+| **24** | Nested / Jagged | 变长序列结构 | 小–中 | 偏移+填充交互 | **偏 SIMT**（按段）；段内可 SIMD |
+| **25** | 排序 / TopK / Unique | 比较网络、选择 | 小–中 | 不规则 | **偏 SIMT**；小块可 SIMD 比较网络 |
+| **26** | 数据依赖动态输出 | 输出 shape 依赖 **数值** | 小 | 两阶段 | **偏 SIMT**；有 `vcompress` 则 SIMD 中 |
+| **27** | 特殊函数 | `special.*`、高阶数学 | 中 | 多为 01 变体 | **偏 SIMT**（近似）；有向量库则双亲 |
+| **28** | 元信息 / 控制 / 辅助 | size、device、assert、autograd 钩子 | 中 | 非计算主路径 | **N/A** |
+| **29** | 同步 / 序约束 | Host·Device·Stream·跨 Rank 等待与屏障 | 中 | 不改数值；约束执行序 | **N/A**（29.8 核内 barrier 属 SIMT 原语） |
 
 复合模块（`nn.Linear`、`nn.MultiheadAttention`）由上表 Pattern **组合** 而成，不单开编号。
 
@@ -97,20 +99,24 @@ NN.M         = 可选子类（一位小数编号）
 
 ## 3. 各类详解：子类、典型算子、备注、SIMT/SIMD
 
-### 3.0 列约定：SIMT · SIMD 易用性与指令
+### 3.0 列约定：SIMT / SIMD 易用性与 SIMD 指令特征
 
-| 标记 | 含义 |
+详表在原有列之外增加三列：
+
+| 列名 | 含义 |
 |---|---|
-| **SIMT** | 一线程一元素（CUDA grid-stride / warp 协作）；易用性看是否需手写边界、warp reduce、共享内存 |
-| **SIMD** | 一指令多 lane / tile（AVX·NEON·RVV·AscendC Vec·SIMD-Tile）；易用性看是否需 mask 尾块、gather、显式规约树 |
-| **高 / 中 / 低** | 写出正确且可向量化实现的相对难度（高=易写） |
+| **SIMT 易用** | 一线程一元素（CUDA grid-stride / warp 协作）写出正确实现的难度；**高=易写** |
+| **SIMD 易用** | 一指令多 lane / tile（AVX·NEON·RVV·AscendC Vec·SIMD-Tile）写出正确实现的难度；**高=易写** |
+| **SIMD 典型指令特征** | 该类热路径需要的可移植向量指令族（后端再映射到具体 ISA） |
 
-**所需 SIMD 指令**用可移植助记名（后端再映射到具体 ISA）：
+易用性取值：`高` / `中` / `低` / `N/A`（可带简短括注）。
 
-| 助记 | 含义 |
+**SIMD 指令助记**：
+
+| 助记 | 特征含义 |
 |---|---|
-| `vload`/`vstore` | 连续向量读写（含 unaligned 变体） |
-| `vloadm`/`vstorem` | 带 mask/谓词的读写（尾块） |
+| `vload`/`vstore` | 连续向量读写（含 unaligned） |
+| `vloadm`/`vstorem` | mask/谓词读写（尾块） |
 | `vadd`/`vmul`/`vfma`/`vdiv`… | 逐 lane 算术 |
 | `vcmp`/`vblend`/`vwhere` | 比较与选择 |
 | `vsplat`/`vbroadcast` | 标量/短向量扩到全宽 |
@@ -119,18 +125,20 @@ NN.M         = 可选子类（一位小数编号）
 | `vshuf`/`vtranspose` | 重排 / 分块转置 |
 | `vcvt` | dtype 转换 |
 | `vprefix`/`vscan` | 有序前缀 |
-| `vatomic_*` | 向量侧或 lane 原子（scatter 冲突） |
+| `vcompress`/`vexpand` | 按 mask 压缩/展开 |
+| `vatomic_*` | lane/地址原子（scatter 冲突） |
+| `MMA/*` | 非通用 SIMD，矩阵加速单元 |
 
 ---
 
 ### Pattern 01 — 逐元素算术
 
-| 子类 | 含义 | 典型算子 | 备注 | SIMT·SIMD 易用 / 所需 SIMD 指令 |
-|---|---|---|---|---|
-| **01.1** 二元算术 | `+/-/×/÷` 等 | `add`、`sub`、`mul`、`div`、`remainder`、`pow`、`atan2`、`hypot` | 默认支持广播与类型提升；TensorIterator 主力 | **SIMT 高**（`i<n`）；**SIMD 高**（整块+尾 mask）。指令：`vload/vstore`、`vloadm/vstorem`、`vadd`/`vmul`/`vdiv`/`vfma`、`vcvt`（提升时） |
-| **01.2** 一元算术 | 逐点变换 | `neg`、`abs`、`reciprocal`、`sqrt`、`rsqrt`、`exp`、`log`、`sin`/`cos` | 与 27 有重叠；实现仍按 pointwise | **SIMT 高**；**SIMD 高～中**（超越函数看 ISA 是否有向量 `vexp`/`vlog`/`vsin`，否则标量近似）。指令：同 01.1 + `vabs`/`vsqrt`/`vexp`… |
-| **01.3** 三元组合 | 乘加类 | `addcmul`、`addcdiv`、`lerp` | 易融合进 10 的 epilogue | **SIMT 高**；**SIMD 高**。指令：`vfma`、`vload×3`、`vblend`（lerp） |
-| **01.4** Foreach 变体 | 列表逐元素 | `_foreach_add`、`_foreach_mul`、… | 优化器步进；并行提交多 tensor | **SIMT 高**（多 stream/多核）；**SIMD 高**（每 tensor 同 01.1）。指令：同 01.1；调度非 SIMD |
+| 子类 | 含义 | 典型算子 | 备注 | SIMT 易用 | SIMD 易用 | SIMD 典型指令特征 |
+|---|---|---|---|---|---|---|
+| **01.1** 二元算术 | `+/-/×/÷` 等 | `add`、`sub`、`mul`、`div`、`remainder`、`pow`、`atan2`、`hypot` | 默认支持广播与类型提升；TensorIterator 主力 | 高（`i<n`） | 高（整块+尾 mask） | `vload/vstore`、`vloadm/vstorem`、`vadd`/`vmul`/`vdiv`/`vfma`、`vcvt`（提升时） |
+| **01.2** 一元算术 | 逐点变换 | `neg`、`abs`、`reciprocal`、`sqrt`、`rsqrt`、`exp`、`log`、`sin`/`cos` | 与 27 有重叠；实现仍按 pointwise | 高 | 高～中（超越函数看 ISA 是否有向量 `vexp`/`vlog`/`vsin`，否则标量近似） | 同 01.1 + `vabs`/`vsqrt`/`vexp`… |
+| **01.3** 三元组合 | 乘加类 | `addcmul`、`addcdiv`、`lerp` | 易融合进 10 的 epilogue | 高 | 高 | `vfma`、`vload×3`、`vblend`（lerp） |
+| **01.4** Foreach 变体 | 列表逐元素 | `_foreach_add`、`_foreach_mul`、… | 优化器步进；并行提交多 tensor | 高（多 stream/多核） | 高（每 tensor 同 01.1） | 同 01.1；调度非 SIMD |
 
 **实现备注**：热路径 = 整块向量 + 标量/窄向量尾；非 contiguous 先 reorder/coalesce。
 
@@ -138,32 +146,32 @@ NN.M         = 可选子类（一位小数编号）
 
 ### Pattern 02 — 比较 / 逻辑 / 选择
 
-| 子类 | 典型算子 | 备注 | SIMT·SIMD 易用 / 所需 SIMD 指令 |
-|---|---|---|---|
-| **02.1** 比较 | `eq`、`ne`、`lt`、`le`、`gt`、`ge`、`isnan`、`isinf`、`isfinite` | 输出常为 bool | **SIMT 高**；**SIMD 高**。指令：`vcmp`、`vstore`（mask→bool 打包视后端） |
-| **02.2** 位/逻辑 | `bitwise_and`/`or`/`xor`、`logical_and`、`__lshift__` | 整数/bool 路径 | **SIMT 高**；**SIMD 高**。指令：`vand`/`vor`/`vxor`/`vshl`/`vshr` |
-| **02.3** 选择 | `where`、`clamp`、`clamp_min`/`max`、`nan_to_num`、`maximum`、`minimum` | `where` = 谓词 blend；尾块需 mask | **SIMT 高**；**SIMD 高**。指令：`vblend`/`vwhere`、`vmin`/`vmax`、`vcmp` |
+| 子类 | 典型算子 | 备注 | SIMT 易用 | SIMD 易用 | SIMD 典型指令特征 |
+|---|---|---|---|---|---|
+| **02.1** 比较 | `eq`、`ne`、`lt`、`le`、`gt`、`ge`、`isnan`、`isinf`、`isfinite` | 输出常为 bool | 高 | 高 | `vcmp`、`vstore`（mask→bool 打包视后端） |
+| **02.2** 位/逻辑 | `bitwise_and`/`or`/`xor`、`logical_and`、`__lshift__` | 整数/bool 路径 | 高 | 高 | `vand`/`vor`/`vxor`/`vshl`/`vshr` |
+| **02.3** 选择 | `where`、`clamp`、`clamp_min`/`max`、`nan_to_num`、`maximum`、`minimum` | `where` = 谓词 blend；尾块需 mask | 高 | 高 | `vblend`/`vwhere`、`vmin`/`vmax`、`vcmp` |
 
 ---
 
 ### Pattern 03 — 激活与非线性
 
-| 子类 | 典型算子 | 备注 | SIMT·SIMD 易用 / 所需 SIMD 指令 |
-|---|---|---|---|
-| **03.1** 经典激活 | `relu`、`leaky_relu`、`elu`、`selu`、`celu`、`threshold` | 常与 09/10 融合（Conv-ReLU） | **SIMT 高**；**SIMD 高**。指令：`vmax`/`vblend`、`vfma`（leaky）；可作 10 epilogue |
-| **03.2** 现代激活 | `gelu`、`silu`/`swish`、`mish`、`hardswish`、`hardsigmoid`、`hardtanh` | Transformer / CNN 高频 | **SIMT 高**；**SIMD 中**（多项式/近似）。指令：`vmul`/`vfma`、`vtanh`/`vexp` 近似、`vmin`/`vmax` |
-| **03.3** 饱和/收缩 | `sigmoid`、`tanh`、`softplus`、`softshrink`、`hardshrink`、`glu` | Softmax 前常用 sigmoid/tanh | **SIMT 高**；**SIMD 中**。指令：`vexp`/`vtanh` 近似、`vdiv`、`vblend` |
-| **03.4** 带参数 | `prelu`、`rrelu` | 额外权重；非纯 01 | **SIMT 高**；**SIMD 高～中**（通道广播）。指令：`vbroadcast` + `vblend`/`vmul` |
+| 子类 | 典型算子 | 备注 | SIMT 易用 | SIMD 易用 | SIMD 典型指令特征 |
+|---|---|---|---|---|---|
+| **03.1** 经典激活 | `relu`、`leaky_relu`、`elu`、`selu`、`celu`、`threshold` | 常与 09/10 融合（Conv-ReLU） | 高 | 高 | `vmax`/`vblend`、`vfma`（leaky）；可作 10 epilogue |
+| **03.2** 现代激活 | `gelu`、`silu`/`swish`、`mish`、`hardswish`、`hardsigmoid`、`hardtanh` | Transformer / CNN 高频 | 高 | 中（多项式/近似） | `vmul`/`vfma`、`vtanh`/`vexp` 近似、`vmin`/`vmax` |
+| **03.3** 饱和/收缩 | `sigmoid`、`tanh`、`softplus`、`softshrink`、`hardshrink`、`glu` | Softmax 前常用 sigmoid/tanh | 高 | 中 | `vexp`/`vtanh` 近似、`vdiv`、`vblend` |
+| **03.4** 带参数 | `prelu`、`rrelu` | 额外权重；非纯 01 | 高 | 高～中（通道广播） | `vbroadcast` + `vblend`/`vmul` |
 
 ---
 
 ### Pattern 04 — 广播与维扩展
 
-| 子类 | 典型算子 | 备注 | SIMT·SIMD 易用 / 所需 SIMD 指令 |
-|---|---|---|---|
-| **04.1** 逻辑广播 | `expand`、`expand_as`、`broadcast_to`、`broadcast_tensors`、`broadcast_shapes` | **默认不物化**；stride=0 | **SIMT 高**（按输出下标算源址）；**SIMD 中**（0-stride 用 `vsplat`/`vbroadcast`，通用广播要 `vgather`）。指令：`vsplat`、`vbroadcast`、必要时 `vgather` |
-| **04.2** 重复物化 | `repeat`、`tile`、`repeat_interleave` | 真正拷贝；与 04.1 成本不同 | **SIMT 高**；**SIMD 中**。指令：`vload`/`vstore` 循环；`repeat_interleave` 常要 `vgather` |
-| **04.3** 隐式广播 | （无独立 API） | 发生在 01/02/03 的 TI build 中 | 同 04.1，并入 01 的地址生成 |
+| 子类 | 典型算子 | 备注 | SIMT 易用 | SIMD 易用 | SIMD 典型指令特征 |
+|---|---|---|---|---|---|
+| **04.1** 逻辑广播 | `expand`、`expand_as`、`broadcast_to`、`broadcast_tensors`、`broadcast_shapes` | **默认不物化**；stride=0 | 高（按输出下标算源址） | 中（0-stride 用 `vsplat`/`vbroadcast`，通用广播要 `vgather`） | `vsplat`、`vbroadcast`、必要时 `vgather` |
+| **04.2** 重复物化 | `repeat`、`tile`、`repeat_interleave` | 真正拷贝；与 04.1 成本不同 | 高 | 中 | `vload`/`vstore` 循环；`repeat_interleave` 常要 `vgather` |
+| **04.3** 隐式广播 | （无独立 API） | 发生在 01/02/03 的 TI build 中 | 见组合 | 见组合 | 同 04.1，并入 01 的地址生成 |
 
 **备注**：实现选型时常把 04 从 01 拆出——后端是否支持 0-stride 决定要不要先 materialize。
 
@@ -171,13 +179,13 @@ NN.M         = 可选子类（一位小数编号）
 
 ### Pattern 05 — 规约
 
-| 子类 | 典型算子 | 备注 | SIMT·SIMD 易用 / 所需 SIMD 指令 |
-|---|---|---|---|
-| **05.1** 数值规约 | `sum`、`prod`、`mean`、`nansum`、`nanmean`、`norm`、`linalg.vector_norm`、`logsumexp`、`count_nonzero` | keepdim / dim / 多维 reduce | **SIMT 中**（需 warp/block reduce）；**SIMD 中**（水平规约+跨 tile 合并）。指令：`vload`/`vloadm`、`vadd`/`vmul`、`vhadd`/`vreduce_*`；尾 lane 填中性元 |
-| **05.2** Arg 规约 | `argmax`、`argmin`、`amax`、`amin`、`aminmax` | 携带 index 或值；尾块禁无效 idx | **SIMT 中**；**SIMD 中～低**（值+索引对）。指令：`vmax`/`vmin` + index 伴随、`vblend`；禁用无效 lane |
-| **05.3** 逻辑规约 | `all`、`any` | bool 中性元不同 | **SIMT 中**；**SIMD 高～中**。指令：`vand`/`vor` 规约、`vcmp` |
-| **05.4** 统计规约 | `std`、`var`、`median`、`quantile`、`mode` | 有的两遍扫描；`quantile` 更复杂 | **SIMT 中～低**；**SIMD 低**（`quantile`/`median` 近排序）。指令：两遍 `vreduce`；或走 25 |
-| **05.5** 全局标量 | `trace`（方阵）、无 dim 的 `sum()` | 可看作全维 05.1 | 同 05.1；对角线另要跨步 `vgather` 或标量 |
+| 子类 | 典型算子 | 备注 | SIMT 易用 | SIMD 易用 | SIMD 典型指令特征 |
+|---|---|---|---|---|---|
+| **05.1** 数值规约 | `sum`、`prod`、`mean`、`nansum`、`nanmean`、`norm`、`linalg.vector_norm`、`logsumexp`、`count_nonzero` | keepdim / dim / 多维 reduce | 中（需 warp/block reduce） | 中（水平规约+跨 tile 合并） | `vload`/`vloadm`、`vadd`/`vmul`、`vhadd`/`vreduce_*`；尾 lane 填中性元 |
+| **05.2** Arg 规约 | `argmax`、`argmin`、`amax`、`amin`、`aminmax` | 携带 index 或值；尾块禁无效 idx | 中 | 中～低（值+索引对） | `vmax`/`vmin` + index 伴随、`vblend`；禁用无效 lane |
+| **05.3** 逻辑规约 | `all`、`any` | bool 中性元不同 | 中 | 高～中 | `vand`/`vor` 规约、`vcmp` |
+| **05.4** 统计规约 | `std`、`var`、`median`、`quantile`、`mode` | 有的两遍扫描；`quantile` 更复杂 | 中～低 | 低（`quantile`/`median` 近排序） | 两遍 `vreduce`；或走 25 |
+| **05.5** 全局标量 | `trace`（方阵）、无 dim 的 `sum()` | 可看作全维 05.1 | 见组合 | 见组合 | 同 05.1；对角线另要跨步 `vgather` 或标量 |
 
 **子特征备注**：
 
@@ -189,20 +197,20 @@ NN.M         = 可选子类（一位小数编号）
 
 ### Pattern 06 — 扫描与累积
 
-| 典型算子 | 备注 | SIMT·SIMD 易用 / 所需 SIMD 指令 |
-|---|---|---|
-| `cumsum`、`cumprod`、`cummax`、`cummin`、`logcumsumexp` | 沿 dim **有序**；不可随意乱序并行；与 05 不同 | **SIMT 中**（Hillis-Steele / Blelloch）；**SIMD 中～低**（块内 `vprefix`/`vscan` + 块间回写）。指令：`vscan_add`/`vscan_max`、`vshuf`（蝶式）、`vload`/`vstore` |
+| 典型算子 | 备注 | SIMT 易用 | SIMD 易用 | SIMD 典型指令特征 |
+|---|---|---|---|---|
+| `cumsum`、`cumprod`、`cummax`、`cummin`、`logcumsumexp` | 沿 dim **有序**；不可随意乱序并行；与 05 不同 | 中（Hillis-Steele / Blelloch） | 中～低（块内 `vprefix`/`vscan` + 块间回写） | `vscan_add`/`vscan_max`、`vshuf`（蝶式）、`vload`/`vstore` |
 
 ---
 
 ### Pattern 07 — 填充（Pad）
 
-| 子类 | 典型算子 | 备注 | SIMT·SIMD 易用 / 所需 SIMD 指令 |
-|---|---|---|---|
-| **07.1** 常值填充 | `constant_pad_nd`、`F.pad(..., mode='constant')`、`zero_`、`fill_`、`masked_fill` | **语义 Pad**：改变有效区域外的值 | **SIMT 高**；**SIMD 高～中**（边界分支）。指令：`vsplat`+`vstore`；`masked_fill` 用 `vblend`/`vstorem` |
-| **07.2** 边界反射/复制 | `reflection_pad1d/2d/3d`、`replication_pad*`、`circular_pad*` | 卷积/分割任务常用 | **SIMT 高**；**SIMD 中～低**（地址折叠）。指令：常 `vgather`；或分段 `vload` |
-| **07.3** 序列填充 | `nn.utils.rnn.pad_sequence`、`pad_packed_sequence`、`_pad_packed_sequence` | 与 24 Nested 交互 | **SIMT 高**；**SIMD 中**（变长段）。指令：段内 `vload`/`vstore`/`vsplat` |
-| **07.4** 矩阵三角填充 | `tril`、`triu`、`tril_`、`triu_` | 按三角掩码写 | **SIMT 高**；**SIMD 中**。指令：lane 坐标生成 mask + `vblend` |
+| 子类 | 典型算子 | 备注 | SIMT 易用 | SIMD 易用 | SIMD 典型指令特征 |
+|---|---|---|---|---|---|
+| **07.1** 常值填充 | `constant_pad_nd`、`F.pad(..., mode='constant')`、`zero_`、`fill_`、`masked_fill` | **语义 Pad**：改变有效区域外的值 | 高 | 高～中（边界分支） | `vsplat`+`vstore`；`masked_fill` 用 `vblend`/`vstorem` |
+| **07.2** 边界反射/复制 | `reflection_pad1d/2d/3d`、`replication_pad*`、`circular_pad*` | 卷积/分割任务常用 | 高 | 中～低（地址折叠） | 常 `vgather`；或分段 `vload` |
+| **07.3** 序列填充 | `nn.utils.rnn.pad_sequence`、`pad_packed_sequence`、`_pad_packed_sequence` | 与 24 Nested 交互 | 高 | 中（变长段） | 段内 `vload`/`vstore`/`vsplat` |
+| **07.4** 矩阵三角填充 | `tril`、`triu`、`tril_`、`triu_` | 按三角掩码写 | 高 | 中 | lane 坐标生成 mask + `vblend` |
 
 **重要区分（实现与对齐常用）**：
 
@@ -217,23 +225,23 @@ NN.M         = 可选子类（一位小数编号）
 
 ### Pattern 08 — 池化
 
-| 子类 | 典型算子 | 备注 | SIMT·SIMD 易用 / 所需 SIMD 指令 |
-|---|---|---|---|
-| **08.1** Max/Avg/Lp | `max_pool2d`、`avg_pool2d`、`lp_pool2d`、`*_pool1d/3d` | 固定 1–3D；含 indices 的 max_pool | **SIMT 高～中**（窗内循环）；**SIMD 中**（沿 W 向量化或窗内 `vmax`）。指令：`vload`、`vmax`/`vadd`、`vreduce_*`；带 indices 时存 arg |
-| **08.2** Adaptive | `adaptive_avg_pool2d`、`adaptive_max_pool2d` | 输出尺寸指定；实现与普通池化不同 | **SIMT 中**；**SIMD 中～低**（窗边界不规则）。指令：同 08.1 + 动态窗索引 |
-| **08.3** 反池化 | `max_unpool2d` | 依赖 08.1 的 indices | **SIMT 中**；**SIMD 低**。指令：`vscatter` |
-| **08.4** Fractional | `fractional_max_pool2d` | 随机/分数步长 | **SIMT 中**；**SIMD 低**。指令：不规则窗 + `vmax` |
+| 子类 | 典型算子 | 备注 | SIMT 易用 | SIMD 易用 | SIMD 典型指令特征 |
+|---|---|---|---|---|---|
+| **08.1** Max/Avg/Lp | `max_pool2d`、`avg_pool2d`、`lp_pool2d`、`*_pool1d/3d` | 固定 1–3D；含 indices 的 max_pool | 高～中（窗内循环） | 中（沿 W 向量化或窗内 `vmax`） | `vload`、`vmax`/`vadd`、`vreduce_*`；带 indices 时存 arg |
+| **08.2** Adaptive | `adaptive_avg_pool2d`、`adaptive_max_pool2d` | 输出尺寸指定；实现与普通池化不同 | 中 | 中～低（窗边界不规则） | 同 08.1 + 动态窗索引 |
+| **08.3** 反池化 | `max_unpool2d` | 依赖 08.1 的 indices | 中 | 低 | `vscatter` |
+| **08.4** Fractional | `fractional_max_pool2d` | 随机/分数步长 | 中 | 低 | 不规则窗 + `vmax` |
 
 ---
 
 ### Pattern 09 — 卷积
 
-| 子类 | 典型算子 | 备注 | SIMT·SIMD 易用 / 所需 SIMD 指令 |
-|---|---|---|---|
-| **09.1** 标准卷积 | `convolution`、`conv1d/2d/3d`、`_convolution` | 统一入口；padding 为 **算法参数**（语义） | **SIMT 中**（手写难打满）；**SIMD 低**（应走 im2col+10 或专用 MMA/Winograd，而非裸 SIMD map）。指令：若 SIMD 路径则 `vfma` 滑窗或 `vload`→im2col；峰值用 **MMA/Cube** 非通用 SIMD |
-| **09.2** 转置/深度可分 | `conv_transpose*`、`_conv_depthwise2d` | 上采样通路；与 23 不同 | **SIMT 中**；**SIMD 低～中**（depthwise 可通道/空间向量化）。指令：depthwise：`vfma`+`vload`；transpose：`vscatter`/`vatomic_add` 或 col2im |
-| **09.3** 后端专用 | `cudnn_convolution`、`miopen_convolution`、`slow_conv*` | 分发到库；用户通常不直接调 | 不手写 SIMT/SIMD；库内自选 |
-| **09.4** im2col | `im2col`、`col2im` | 卷积折叠到 10；调试/后备路径 | **SIMT 高**；**SIMD 中**。指令：`vload`/`vstore`、`vgather`（展开）；`col2im` 用 `vscatter`/`vatomic_add` |
+| 子类 | 典型算子 | 备注 | SIMT 易用 | SIMD 易用 | SIMD 典型指令特征 |
+|---|---|---|---|---|---|
+| **09.1** 标准卷积 | `convolution`、`conv1d/2d/3d`、`_convolution` | 统一入口；padding 为 **算法参数**（语义） | 中（手写难打满） | 低（应走 im2col+10 或专用 MMA/Winograd，而非裸 SIMD map） | 若 SIMD 路径则 `vfma` 滑窗或 `vload`→im2col；峰值用 **MMA/Cube** 非通用 SIMD |
+| **09.2** 转置/深度可分 | `conv_transpose*`、`_conv_depthwise2d` | 上采样通路；与 23 不同 | 中 | 低～中（depthwise 可通道/空间向量化） | depthwise：`vfma`+`vload`；transpose：`vscatter`/`vatomic_add` 或 col2im |
+| **09.3** 后端专用 | `cudnn_convolution`、`miopen_convolution`、`slow_conv*` | 分发到库；用户通常不直接调 | N/A（库） | N/A（库） | 库内自选 / MMA |
+| **09.4** im2col | `im2col`、`col2im` | 卷积折叠到 10；调试/后备路径 | 高 | 中 | `vload`/`vstore`、`vgather`（展开）；`col2im` 用 `vscatter`/`vatomic_add` |
 
 **备注**：不宜用通用 01 模型硬写；与 07 的 pad、08 的窗口模式相关但实现独立。
 
@@ -241,105 +249,105 @@ NN.M         = 可选子类（一位小数编号）
 
 ### Pattern 10 — 矩阵乘与线性代数
 
-| 子类 | 典型算子 | 备注 | SIMT·SIMD 易用 / 所需 SIMD 指令 |
-|---|---|---|---|
-| **10.1** GEMM 族 | `mm`、`bmm`、`addmm`、`baddbmm`、`addbmm`、`matmul`、`tensordot`、`einsum` | 训练/推理算力主力；epilogue 可融 01/03 | **SIMT 低**（手写 tile）；**SIMD 低**（应 **MMA/WMMA/Cube/AMX**，外加 epilogue `vfma`/`vadd`）。通用 SIMD 仅作小规模/后备 |
-| **10.2** 向量积 | `dot`、`vdot`、`ger`、`inner`、`outer`、`addr` | 小规模或构建块 | **SIMT 中**；**SIMD 高～中**。指令：`vfma` + `vreduce_add`；`outer`/`ger` 用 `vsplat`×`vmul` |
-| **10.3** 分解/求解 | `linalg.svd`、`linalg.qr`、`linalg.cholesky`、`linalg.solve`、`triangular_solve`、`lu_*` | 数值库路径 | **SIMT/SIMD 均低**（数值库）；非通用向量 map |
-| **10.4** 量化/低比特 GEMM | `_int_mm`、`_dyn_quant_matmul_4bit`、`_weight_int4pack_mm` | 与 19 交界；专用核 | **SIMT 低**；**SIMD 低～中**（`vpdpbusd`/int8 MMA、unpack）。指令：整数 MMA、`vcvt`、scale `vmul` |
-| **10.5** 分组/稀疏 MM | `_grouped_mm`、`_cslt_sparse_mm`、`_sparse_semi_structured_linear` | 与 20 交界 | **SIMT 中～低**；**SIMD 低**。指令：结构化稀疏 MMA 或 `vgather` |
+| 子类 | 典型算子 | 备注 | SIMT 易用 | SIMD 易用 | SIMD 典型指令特征 |
+|---|---|---|---|---|---|
+| **10.1** GEMM 族 | `mm`、`bmm`、`addmm`、`baddbmm`、`addbmm`、`matmul`、`tensordot`、`einsum` | 训练/推理算力主力；epilogue 可融 01/03 | 低（手写 tile） | 低（应 MMA/WMMA/Cube/AMX，外加 epilogue `vfma`/`vadd`） | 通用 SIMD 仅作小规模/后备 |
+| **10.2** 向量积 | `dot`、`vdot`、`ger`、`inner`、`outer`、`addr` | 小规模或构建块 | 中 | 高～中 | `vfma` + `vreduce_add`；`outer`/`ger` 用 `vsplat`×`vmul` |
+| **10.3** 分解/求解 | `linalg.svd`、`linalg.qr`、`linalg.cholesky`、`linalg.solve`、`triangular_solve`、`lu_*` | 数值库路径 | 低（数值库） | 低（数值库） | 非通用向量 map |
+| **10.4** 量化/低比特 GEMM | `_int_mm`、`_dyn_quant_matmul_4bit`、`_weight_int4pack_mm` | 与 19 交界；专用核 | 低 | 低～中（`vpdpbusd`/int8 MMA、unpack） | 整数 MMA、`vcvt`、scale `vmul` |
+| **10.5** 分组/稀疏 MM | `_grouped_mm`、`_cslt_sparse_mm`、`_sparse_semi_structured_linear` | 与 20 交界 | 中～低 | 低 | 结构化稀疏 MMA 或 `vgather` |
 
 ---
 
 ### Pattern 11 — 归一化
 
-| 典型算子 | 备注 | SIMT·SIMD 易用 / 所需 SIMD 指令 |
-|---|---|---|
-| `native_batch_norm`、`batch_norm`、`native_layer_norm`、`layer_norm`、`native_group_norm`、`group_norm`、`instance_norm`、`rms_norm`、`normalize` | 内部 = **05 规约 + 01/04 仿射**；实现几乎总是融合专用核 | **SIMT 中**（两遍/Welford）；**SIMD 中**（内维 `vreduce` + `vsplat` 广播 + `vfma`）。指令：`vload`、`vreduce_add`/`vhadd`、`vsplat`、`vrsqrt`/`vdiv`、`vfma` |
+| 典型算子 | 备注 | SIMT 易用 | SIMD 易用 | SIMD 典型指令特征 |
+|---|---|---|---|---|
+| `native_batch_norm`、`batch_norm`、`native_layer_norm`、`layer_norm`、`native_group_norm`、`group_norm`、`instance_norm`、`rms_norm`、`normalize` | 内部 = **05 规约 + 01/04 仿射**；实现几乎总是融合专用核 | 中（两遍/Welford） | 中（内维 `vreduce` + `vsplat` 广播 + `vfma`） | `vload`、`vreduce_add`/`vhadd`、`vsplat`、`vrsqrt`/`vdiv`、`vfma` |
 
 ---
 
 ### Pattern 12 — Softmax / Attention
 
-| 子类 | 典型算子 | 备注 | SIMT·SIMD 易用 / 所需 SIMD 指令 |
-|---|---|---|---|
-| **12.1** Softmax | `softmax`、`log_softmax`、`_softmax`、`_safe_softmax` | 数值稳定：max-sub → exp → sum → div | **SIMT 中**；**SIMD 中**。指令：`vmax`/`vreduce_max`、`vsub`、`vexp`、`vreduce_add`、`vdiv` |
-| **12.2** SDPA / Flash | `scaled_dot_product_attention`、`_flash_attention_forward`、`_efficient_attention_forward`、`_cudnn_attention_forward` | IO 感知；动态序列长度敏感 | **SIMT 低**（专用算法）；**SIMD/MMA 低～中**（块内 GEMM+在线 softmax）。指令：MMA + 12.1 向量 epilogue；**非**纯 SIMD map |
-| **12.3** MHA 包装 | `_native_multi_head_attention` | 组合 10+12+13 | 同 10+12+13 组合 |
+| 子类 | 典型算子 | 备注 | SIMT 易用 | SIMD 易用 | SIMD 典型指令特征 |
+|---|---|---|---|---|---|
+| **12.1** Softmax | `softmax`、`log_softmax`、`_softmax`、`_safe_softmax` | 数值稳定：max-sub → exp → sum → div | 中 | 中 | `vmax`/`vreduce_max`、`vsub`、`vexp`、`vreduce_add`、`vdiv` |
+| **12.2** SDPA / Flash | `scaled_dot_product_attention`、`_flash_attention_forward`、`_efficient_attention_forward`、`_cudnn_attention_forward` | IO 感知；动态序列长度敏感 | 低（专用算法） | 低～中（块内 GEMM+在线 softmax） | MMA + 12.1 向量 epilogue；**非**纯 SIMD map |
+| **12.3** MHA 包装 | `_native_multi_head_attention` | 组合 10+12+13 | 见组合 | 见组合 | 同 10+12+13 组合 |
 
 ---
 
 ### Pattern 13 — 索引 / 散射 / Embedding
 
-| 子类 | 典型算子 | 备注 | SIMT·SIMD 易用 / 所需 SIMD 指令 |
-|---|---|---|---|
-| **13.1** Gather | `gather`、`index_select`、`take`、`take_along_dim`、`index` | 读间接；难向量化 | **SIMT 高**；**SIMD 中～低**。指令：`vgather`；连续 index 可退化 `vload` |
-| **13.2** Scatter | `scatter`、`scatter_add`、`scatter_reduce`、`index_add`、`index_put`、`put_` | 写冲突；需原子或确定性策略 | **SIMT 中**（原子）；**SIMD 低**。指令：`vscatter`、`vatomic_add`；冲突时标量回退 |
-| **13.3** Masked | `masked_select`、`masked_scatter`、`masked_fill` | `masked_select` → 亦属 26 | **SIMT 中**；**SIMD 中～低**。指令：`vcompress`/`vexpand`（若有）、`vblend`；否则两阶段 |
-| **13.4** Embedding | `embedding`、`embedding_bag`、`_embedding_bag` | 查表 + 可选 05；稀疏梯度 | **SIMT 高～中**；**SIMD 中**（行 gather）。指令：`vgather` 行；bag 再 `vreduce` |
-| **13.5** 搜索桶 | `bucketize`、`searchsorted`、`one_hot` | 半有序索引 | **SIMT 高**；**SIMD 中～低**。指令：向量二分或 `vcmp` 边界；`one_hot` 用 `vscatter` |
+| 子类 | 典型算子 | 备注 | SIMT 易用 | SIMD 易用 | SIMD 典型指令特征 |
+|---|---|---|---|---|---|
+| **13.1** Gather | `gather`、`index_select`、`take`、`take_along_dim`、`index` | 读间接；难向量化 | 高 | 中～低 | `vgather`；连续 index 可退化 `vload` |
+| **13.2** Scatter | `scatter`、`scatter_add`、`scatter_reduce`、`index_add`、`index_put`、`put_` | 写冲突；需原子或确定性策略 | 中（原子） | 低 | `vscatter`、`vatomic_add`；冲突时标量回退 |
+| **13.3** Masked | `masked_select`、`masked_scatter`、`masked_fill` | `masked_select` → 亦属 26 | 中 | 中～低 | `vcompress`/`vexpand`（若有）、`vblend`；否则两阶段 |
+| **13.4** Embedding | `embedding`、`embedding_bag`、`_embedding_bag` | 查表 + 可选 05；稀疏梯度 | 高～中 | 中（行 gather） | `vgather` 行；bag 再 `vreduce` |
+| **13.5** 搜索桶 | `bucketize`、`searchsorted`、`one_hot` | 半有序索引 | 高 | 中～低 | 向量二分或 `vcmp` 边界；`one_hot` 用 `vscatter` |
 
 ---
 
 ### Pattern 14 — 布局变换
 
-| 子类 | 典型算子 | 备注 | SIMT·SIMD 易用 / 所需 SIMD 指令 |
-|---|---|---|---|
-| **14.1** 元数据 View | `view`、`reshape`（可 view 时）、`expand`、`transpose`/`permute`（可 view）、`squeeze`/`unsqueeze`、`as_strided`、`select`、`narrow`、`diagonal` | `inplace_view` / view 语义；尽量零拷贝 | **SIMT/SIMD 均 N/A**（无向量核）；零指令数据面 |
-| **14.2** 物化转置/重排 | `contiguous`、`permute` 打断时、`transpose` 拷贝路径、`movedim` | 分块转置；边缘 gather | **SIMT 中**；**SIMD 中**。指令：`vload`/`vstore`、`vtranspose`/`vshuf`；边缘 `vgather`/`vloadm` |
-| **14.3** 展平/折叠 | `flatten`、`unflatten`、`unfold` | `unfold` 有重叠窗，偏 08/09 预备 | **SIMT 高**；**SIMD 中**（`unfold` 重叠）。指令：copy 用 `vload`/`vstore`；`unfold` 常 `vgather` |
-| **14.4** view_copy 族 | `*_copy`（如 `transpose_copy`、`permute_copy`） | 功能化 IR / Export 用 | 同 14.2 |
+| 子类 | 典型算子 | 备注 | SIMT 易用 | SIMD 易用 | SIMD 典型指令特征 |
+|---|---|---|---|---|---|
+| **14.1** 元数据 View | `view`、`reshape`（可 view 时）、`expand`、`transpose`/`permute`（可 view）、`squeeze`/`unsqueeze`、`as_strided`、`select`、`narrow`、`diagonal` | `inplace_view` / view 语义；尽量零拷贝 | N/A（无向量核） | N/A（无向量核） | 零指令数据面 |
+| **14.2** 物化转置/重排 | `contiguous`、`permute` 打断时、`transpose` 拷贝路径、`movedim` | 分块转置；边缘 gather | 中 | 中 | `vload`/`vstore`、`vtranspose`/`vshuf`；边缘 `vgather`/`vloadm` |
+| **14.3** 展平/折叠 | `flatten`、`unflatten`、`unfold` | `unfold` 有重叠窗，偏 08/09 预备 | 高 | 中（`unfold` 重叠） | copy 用 `vload`/`vstore`；`unfold` 常 `vgather` |
+| **14.4** view_copy 族 | `*_copy`（如 `transpose_copy`、`permute_copy`） | 功能化 IR / Export 用 | 中 | 中 | 同 14.2：`vload`/`vstore`、`vtranspose`/`vshuf` |
 
 ---
 
 ### Pattern 15 — 拼接与分割
 
-| 子类 | 典型算子 | 备注 | SIMT·SIMD 易用 / 所需 SIMD 指令 |
-|---|---|---|---|
-| **15.1** 拼接 | `cat`、`concat`、`stack`、`hstack`/`vstack`/`dstack`、`column_stack` | **分段 copy**；每段独立尾块 | **SIMT 高**；**SIMD 高**。指令：每段 `vload`/`vstore`/`vloadm`/`vstorem` |
-| **15.2** 分割 | `split`、`split_with_sizes`、`chunk`、`tensor_split`、`unbind`、`hsplit`/`vsplit` | 多为 view 或分段 view | view：**N/A**；物化同 15.1 |
-| **15.3** 块对角等 | `block_diag` | 隐式零填充区域 ↔ 与 07 相关 | **SIMT 高**；**SIMD 中**。指令：块内 copy + `vsplat(0)` 填空隙 |
+| 子类 | 典型算子 | 备注 | SIMT 易用 | SIMD 易用 | SIMD 典型指令特征 |
+|---|---|---|---|---|---|
+| **15.1** 拼接 | `cat`、`concat`、`stack`、`hstack`/`vstack`/`dstack`、`column_stack` | **分段 copy**；每段独立尾块 | 高 | 高 | 每段 `vload`/`vstore`/`vloadm`/`vstorem` |
+| **15.2** 分割 | `split`、`split_with_sizes`、`chunk`、`tensor_split`、`unbind`、`hsplit`/`vsplit` | 多为 view 或分段 view | N/A（view）/ 高（物化） | N/A（view）/ 高（物化） | view 无指令；物化同 15.1：`vload`/`vstore` |
+| **15.3** 块对角等 | `block_diag` | 隐式零填充区域 ↔ 与 07 相关 | 高 | 中 | 块内 copy + `vsplat(0)` 填空隙 |
 
 ---
 
 ### Pattern 16 — 拷贝与类型转换
 
-| 子类 | 典型算子 | 备注 | SIMT·SIMD 易用 / 所需 SIMD 指令 |
-|---|---|---|---|
-| **16.1** 拷贝 | `clone`、`copy_`、`_to_copy`、`_copy_from` | 保 dtype 或随 `to` | **SIMT 高**；**SIMD 高**。指令：`vload`/`vstore`（可按字节宽向量） |
-| **16.2** dtype/device | `to`、`type_as`、`_autocast_to_*_precision`、历史 `_cast_*` | 涉及拷贝+转换 | **SIMT 高**；**SIMD 高～中**。指令：`vcvt` + `vload`/`vstore`；跨设备非 SIMD |
-| **16.3** 别名 | `alias`、`detach`、`detach_` | 元数据；非数据面 | **N/A** |
+| 子类 | 典型算子 | 备注 | SIMT 易用 | SIMD 易用 | SIMD 典型指令特征 |
+|---|---|---|---|---|---|
+| **16.1** 拷贝 | `clone`、`copy_`、`_to_copy`、`_copy_from` | 保 dtype 或随 `to` | 高 | 高 | `vload`/`vstore`（可按字节宽向量） |
+| **16.2** dtype/device | `to`、`type_as`、`_autocast_to_*_precision`、历史 `_cast_*` | 涉及拷贝+转换 | 高 | 高～中 | `vcvt` + `vload`/`vstore`；跨设备非 SIMD |
+| **16.3** 别名 | `alias`、`detach`、`detach_` | 元数据；非数据面 | N/A | N/A | — |
 
 ---
 
 ### Pattern 17 — 工厂与创建
 
-| 子类 | 典型算子 | 备注 | SIMT·SIMD 易用 / 所需 SIMD 指令 |
-|---|---|---|---|
-| **17.1** 空/常量 | `empty`、`zeros`、`ones`、`full`、`empty_like`、`zeros_like` | 无 tensor 输入或 like | **SIMT 高**；**SIMD 高**。指令：`vsplat`+`vstore`；`empty` 可无写 |
-| **17.2** 序列 | `arange`、`linspace`、`logspace`、`eye`、`range`（legacy） | 索引生成常用 | **SIMT 高**；**SIMD 高～中**。指令：lane id → `vfma` 生成序列；`eye` 用 mask 对角 |
-| **17.3** 窗函数 | `bartlett_window`、`hann_window`、`hamming_window`、`kaiser_window` | 与 21 配合 | **SIMT 高**；**SIMD 中**。指令：`vcos`/`vmul` 近似或标量表 |
-| **17.4** 量化工厂 | `_empty_affine_quantized`、`_empty_per_channel_affine_quantized` | 归属 17 创建、服务 19 | 同 17.1 + 元数据；数据面可选 `vsplat` |
+| 子类 | 典型算子 | 备注 | SIMT 易用 | SIMD 易用 | SIMD 典型指令特征 |
+|---|---|---|---|---|---|
+| **17.1** 空/常量 | `empty`、`zeros`、`ones`、`full`、`empty_like`、`zeros_like` | 无 tensor 输入或 like | 高 | 高 | `vsplat`+`vstore`；`empty` 可无写 |
+| **17.2** 序列 | `arange`、`linspace`、`logspace`、`eye`、`range`（legacy） | 索引生成常用 | 高 | 高～中 | lane id → `vfma` 生成序列；`eye` 用 mask 对角 |
+| **17.3** 窗函数 | `bartlett_window`、`hann_window`、`hamming_window`、`kaiser_window` | 与 21 配合 | 高 | 中 | `vcos`/`vmul` 近似或标量表 |
+| **17.4** 量化工厂 | `_empty_affine_quantized`、`_empty_per_channel_affine_quantized` | 归属 17 创建、服务 19 | 见组合 | 见组合 | 同 17.1 + 元数据；数据面可选 `vsplat` |
 
 ---
 
 ### Pattern 18 — 随机与 Dropout
 
-| 子类 | 典型算子 | 备注 | SIMT·SIMD 易用 / 所需 SIMD 指令 |
-|---|---|---|---|
-| **18.1** 分布采样 | `rand`、`randn`、`randint`、`normal`、`uniform_`、`bernoulli`、`poisson`、`multinomial` | `Generator` 控制；nondeterministic 标签 | **SIMT 高～中**（每线程 RNG）；**SIMD 中**（向量 Philox/xorshift）。指令：`vrng`/`vphilox`、`vcvt`、Box-Muller 用 `vlog`/`vsin` |
-| **18.2** Dropout | `dropout`、`native_dropout`、`alpha_dropout`、`feature_dropout` | 训练图高频；与 01 融合可能 | **SIMT 高**；**SIMD 高～中**。指令：`vrng`+`vcmp`+`vblend`/`vmul` |
+| 子类 | 典型算子 | 备注 | SIMT 易用 | SIMD 易用 | SIMD 典型指令特征 |
+|---|---|---|---|---|---|
+| **18.1** 分布采样 | `rand`、`randn`、`randint`、`normal`、`uniform_`、`bernoulli`、`poisson`、`multinomial` | `Generator` 控制；nondeterministic 标签 | 高～中（每线程 RNG） | 中（向量 Philox/xorshift） | `vrng`/`vphilox`、`vcvt`、Box-Muller 用 `vlog`/`vsin` |
+| **18.2** Dropout | `dropout`、`native_dropout`、`alpha_dropout`、`feature_dropout` | 训练图高频；与 01 融合可能 | 高 | 高～中 | `vrng`+`vcmp`+`vblend`/`vmul` |
 
 ---
 
 ### Pattern 19 — 量化
 
-| 子类 | 典型算子 | 备注 | SIMT·SIMD 易用 / 所需 SIMD 指令 |
-|---|---|---|---|
-| **19.1** 量/反量 | `quantize_per_tensor`、`quantize_per_channel`、`dequantize` | 进出整型表示 | **SIMT 高**；**SIMD 高～中**。指令：`vmul`/`vfma`、`vcvt`（sat）、`vrnd`；per-channel 要 `vbroadcast` 轴 |
-| **19.2** Fake quant | `fake_quantize_per_tensor_affine`、`_fake_quantize_learnable_*`、`choose_qparams_*` | QAT；可反传 | **SIMT 高**；**SIMD 中**。指令：同 19.1 + 反传 STE（`vblend`） |
-| **19.3** Q 张量元数据 | `q_scale`、`q_zero_point`、`q_per_channel_scales`、`int_repr` | 读量化参数 | **N/A** / 标量；`int_repr` 同 copy |
-| **19.4** 量化计算核 | `quantized::conv2d`、`quantized::linear`、`_int_mm` 等 | 常挂独立 namespace / DispatchKey；与 09/10 功能对应的整数实现 | 同 09/10 的 **整数 MMA + scale epilogue**；非通用 SIMD 主路径 |
+| 子类 | 典型算子 | 备注 | SIMT 易用 | SIMD 易用 | SIMD 典型指令特征 |
+|---|---|---|---|---|---|
+| **19.1** 量/反量 | `quantize_per_tensor`、`quantize_per_channel`、`dequantize` | 进出整型表示 | 高 | 高～中 | `vmul`/`vfma`、`vcvt`（sat）、`vrnd`；per-channel 要 `vbroadcast` 轴 |
+| **19.2** Fake quant | `fake_quantize_per_tensor_affine`、`_fake_quantize_learnable_*`、`choose_qparams_*` | QAT；可反传 | 高 | 中 | 同 19.1 + 反传 STE（`vblend`） |
+| **19.3** Q 张量元数据 | `q_scale`、`q_zero_point`、`q_per_channel_scales`、`int_repr` | 读量化参数 | N/A（标量元数据） | N/A / 高（`int_repr`） | `int_repr` 同 16：`vload`/`vstore` |
+| **19.4** 量化计算核 | `quantized::conv2d`、`quantized::linear`、`_int_mm` 等 | 常挂独立 namespace / DispatchKey；与 09/10 功能对应的整数实现 | 见组合 | 见组合 | 同 09/10 的 **整数 MMA + scale epilogue**；非通用 SIMD 主路径 |
 
 **备注**：功能上「量化」既是 **dtype/数值域变换（19.1–19.3）**，也是 **同构算子的整数后端（19.4）**。
 
@@ -347,76 +355,76 @@ NN.M         = 可选子类（一位小数编号）
 
 ### Pattern 20 — 稀疏
 
-| 典型算子 | 备注 | SIMT·SIMD 易用 / 所需 SIMD 指令 |
-|---|---|---|
-| `to_sparse`、`to_dense`、`sparse_coo_tensor`、`_to_sparse_csr/csc/bsr/bsc`、稀疏 `mm`/`add`、`_sparse_semi_structured_*` | shape 规则含 sparse/dense 维；与 10/13 交界 | **SIMT 中**；**SIMD 低**（不规则）。指令：`vgather`/`vscatter`；稠密块内可 `vfma`；semi-structured 走专用 MMA |
+| 典型算子 | 备注 | SIMT 易用 | SIMD 易用 | SIMD 典型指令特征 |
+|---|---|---|---|---|
+| `to_sparse`、`to_dense`、`sparse_coo_tensor`、`_to_sparse_csr/csc/bsr/bsc`、稀疏 `mm`/`add`、`_sparse_semi_structured_*` | shape 规则含 sparse/dense 维；与 10/13 交界 | 中 | 低（不规则） | `vgather`/`vscatter`；稠密块内可 `vfma`；semi-structured 走专用 MMA |
 
 ---
 
 ### Pattern 21 — FFT / 信号
 
-| 典型算子 | 备注 | SIMT·SIMD 易用 / 所需 SIMD 指令 |
-|---|---|---|
-| `_fft_c2c`、`_fft_r2c`、`_fft_c2r`、`fft.*`、`stft`、`istft`、`fftfreq` | 多调 MKL / cuFFT / pocketfft；计划缓存（`_cufft_*`）属辅助 | **SIMT/SIMD 均低**（专用库）。若自研：蝶形 `vfma`、`vshuf`、复数对；通常不手写 |
+| 典型算子 | 备注 | SIMT 易用 | SIMD 易用 | SIMD 典型指令特征 |
+|---|---|---|---|---|
+| `_fft_c2c`、`_fft_r2c`、`_fft_c2r`、`fft.*`、`stft`、`istft`、`fftfreq` | 多调 MKL / cuFFT / pocketfft；计划缓存（`_cufft_*`）属辅助 | 低（专用库） | 低（专用库） | 库内自选 / MMA |
 
 ---
 
 ### Pattern 22 — 损失函数
 
-| 典型算子 | 备注 | SIMT·SIMD 易用 / 所需 SIMD 指令 |
-|---|---|---|
-| `nll_loss`、`cross_entropy`、`mse_loss`、`l1_loss`、`smooth_l1_loss`、`binary_cross_entropy`、`kl_div`、`ctc_loss`、`triplet_margin_loss`、`hinge_embedding_loss` | 内部常 **01/05/13 组合**；CTC 等更专用 | **SIMT 高～中**；**SIMD 中**（先 01 再 05）。指令：`vsub`/`vmul`/`vmax`/`vlog` + `vreduce`；CTC **低**（动态规划，非 SIMD map） |
+| 典型算子 | 备注 | SIMT 易用 | SIMD 易用 | SIMD 典型指令特征 |
+|---|---|---|---|---|
+| `nll_loss`、`cross_entropy`、`mse_loss`、`l1_loss`、`smooth_l1_loss`、`binary_cross_entropy`、`kl_div`、`ctc_loss`、`triplet_margin_loss`、`hinge_embedding_loss` | 内部常 **01/05/13 组合**；CTC 等更专用 | 高～中 | 中（先 01 再 05） | `vsub`/`vmul`/`vmax`/`vlog` + `vreduce`；CTC **低**（动态规划，非 SIMD map） |
 
 ---
 
 ### Pattern 23 — 上采样与插值
 
-| 典型算子 | 备注 | SIMT·SIMD 易用 / 所需 SIMD 指令 |
-|---|---|---|
-| `upsample_nearest2d`、`upsample_bilinear2d`、`upsample_bicubic2d`、`upsample_trilinear3d`、`_upsample_*_aa`、`grid_sampler_2d/3d`、`affine_grid` | 固定维；与 09.2 转置卷积不同路径 | **SIMT 高～中**；**SIMD 中～低**（邻域 gather）。指令：nearest=`vgather`/复制；bilinear=`vload` 邻域 + `vfma` 权重；grid_sample 几乎必 `vgather` |
+| 典型算子 | 备注 | SIMT 易用 | SIMD 易用 | SIMD 典型指令特征 |
+|---|---|---|---|---|
+| `upsample_nearest2d`、`upsample_bilinear2d`、`upsample_bicubic2d`、`upsample_trilinear3d`、`_upsample_*_aa`、`grid_sampler_2d/3d`、`affine_grid` | 固定维；与 09.2 转置卷积不同路径 | 高～中 | 中～低（邻域 gather） | nearest=`vgather`/复制；bilinear=`vload` 邻域 + `vfma` 权重；grid_sample 几乎必 `vgather` |
 
 ---
 
 ### Pattern 24 — Nested / Jagged
 
-| 典型算子 | 备注 | SIMT·SIMD 易用 / 所需 SIMD 指令 |
-|---|---|---|
-| `_nested_from_padded`、`_nested_tensor_*`、`_jagged_to_padded_dense_forward`、`_pack_padded_sequence` | **变长** 与 07 填充互转；动态 shape 友好表示 | **SIMT 高～中**（按段）；**SIMD 中**（段内向量，段间标量调度）。指令：段内同 15/16；padding 区 `vsplat` |
+| 典型算子 | 备注 | SIMT 易用 | SIMD 易用 | SIMD 典型指令特征 |
+|---|---|---|---|---|
+| `_nested_from_padded`、`_nested_tensor_*`、`_jagged_to_padded_dense_forward`、`_pack_padded_sequence` | **变长** 与 07 填充互转；动态 shape 友好表示 | 高～中（按段） | 中（段内向量，段间标量调度） | 段内同 15/16；padding 区 `vsplat` |
 
 ---
 
 ### Pattern 25 — 排序 / TopK / Unique
 
-| 子类 | 典型算子 | 备注 | SIMT·SIMD 易用 / 所需 SIMD 指令 |
-|---|---|---|---|
-| **25.1** 排序选择 | `sort`、`argsort`、`topk`、`kthvalue`、`msort` | 比较网络；dim 指定 | **SIMT 中**；**SIMD 中～低**（bitonic/`vcmp`+`vblend` 网络）。指令：`vcmp`、`vblend`、`vmin`/`vmax`、`vshuf`；大 topk 用堆（标量友好） |
-| **25.2** Unique / 成员 | `unique`、`unique_consecutive`、`_unique2`、`isin` | `unique` 输出长度数据依赖 → 亦标 26 | **SIMT 中**；**SIMD 低**。指令：排序后 `vcmp` 邻差 + `vcompress`；或哈希（SIMT 更自然） |
+| 子类 | 典型算子 | 备注 | SIMT 易用 | SIMD 易用 | SIMD 典型指令特征 |
+|---|---|---|---|---|---|
+| **25.1** 排序选择 | `sort`、`argsort`、`topk`、`kthvalue`、`msort` | 比较网络；dim 指定 | 中 | 中～低（bitonic/`vcmp`+`vblend` 网络） | `vcmp`、`vblend`、`vmin`/`vmax`、`vshuf`；大 topk 用堆（标量友好） |
+| **25.2** Unique / 成员 | `unique`、`unique_consecutive`、`_unique2`、`isin` | `unique` 输出长度数据依赖 → 亦标 26 | 中 | 低 | 排序后 `vcmp` 邻差 + `vcompress`；或哈希（SIMT 更自然） |
 
 ---
 
 ### Pattern 26 — 数据依赖动态输出
 
-| 典型算子 | 备注 | SIMT·SIMD 易用 / 所需 SIMD 指令 |
-|---|---|---|
-| `nonzero`、`masked_select`、`unique`（长度）、`syncronized` 类 compact | 官方 tag：`dynamic_output_shape`；实现常 **两阶段 count → write**；meta/导出受限 | **SIMT 中**（compact 扫描）；**SIMD 中～低**。指令：阶段1 `vcmp`+`vreduce`/`vprefix` 计数；阶段2 `vcompress`/`vscatter`；无 compress 则 SIMT 更易 |
+| 典型算子 | 备注 | SIMT 易用 | SIMD 易用 | SIMD 典型指令特征 |
+|---|---|---|---|---|
+| `nonzero`、`masked_select`、`unique`（长度）、`syncronized` 类 compact | 官方 tag：`dynamic_output_shape`；实现常 **两阶段 count → write**；meta/导出受限 | 中（compact 扫描） | 中～低 | 阶段1 `vcmp`+`vreduce`/`vprefix` 计数；阶段2 `vcompress`/`vscatter`；无 compress 则 SIMT 更易 |
 
 ---
 
 ### Pattern 27 — 特殊函数
 
-| 典型算子 | 备注 | SIMT·SIMD 易用 / 所需 SIMD 指令 |
-|---|---|---|
-| `special.erf`、`erfc`、`erfinv`、`lgamma`、`digamma`、`polygamma`、`i0`、`sinc`、`xlogy` | 数学特殊函数；实现形态同 01，单独成类便于库映射 | **SIMT 高**；**SIMD 中**（多项式/有理近似）。指令：同 01 + `vfma` 多级近似；缺向量超越函数时 SIMT 更易 |
+| 典型算子 | 备注 | SIMT 易用 | SIMD 易用 | SIMD 典型指令特征 |
+|---|---|---|---|---|
+| `special.erf`、`erfc`、`erfinv`、`lgamma`、`digamma`、`polygamma`、`i0`、`sinc`、`xlogy` | 数学特殊函数；实现形态同 01，单独成类便于库映射 | 高 | 中（多项式/有理近似） | 同 01 + `vfma` 多级近似；缺向量超越函数时 SIMT 更易 |
 
 ---
 
 ### Pattern 28 — 元信息 / 控制 / 辅助
 
-| 子类 | 典型算子 | 备注 | SIMT·SIMD 易用 / 所需 SIMD 指令 |
-|---|---|---|---|
-| **28.1** 查询 | `size`、`stride`、`dim`、`numel`、`is_floating_point`、`device`、`layout` | 非数据面 | **N/A**（无向量） |
-| **28.2** 断言/调试 | `_assert_async`、`_assert_tensor_metadata`、`_foobar` | 图安全/测试；`_assert_async` 亦带 **29** 序依赖语义 | **N/A** / 设备侧标量比较；非 SIMD 主路径 |
-| **28.3** Autograd 辅助 | `_backward`、`requires_grad_`、AMP `_amp_*` | 训练基础设施 | **N/A**（控制面）；AMP unscale 若向量化则同 01：`vmul`/`vcmp` |
+| 子类 | 典型算子 | 备注 | SIMT 易用 | SIMD 易用 | SIMD 典型指令特征 |
+|---|---|---|---|---|---|
+| **28.1** 查询 | `size`、`stride`、`dim`、`numel`、`is_floating_point`、`device`、`layout` | 非数据面 | N/A | N/A | — |
+| **28.2** 断言/调试 | `_assert_async`、`_assert_tensor_metadata`、`_foobar` | 图安全/测试；`_assert_async` 亦带 **29** 序依赖语义 | N/A / 设备侧标量比较 | N/A / 设备侧标量比较 | N/A / 设备侧标量比较；非 SIMD 主路径 |
+| **28.3** Autograd 辅助 | `_backward`、`requires_grad_`、AMP `_amp_*` | 训练基础设施 | N/A（控制面） | N/A / 高（AMP unscale） | AMP unscale 可同 01：`vmul`/`vcmp` |
 
 ---
 
@@ -424,16 +432,16 @@ NN.M         = 可选子类（一位小数编号）
 
 > 同步算子 **通常不改变张量数值**，而是建立 **happens-before**。特征提取见 §7。
 
-| 子类 | 典型 API / 算子 | 备注 | SIMT·SIMD 易用 / 所需 SIMD 指令 |
-|---|---|---|---|
-| **29.1** Host↔Device 全同步 | `torch.cuda.synchronize` / `torch.npu.synchronize`、`Stream.synchronize`、`.item()` / `.cpu()` 隐式同步 | CPU 线程阻塞到指定 device/stream 完成 | **N/A**（运行时 API，非计算向量化） |
-| **29.2** 跨 Stream 序 | `Event.record` / `Event.wait` / `Stream.wait_event` / `Stream.wait_stream` | 设备侧序；默认 **不** 阻塞 Host | **N/A**；对应硬件 event，非 SIMD |
-| **29.3** 张量–流绑定 | `record_stream` | ATen schema 有显式条目；缓存分配器跨流复用安全 | **N/A** |
-| **29.4** 图/编译依赖令牌 | `_make_dep_token`、`_functional_assert_async`、带 `dep_token` 的 constrain | 把副作用变成 SSA 边，供 Inductor/Export | **N/A**（IR 边） |
-| **29.5** 集合通信完成 | `Work.wait` / `Work.synchronize`、`barrier`、`async_op=False` 路径 | **Host-block** vs **stream-order** 必须拆开（见 §7.3） | **N/A**；通信完成协议。核内 reduce 另属 05/29.8 |
-| **29.6** P2P 通信序 | `send`/`recv`（同步语义）、`isend`/`irecv` + `wait` | CUDA+NCCL 上常为 stream 序，易被误读成 Host 阻塞 | **N/A** |
-| **29.7** 隐式同步点 | 非 `non_blocking` 的 D2H、跨设备 `copy_`、部分 view 失败路径 | 无独立算子名，但特征上等同 29.1 | **N/A**；伴随的 copy 数据面见 16 |
-| **29.8** 核内同步（后端） | `__syncthreads`、AscendC `PipeBarrier`/`SetFlag`/`WaitFlag` | 不在 Python ATen 面；lowering 时与 29.2 对照 | **SIMT 必需**（block barrier）；**SIMD 模型通常隐式**（tile 边界）。指令/原语：`bar.sync` / `PipeBarrier`，**不是**算术 SIMD |
+| 子类 | 典型 API / 算子 | 备注 | SIMT 易用 | SIMD 易用 | SIMD 典型指令特征 |
+|---|---|---|---|---|---|
+| **29.1** Host↔Device 全同步 | `torch.cuda.synchronize` / `torch.npu.synchronize`、`Stream.synchronize`、`.item()` / `.cpu()` 隐式同步 | CPU 线程阻塞到指定 device/stream 完成 | N/A（运行时） | N/A | — |
+| **29.2** 跨 Stream 序 | `Event.record` / `Event.wait` / `Stream.wait_event` / `Stream.wait_stream` | 设备侧序；默认 **不** 阻塞 Host | N/A | N/A | N/A；对应硬件 event，非 SIMD |
+| **29.3** 张量–流绑定 | `record_stream` | ATen schema 有显式条目；缓存分配器跨流复用安全 | N/A | N/A | — |
+| **29.4** 图/编译依赖令牌 | `_make_dep_token`、`_functional_assert_async`、带 `dep_token` 的 constrain | 把副作用变成 SSA 边，供 Inductor/Export | N/A（IR 边） | N/A | — |
+| **29.5** 集合通信完成 | `Work.wait` / `Work.synchronize`、`barrier`、`async_op=False` 路径 | **Host-block** vs **stream-order** 必须拆开（见 §7.3） | N/A | N/A | —（通信完成协议；核内 reduce 见 05/29.8） |
+| **29.6** P2P 通信序 | `send`/`recv`（同步语义）、`isend`/`irecv` + `wait` | CUDA+NCCL 上常为 stream 序，易被误读成 Host 阻塞 | N/A | N/A | — |
+| **29.7** 隐式同步点 | 非 `non_blocking` 的 D2H、跨设备 `copy_`、部分 view 失败路径 | 无独立算子名，但特征上等同 29.1 | N/A | N/A | —（伴随 copy 数据面见 16） |
+| **29.8** 核内同步（后端） | `__syncthreads`、AscendC `PipeBarrier`/`SetFlag`/`WaitFlag` | 不在 Python ATen 面；lowering 时与 29.2 对照 | 必需（block barrier） | 模型通常隐式（tile 边界） | `bar.sync` / `PipeBarrier`，**不是**算术 SIMD |
 
 ---
 
