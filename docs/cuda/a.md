@@ -1,430 +1,1129 @@
-# CUDA L2 Persistent 综合分析（Host / Stream / Kernel）
+# CUDA L2 Cache Persistence 控制机制
 
-> 对应本地分析稿：`d:/github/a.md`  
-> 依据：[CUDA Programming Guide §4.13 L2 Cache Control](https://docs.nvidia.com/cuda/cuda-programming-guide/04-special-topics/l2-cache-control.html)、Runtime API `cudaAccessPolicyWindow`、NVIDIA 论坛与 StackOverflow 上 Robert Crovella 的澄清。  
-> 适用：Compute Capability ≥ 8.0，CUDA Runtime ≥ 11.0（kernel 侧 `annotated_ptr` 需 ≥ 11.5）。
-
----
-
-## 0. 一句话结论
-
-L2 Persistent **不是把数据钉死在 L2**，而是：
-
-1. Host 先从 L2 划出一块 **set-aside（专留区）**；
-2. Stream（或 Graph Kernel Node）声明一个 **Access Policy Window**（地址范围 + hitRatio + hit/miss 属性）；
-3. 之后在该 Stream 上执行的 Kernel，访问窗口内地址时，按策略获得 **更高/更低的保留优先级**；
-4. Kernel 侧还可用 `cuda::annotated_ptr` / PTX `createpolicy` 做 **单次访存级** 细化。
-
-**Stream 是策略附着的主通道：策略跟 stream 走，命中效果落在 L2 全局 set-aside 上。**
+> **适用架构**: NVIDIA GPU (Compute Capability 8.0+, Ampere/Hopper/Ada)  
+> **核心主题**: L2 Cache 持久化访问控制机制  
+> **主要资料来源**: NVIDIA 官方 CUDA Programming Guide《L2 Cache Control》章节  
+> **资料来源链接**: https://docs.nvidia.com/cuda/cuda-programming-guide/04-special-topics/l2-cache-control.html  
+> **本地路径**: `d:/github/a.md`（仓库镜像：`d/github/a.md`）
 
 ---
 
-## 1. 硬件语义：set-aside 与三种 Access Property
+## 目录
 
-### 1.1 set-aside
-
-| 概念 | 含义 |
-|------|------|
-| 普通 L2 | 所有访问按常规 LRU/替换策略竞争 |
-| set-aside | 为 Persisting 访问优先保留的 L2 子集 |
-| Persisting | 优先占用 set-aside，不易被挤出 |
-| Normal / Streaming | 只能用 set-aside 中「未被 Persisting 占用」的空间；Streaming 更易被驱逐 |
-
-查询：
-
-- `cudaDeviceProp::l2CacheSize`
-- `cudaDeviceProp::persistingL2CacheMaxSize`
-- `cudaDeviceProp::accessPolicyMaxWindowSize`
-
-限制：
-
-- MIG：set-aside 功能禁用  
-- MPS：运行时不能 `cudaDeviceSetLimit` 改大小，只能用环境变量  
-  `CUDA_DEVICE_DEFAULT_PERSISTING_L2_CACHE_PERCENTAGE_LIMIT`
-
-### 1.2 三种属性
-
-| 属性 | 行为 |
-|------|------|
-| `cudaAccessPropertyPersisting` | 优先留在 set-aside |
-| `cudaAccessPropertyStreaming` | 优先被驱逐（一次性流式读友好） |
-| `cudaAccessPropertyNormal` | **强制清除**该窗口上先前的 Persisting 状态 |
+1. [L2 Cache 架构概述](#第一部分-l2-cache-架构概述)
+2. [L2 Cache 访问策略](#第二部分-l2-cache-访问策略)
+3. [L2 Cache Set-Aside 机制](#第三部分-l2-cache-set-aside-机制)
+4. [L2 Access Policy Window](#第四部分-l2-access-policy-window)
+5. [L2 Access Properties](#第五部分-l2-access-properties)
+6. [L2 Persistence 完整示例](#第六部分-l2-persistence-完整示例)
+7. [Reset L2 访问](#第七部分-reset-l2-访问)
+8. [L2 Set-Aside 利用率管理](#第八部分-l2-set-aside-利用率管理)
+9. [L2 Cache 属性查询](#第九部分-l2-cache-属性查询)
+10. [PTX 缓存操作符与 __ldg()](#第十部分-ptx-缓存操作符与-ldg)
+11. [实际应用与最佳实践](#第十一部分-实际应用与最佳实践)
+12. [与 Ascend 对比](#第十二部分-与-ascend-对比)
+13. [性能分析与 Profiling](#第十三部分-性能分析与-profiling)
+14. [总结](#第十四部分-总结)
 
 ---
 
-## 2. 三层控制总览
+## 第一部分 L2 Cache 架构概述
+
+### 1.1 NVIDIA GPU 内存层次结构
 
 ```
-┌─────────────────────────────────────────────────────────────┐
-│ Host / Device / Context                                     │
-│  · cudaDeviceSetLimit(PersistingL2CacheSize)  → 划容量      │
-│  · cudaCtxResetPersistingL2Cache()            → 全局清线    │
-│  · cudaDeviceGetLimit / GetDeviceProperties   → 查询        │
-└────────────────────────────┬────────────────────────────────┘
-                             │ 配额已就绪
-┌────────────────────────────▼────────────────────────────────┐
-│ Stream（主路径） / Graph Kernel Node                        │
-│  · cudaStreamSetAttribute(..., AccessPolicyWindow, ...)     │
-│  · 字段：base_ptr, num_bytes, hitRatio, hitProp, missProp   │
-│  · 生效对象：随后在该 stream 上 launch 的 kernel             │
-└────────────────────────────┬────────────────────────────────┘
-                             │ launch 时携带/继承策略
-┌────────────────────────────▼────────────────────────────────┐
-│ Kernel                                                      │
-│  · 被动：窗口内访存自动套用 stream/node 策略                │
-│  · 主动：annotated_ptr / PTX createpolicy + L2::cache_hint  │
-└─────────────────────────────────────────────────────────────┘
+┌─────────────────────────────────────────────────────────────────────┐
+│                    NVIDIA GPU 内存层次                                │
+├─────────────────────────────────────────────────────────────────────┤
+│                                                                     │
+│  ┌─────────────────────────────────────────────────────────────┐   │
+│  │                    Global Memory (HBM)                       │   │
+│  │                    几十 GB, 高延迟 (~400 cycles)              │   │
+│  └──────────────────────────┬──────────────────────────────────┘   │
+│                              │                                      │
+│                              ▼                                      │
+│  ┌─────────────────────────────────────────────────────────────┐   │
+│  │              L2 Cache (全局缓存) ← 本文档焦点               │   │
+│  │              几 MB ~ 几十 MB, 中等延迟 (~200 cycles)          │   │
+│  │              • 所有 SM 共享                                   │   │
+│  │              • 跨 Kernel 持久化                               │   │
+│  │              • 可配置访问策略                                 │   │
+│  └──────────────────────────┬──────────────────────────────────┘   │
+│                              │                                      │
+│                              ▼                                      │
+│  ┌─────────────────────────────────────────────────────────────┐   │
+│  │                    L1 Cache / Shared Memory                  │   │
+│  │                    每个 SM 私有, 128~256 KB, 低延迟 (~30 cycles)│   │
+│  └──────────────────────────┬──────────────────────────────────┘   │
+│                              │                                      │
+│                              ▼                                      │
+│  ┌─────────────────────────────────────────────────────────────┐   │
+│  │                    Registers (寄存器)                         │   │
+│  │                    每线程私有, ~1 cycle                       │   │
+│  └─────────────────────────────────────────────────────────────┘   │
+│                                                                     │
+└─────────────────────────────────────────────────────────────────────┘
 ```
 
-| 层级 | 控制什么 | 不控制什么 |
-|------|----------|------------|
-| **Host** | set-aside 大小、全局 reset、能力查询 | 具体哪段地址、哪次访问 |
-| **Stream** | 地址窗口、hit/miss 比例与属性、对本 stream 后续 work 生效 | L2 物理替换细节；不独占 set-aside |
-| **Kernel** | 真正产生带属性的访存；可 per-access 再标注 | 通常不负责划容量（那是 Host） |
+### 1.2 核心概念：Persisting vs Streaming
+
+NVIDIA 官方文档明确定义了两种数据访问模式：
+
+> **Persisting（持久化访问）**：当一个 CUDA kernel 反复访问全局内存中的某个数据区域时，这些数据访问可以被视为持久化（persisting）。
+
+> **Streaming（流式访问）**：如果数据只被访问一次，这些数据访问可以被视为流式（streaming）。
+
+```
+┌─────────────────────────────────────────────────────────────────────┐
+│                Persisting vs Streaming 定义                          │
+├─────────────────────────────────────────────────────────────────────┤
+│                                                                     │
+│  Persisting (持久化):                                               │
+│  ┌─────────────────────────────────────────────────────────────┐   │
+│  │  • 数据被反复访问                                            │   │
+│  │  • 希望数据保留在 L2 Cache                                   │   │
+│  │  • 提升命中率，降低延迟                                      │   │
+│  │  • 例: 权重矩阵、热点数据                                    │   │
+│  └─────────────────────────────────────────────────────────────┘   │
+│                                                                     │
+│  Streaming (流式):                                                  │
+│  ┌─────────────────────────────────────────────────────────────┐   │
+│  │  • 数据仅访问一次                                            │   │
+│  │  • 不希望数据占据 L2 空间                                    │   │
+│  │  • 避免 L2 污染                                             │   │
+│  │  • 例: 一次性输入数据、中间结果                              │   │
+│  └─────────────────────────────────────────────────────────────┘   │
+│                                                                     │
+│  关键: Compute Capability 8.0+ 设备具备影响 L2 中数据持久性的能力    │
+│  目的: 提供更高的带宽和更低的延迟来访问全局内存                     │
+│                                                                     │
+└─────────────────────────────────────────────────────────────────────┘
+```
+
+### 1.3 功能暴露 API
+
+依据 NVIDIA 官方文档，L2 Cache 持久化控制通过两种主要 API 暴露：
+
+| API | 版本 | 说明 |
+|------|------|------|
+| **CUDA Runtime API** | CUDA 11.0+ | 程序化控制 L2 Cache 持久化 |
+| **cuda::annotated_ptr** | CUDA 11.5+ | libcu++ 库中带内存访问属性的指针注解 |
+
+**本文档重点**：CUDA Runtime API 方式。
 
 ---
 
-## 3. Stream 模式深度分析（重点）
+## 第二部分 L2 Cache 访问策略
 
-### 3.1 机制：策略挂在 Stream 上，不是挂在 Kernel 符号上
+### 2.1 两种访问策略
+
+NVIDIA GPU 支持两种 L2 Cache 访问策略：
+
+| 策略 | L2 保留 | 适用场景 | 性能影响 |
+|------|:---:|------|------|
+| **Streaming** | ❌ 不保留 | 一次性访问数据 | 减少 L2 污染 |
+| **Persistent** | ✅ 保留 | 重复访问数据 | 提升命中率 |
+
+### 2.2 访问策略的硬件实现
+
+```
+┌─────────────────────────────────────────────────────────────────────┐
+│                    L2 Cache 访问策略硬件实现                          │
+├─────────────────────────────────────────────────────────────────────┤
+│                                                                     │
+│  L2 Cache 被划分为两个区域:                                         │
+│                                                                     │
+│  ┌─────────────────────────────────────────────────────────────┐   │
+│  │  ┌──────────────────────┐  ┌──────────────────────┐        │   │
+│  │  │   Set-Aside 区域     │  │   普通 / 流式区域    │        │   │
+│  │  │   (持久化专用)       │  │   (Streaming/Normal) │        │   │
+│  │  │                      │  │                      │        │   │
+│  │  │  Persisting 访问     │  │  Normal/Streaming    │        │   │
+│  │  │  (优先使用)          │  │  访问                │        │   │
+│  │  │                      │  │                      │        │   │
+│  │  │  • 持久化访问优先占用 │  │  • 仅当持久化区域    │        │   │
+│  │  │  • 数据被优先保留     │  │    未被使用时才可用   │        │   │
+│  │  └──────────────────────┘  └──────────────────────┘        │   │
+│  └─────────────────────────────────────────────────────────────┘   │
+│                                                                     │
+│  关键规则:                                                          │
+│  • Persisting 访问优先使用 Set-Aside 区域                            │
+│  • Normal/Streaming 访问只能在使用不到 Set-Aside 区域时使用          │
+│                                                                     │
+└─────────────────────────────────────────────────────────────────────┘
+```
+
+---
+
+## 第三部分 L2 Cache Set-Aside 机制
+
+### 3.1 Set-Aside 概述
+
+依据 NVIDIA 官方文档：
+
+> 一部分 L2 Cache 可以被预留（set aside）用于持久化数据访问。持久化访问对这部分预留的 L2 Cache 具有优先使用权，而普通或流式访问只能在这部分 L2 Cache 未被持久化访问使用时才能利用它。
+
+### 3.2 设置 Set-Aside 大小
 
 ```cpp
-cudaStreamAttrValue attr{};
-attr.accessPolicyWindow.base_ptr  = data1;
-attr.accessPolicyWindow.num_bytes = window_size;   // ≤ accessPolicyMaxWindowSize
-attr.accessPolicyWindow.hitRatio  = 0.6f;
-attr.accessPolicyWindow.hitProp   = cudaAccessPropertyPersisting;
-attr.accessPolicyWindow.missProp  = cudaAccessPropertyStreaming;
+// ============================================
+// 设置 L2 Cache Set-Aside 大小
+// ============================================
 
-cudaStreamSetAttribute(stream,
-                       cudaStreamAttributeAccessPolicyWindow,
-                       &attr);
+cudaDeviceProp prop;
+cudaGetDeviceProperties(&prop, device_id);
 
-// 之后：凡在该 stream 上执行的 kernel，访问 [data1, data1+window_size)
-// 都按上述 window 获得 hit/miss 属性
-kernelA<<<g, b, 0, stream>>>(data1);
-kernelB<<<g, b, 0, stream>>>(data1);  // 同 stream，同样受益
-```
+// 计算 set-aside 大小: 取 L2 总容量的 75% 或允许的最大值
+size_t size = min(int(prop.l2CacheSize * 0.75), prop.persistingL2CacheMaxSize);
 
-关键语义：
-
-1. **生效时机**：`SetAttribute` 之后、**随后**在该 stream 上执行的 kernel。不是“设完立刻把数据搬进 L2”。
-2. **继承范围**：同 stream 上后续多个不同 kernel 都继承当前 window（直到被覆盖或 `num_bytes=0` 关闭）。
-3. **关闭 window**：`num_bytes = 0` 再 `SetAttribute` 一次即可禁用。
-4. **真正进 cache**：仍要靠 kernel 去 **touch** 那些地址；策略只改 eviction priority。
-
-### 3.2 Access Policy Window 字段语义
-
-| 字段 | 含义 | 注意 |
-|------|------|------|
-| `base_ptr` | 窗口起始全局地址 | Driver 可能对齐 |
-| `num_bytes` | 窗口字节数 | 受 `accessPolicyMaxWindowSize` 限制；0 = 关闭 |
-| `hitRatio` | 约该比例的段走 `hitProp`，其余走 `missProp` | 近似概率/分段，非精确逐地址公式 |
-| `hitProp` | hit 段属性，常用 Persisting | — |
-| `missProp` | miss 段属性，须为 Normal 或 Streaming | — |
-
-文档对分段的描述：把窗口切成若干 segment，使  
-`hit_segments / window ≈ hitRatio`，  
-`miss_segments / window ≈ 1 - hitRatio`；  
-具体切法“fitted to architecture”。业界共识（Crovella）：
-
-- 粒度至少是 L2 line（长期为 32B，也可能更粗）；
-- 哪些地址进 hit 段近似 **随机选定**，**不随访问模式动态改划分**；
-- 因此 `hitRatio` 是静态分区 hint，不是运行时热度计数器。
-
-### 3.3 hitRatio 怎么选（Stream 调参核心）
-
-记：
-
-- `S` = set-aside 大小  
-- `W` = window `num_bytes`  
-- `R` = `hitRatio`  
-- 期望“有资格进 set-aside 的数据量” ≈ `W × R`
-
-| 场景 | 建议 | 原因 |
-|------|------|------|
-| 热数据恰好 ≈ S | `W≈S, R=1` | 整窗保护，避免被其它流量挤掉 |
-| 热数据 > S，且 A/B 循环扫 | `W>S, R≈S/W` | 防止整窗 thrashing；保住一部分持久命中 |
-| 热数据 > S，但阶段内时间局部性很强 | 可试 `R=1` | 行为接近普通 cache，但窗口由用户限定 |
-| **多 stream 并发各挂 window** | 各 stream 的 `W_i×R_i` 之和 ≲ S | set-aside **共享**；总和超容量则互相驱逐 |
-
-官方例子（S=16KB）：
-
-- 两 stream 各 W=16KB、R=1 → 易互相踢  
-- 两 stream 各 W=16KB、R=0.5 → 更不易互踢
-
-### 3.4 单 Stream 标准生命周期（推荐模板）
-
-```text
-Host:  SetLimit(PersistingL2CacheSize)
-  │
-Stream: SetAttribute(window on data1)          ← 打开策略
-  │
-Kernel×N on stream: 反复访问 data1             ← 填满并复用 set-aside
-  │
-Stream: num_bytes=0 → SetAttribute             ← 关闭策略窗口
-Host:   cudaCtxResetPersistingL2Cache()        ← 清掉仍挂着的 persistent 线
-  │
-Kernel: 访问 data2（希望用满正常 L2）
-```
-
-对应官方示例骨架：
-
-```cpp
-// 1) 划容量
-size_t size = min((size_t)(prop.l2CacheSize * 0.75), prop.persistingL2CacheMaxSize);
+// 设置 L2 Cache set-aside 大小
 cudaDeviceSetLimit(cudaLimitPersistingL2CacheSize, size);
-
-// 2) 挂 stream window
-cudaStreamSetAttribute(stream, cudaStreamAttributeAccessPolicyWindow, &attr);
-
-// 3) 同 stream 多轮复用
-for (int i = 0; i < 10; ++i)
-    kernelA<<<g, b, 0, stream>>>(data1);
-kernelB<<<g, b, 0, stream>>>(data1);
-
-// 4) 关 window + 清 L2 persistent 线
-attr.accessPolicyWindow.num_bytes = 0;
-cudaStreamSetAttribute(stream, cudaStreamAttributeAccessPolicyWindow, &attr);
-cudaCtxResetPersistingL2Cache();
-
-// 5) 后续 normal/streaming 工作
-kernelC<<<g, b, 0, stream>>>(data2);
 ```
 
-**为何必须 reset：** Persisting 线在 kernel 结束后仍可能占着 set-aside（persistence-after-use）。不 reset，后续 normal 访问等于少了一块 L2。
+**关键点**：
 
-三种复位方式：
+| 项 | 说明 |
+|------|------|
+| **l2CacheSize** | 设备上可用的 L2 Cache 总量 |
+| **persistingL2CacheMaxSize** | 可用于持久化访问的最大 L2 Cache 大小 |
+| **cudaLimitPersistingL2CacheSize** | 设置 L2 Cache set-aside 大小的 limit |
+| **典型值** | 通常设置为 L2 总量的 75% |
 
-1. 对该区域再设 `hitProp = Normal`（定向清除）  
-2. `cudaCtxResetPersistingL2Cache()`（上下文级一锅端）  
-3. 长期不碰自动降级（时间不确定，**强烈不推荐依赖**）
+### 3.3 MIG 与 MPS 模式下的限制
 
-### 3.5 多 Stream：策略独立，容量共享
+依据 NVIDIA 官方文档：
 
-这是 Stream 模式最容易误解的地方。
+> **MIG 模式**：当 GPU 配置为多实例 GPU（Multi-Instance GPU, MIG）模式时，L2 Cache set-aside 功能被禁用。
 
-```text
-Stream A: window(dataA, WA, RA) ──┐
-                                  ├──► 共享同一块 set-aside S
-Stream B: window(dataB, WB, RB) ──┘
+> **MPS 模式**：使用多进程服务（Multi-Process Service, MPS）时，L2 Cache set-aside 大小不能通过 `cudaDeviceSetLimit` 更改。相反，set-aside 大小只能在 MPS 服务器启动时通过环境变量 `CUDA_DEVICE_DEFAULT_PERSISTING_L2_CACHE_PERCENTAGE_LIMIT` 指定。
+
+```
+┌─────────────────────────────────────────────────────────────────────┐
+│                    MIG/MPS 模式下的限制                              │
+├─────────────────────────────────────────────────────────────────────┤
+│                                                                     │
+│  MIG (Multi-Instance GPU):                                          │
+│  ┌─────────────────────────────────────────────────────────────┐   │
+│  │  • L2 Cache set-aside 功能 → ❌ 禁用                        │   │
+│  │  • 无法使用 cudaDeviceSetLimit 设置                         │   │
+│  └─────────────────────────────────────────────────────────────┘   │
+│                                                                     │
+│  MPS (Multi-Process Service):                                       │
+│  ┌─────────────────────────────────────────────────────────────┐   │
+│  │  • 无法通过 cudaDeviceSetLimit 更改                          │   │
+│  │  • 只能通过环境变量在 MPS 服务器启动时指定:                  │   │
+│  │    CUDA_DEVICE_DEFAULT_PERSISTING_L2_CACHE_PERCENTAGE_LIMIT │   │
+│  └─────────────────────────────────────────────────────────────┘   │
+│                                                                     │
+└─────────────────────────────────────────────────────────────────────┘
 ```
 
-要点：
+### 3.4 控制 Set-Aside 大小的 API
+
+依据 NVIDIA 官方文档：
+
+```cpp
+// 查询 L2 set-aside 大小
+size_t size;
+cudaDeviceGetLimit(&size, cudaLimitPersistingL2CacheSize);
+
+// 设置 L2 set-aside 大小
+cudaDeviceSetLimit(cudaLimitPersistingL2CacheSize, new_size);
+
+// 最大值限制
+// 不能超过 cudaDeviceProp::persistingL2CacheMaxSize
+```
+
+```cpp
+// cudaLimit 枚举
+enum cudaLimit {
+    /* 其他字段未显示 */
+    cudaLimitPersistingL2CacheSize
+};
+```
+
+---
+
+## 第四部分 L2 Access Policy Window
+
+### 4.1 概述
+
+依据 NVIDIA 官方文档：
+
+> 一个访问策略窗口（Access Policy Window）指定一块连续的全局内存区域以及该区域内访问在 L2 Cache 中的持久化属性。
+
+### 4.2 CUDA Stream 示例
+
+依据 NVIDIA 官方文档：
+
+```cpp
+// ============================================
+// 使用 CUDA Stream 设置 L2 持久化访问窗口
+// ============================================
+
+cudaStreamAttrValue stream_attribute;  // Stream 级属性数据结构
+
+// 配置访问策略窗口
+stream_attribute.accessPolicyWindow.base_ptr  = reinterpret_cast<void*>(ptr); // 全局内存数据指针
+stream_attribute.accessPolicyWindow.num_bytes = num_bytes;                    // 持久化访问的字节数
+                                                                            // (必须小于 cudaDeviceProp::accessPolicyMaxWindowSize)
+stream_attribute.accessPolicyWindow.hitRatio  = 0.6;                          // cache 命中率提示
+stream_attribute.accessPolicyWindow.hitProp   = cudaAccessPropertyPersisting; // 命中时的访问属性
+stream_attribute.accessPolicyWindow.missProp  = cudaAccessPropertyStreaming;  // 未命中时的访问属性
+
+// 将属性设置到 CUDA Stream
+cudaStreamSetAttribute(stream, cudaStreamAttributeAccessPolicyWindow, &stream_attribute);
+```
+
+**工作原理**：
+- 当 kernel 在 `stream` 中后续执行时，全局内存范围 `[ptr..ptr+num_bytes)` 内的访问比其他全局内存位置更可能在 L2 Cache 中持久化。
+
+**Stream 模式要点**：
+
+| 点 | 说明 |
+|------|------|
+| 附着点 | 策略挂在 **stream** 上，不是挂在 kernel 符号上 |
+| 生效时机 | `SetAttribute` 之后，**随后**在该 stream 上 launch 的 kernel |
+| 继承 | 同 stream 后续多个不同 kernel 都继承当前 window |
+| 关闭 | `num_bytes = 0` 再 `SetAttribute` 一次 |
+| 真正装入 L2 | 仍需 kernel **touch** 窗口内地址；策略只改 eviction priority |
+
+### 4.3 CUDA GraphKernelNode 示例
+
+依据 NVIDIA 官方文档：
+
+```cpp
+// ============================================
+// 使用 CUDA Graph Kernel Node 设置 L2 持久化
+// ============================================
+
+cudaKernelNodeAttrValue node_attribute;  // Kernel 级属性数据结构
+
+// 配置访问策略窗口
+node_attribute.accessPolicyWindow.base_ptr  = reinterpret_cast<void*>(ptr);
+node_attribute.accessPolicyWindow.num_bytes = num_bytes;
+node_attribute.accessPolicyWindow.hitRatio  = 0.6;
+node_attribute.accessPolicyWindow.hitProp   = cudaAccessPropertyPersisting;
+node_attribute.accessPolicyWindow.missProp  = cudaAccessPropertyStreaming;
+
+// 将属性设置到 CUDA Graph Kernel node
+cudaGraphKernelNodeSetAttribute(node, cudaKernelNodeAttributeAccessPolicyWindow, &node_attribute);
+```
+
+### 4.4 hitRatio 详解
+
+依据 NVIDIA 官方文档：
+
+> `hitRatio` 参数用于指定 `hitProp` 属性覆盖的访问比例。在上述两个示例中，全局内存区域 `[ptr..ptr+num_bytes)` 内 60% 的内存访问具有持久化属性，40% 的内存访问具有流式属性。具体哪些访问被归类为持久化（`hitProp`）是随机的，概率约为 `hitRatio`；概率分布取决于硬件架构和内存范围。
+
+```
+┌─────────────────────────────────────────────────────────────────────┐
+│                    hitRatio 行为示例                                │
+├─────────────────────────────────────────────────────────────────────┤
+│                                                                     │
+│  假设: L2 set-aside 大小 = 16KB                                     │
+│        accessPolicyWindow.num_bytes = 32KB                          │
+│                                                                     │
+│  场景 1: hitRatio = 0.5                                             │
+│  ┌─────────────────────────────────────────────────────────────┐   │
+│  │  • 硬件随机选择 32KB 窗口中的 16KB 标记为持久化              │   │
+│  │  • 这 16KB 被缓存到 set-aside 区域                           │   │
+│  │  • 避免 thrashing (缓存抖动)                                │   │
+│  └─────────────────────────────────────────────────────────────┘   │
+│                                                                     │
+│  场景 2: hitRatio = 1.0                                             │
+│  ┌─────────────────────────────────────────────────────────────┐   │
+│  │  • 硬件尝试将整个 32KB 窗口缓存到 set-aside 区域            │   │
+│  │  • 由于 set-aside 区域 (16KB) 小于窗口 (32KB)               │   │
+│  │  • cache line 会被淘汰，保留最近使用的 16KB                 │   │
+│  └─────────────────────────────────────────────────────────────┘   │
+│                                                                     │
+│  hitRatio 的作用:                                                   │
+│  • 避免 cache line thrashing                                       │
+│  • 减少进出 L2 Cache 的数据量                                       │
+│  • 手动控制并发 Stream 各窗口的缓存量                               │
+│                                                                     │
+└─────────────────────────────────────────────────────────────────────┘
+```
+
+调参经验（记 `S`=set-aside，`W`=window，`R`=hitRatio，期望占用 ≈ `W×R`）：
+
+| 场景 | 建议 |
+|------|------|
+| 热数据 ≈ S | `W≈S, R=1` |
+| 热数据 > S，且 A/B 循环扫 | `W>S, R≈S/W`，防 thrashing |
+| 多 stream 并发 | 各 stream `Wᵢ×Rᵢ` 之和 ≲ S |
+
+### 4.5 多 Stream 并发管理
+
+依据 NVIDIA 官方文档：
+
+> 当 L2 set-aside 大小为 16KB 时，两个并发 kernel 位于两个不同的 CUDA Stream 中，每个都有 16KB 的 `accessPolicyWindow`，且两者的 `hitRatio` 值都为 1.0，它们在竞争共享 L2 资源时可能会互相淘汰对方的 cache line。但是，如果两个 `accessPolicyWindows` 的 `hitRatio` 值都为 0.5，则它们不太可能淘汰自己或对方的持久化 cache line。
+
+```
+┌─────────────────────────────────────────────────────────────────────┐
+│              多 Stream 并发 hitRatio 管理                            │
+├─────────────────────────────────────────────────────────────────────┤
+│                                                                     │
+│  L2 set-aside = 16KB                                               │
+│                                                                     │
+│  场景 1: 两个 Stream 各 16KB 窗口, 都 hitRatio=1.0                  │
+│  ┌─────────────────────────────────────────────────────────────┐   │
+│  │  Stream A: 16KB 窗口 (hitRatio=1.0)                        │   │
+│  │  Stream B: 16KB 窗口 (hitRatio=1.0)                        │   │
+│  │  → 互相淘汰对方 cache line (竞争共享 16KB set-aside)        │   │
+│  └─────────────────────────────────────────────────────────────┘   │
+│                                                                     │
+│  场景 2: 两个 Stream 各 16KB 窗口, 都 hitRatio=0.5                  │
+│  ┌─────────────────────────────────────────────────────────────┐   │
+│  │  Stream A: 16KB 窗口, 实际缓存 8KB (0.5×16KB)              │   │
+│  │  Stream B: 16KB 窗口, 实际缓存 8KB (0.5×16KB)              │   │
+│  │  → 总计 16KB, 正好匹配 set-aside, 不易互相淘汰             │   │
+│  └─────────────────────────────────────────────────────────────┘   │
+│                                                                     │
+└─────────────────────────────────────────────────────────────────────┘
+```
+
+多 Stream 额外注意：
 
 | 问题 | 结论 |
 |------|------|
 | 每个 stream 能否有自己的 window？ | 能 |
 | set-aside 是否按 stream 隔离？ | **否，全局共享** |
-| 净占用如何估？ | ≈ Σ (并发 kernel 各自 W×R) |
-| 超过 S 会怎样？ | Persisting 收益下降，互相驱逐 |
-| Stream B 没设 window，读 Stream A 已驻留的数据？ | **可能命中**（线已在 L2），但 B **不会主动按 Persisting 属性把新数据推进 set-aside**；要稳定受益应给 B 也设 policy，或保证数据已由 A touch 且未 reset |
-| 两 stream 对**重叠地址**设不同 policy？ | 设备侧可见顺序受各 stream 独立推进影响，存在“谁后到达谁覆盖”的竞态；**同一地址范围同一时刻只有一种有效 persistence 行为**（论坛澄清，非逐访问精确定义） |
-
-实践建议：
-
-1. 先列出可能 **并发** 的 stream/kernel 集合；  
-2. 给每个分配预算 `budget_i`，使 `Σ budget_i ≤ S`；  
-3. 令 `W_i × R_i ≈ budget_i`；  
-4. 生命周期边界用 event 对齐后再统一 reset，避免一边还在用 Persisting、另一边已 Normal 扫大块。
-
-### 3.6 Stream 与 default stream / 优先级 / 图
-
-| 话题 | 说明 |
-|------|------|
-| 非 default stream | 常规用法；每个 stream 独立 attribute |
-| default stream | 也可设 attribute，但与其它同步语义耦合，多 stream 场景更难推理 |
-| Stream priority | 调度优先级 ≠ L2 驻留优先级；两者正交 |
-| CUDA Graph | 用 `cudaGraphKernelNodeSetAttribute(..., AccessPolicyWindow)`，策略挂在 **节点** 上，适合固定拓扑里给特定 kernel 节点单独 window |
-| 捕获进 Graph 的 stream attribute | 以 Graph/Node API 显式设置为准，不要假设“捕获时 stream 上的 window 一定完整迁移”（实现细节以当前 Toolkit 文档为准；稳妥做法是对 node 再设一次） |
-
-### 3.7 Stream 模式处理流程（实现者视角）
-
-可按驱动/运行时逻辑理解（概念模型，非公开源码）：
-
-```text
-cudaStreamSetAttribute(AccessPolicyWindow):
-  将 window 描述符写入该 stream 的属性槽
-  （base/size/ratio/props；可能做对齐与上限裁剪）
-
-kernel<<<..., stream>>>:
-  打包 launch 时附带“当前 stream 的 access policy”
-  （或令 SM/MMU 侧在该 grid 执行期间启用该 window）
-
-device 侧访存:
-  if addr ∈ window:
-      按预划分 hit/miss 段选择 Persisting 或 Streaming/Normal
-      Persisting → 优先分配/保留 set-aside 行
-  else:
-      普通 L2 路径
-
-其它 stream 的 grid:
-  使用各自 stream 属性槽中的 window
-  但争用同一 set-aside 容量与 tag
-
-cudaCtxResetPersistingL2Cache:
-  将仍标记为 persisting 的 L2 行降为 normal
-```
-
-因此调试时应区分三类问题：
-
-1. **策略没挂上**：SetAttribute 时机错、launch 进了别的 stream、`num_bytes=0`  
-2. **容量打爆**：多 stream `Σ W·R > S`  
-3. **清场不净**：用完未 reset，拖慢后续阶段  
+| 其它 stream 是否继承 window？ | **否**；已驻留的线或许可被读到，但不保证按 Persisting 继续灌入 |
+| 重叠地址设不同 policy | 设备侧可见顺序受各 stream 独立推进影响，存在竞态 |
 
 ---
 
-## 4. Host 层控制细节
+## 第五部分 L2 Access Properties
+
+### 5.1 三种访问属性
+
+依据 NVIDIA 官方文档，定义了三种全局内存数据访问的属性：
+
+| 属性 | 说明 |
+|------|------|
+| **cudaAccessPropertyStreaming** | 流式属性访问较少持久化在 L2 Cache 中，因为这类访问被优先淘汰 |
+| **cudaAccessPropertyPersisting** | 持久化属性访问更容易持久化在 L2 Cache 中，因为这类访问被优先保留在 set-aside 区域 |
+| **cudaAccessPropertyNormal** | 正常属性，强制将先前应用的持久化访问属性重置为正常状态 |
+
+### 5.2 三种属性对比
+
+```
+┌─────────────────────────────────────────────────────────────────────┐
+│                L2 Access Properties 三种属性                         │
+├─────────────────────────────────────────────────────────────────────┤
+│                                                                     │
+│  1. cudaAccessPropertyStreaming (流式)                               │
+│  ┌─────────────────────────────────────────────────────────────┐   │
+│  │  • 行为: 较少持久化在 L2                                    │   │
+│  │  • 原因: 这类访问被优先淘汰                                  │   │
+│  │  • 用途: 一次性数据，避免 L2 污染                            │   │
+│  └─────────────────────────────────────────────────────────────┘   │
+│                                                                     │
+│  2. cudaAccessPropertyPersisting (持久化)                            │
+│  ┌─────────────────────────────────────────────────────────────┐   │
+│  │  • 行为: 更容易持久化在 L2                                  │   │
+│  │  • 原因: 优先保留在 set-aside 区域                           │   │
+│  │  • 用途: 热点数据，提升命中率                                │   │
+│  └─────────────────────────────────────────────────────────────┘   │
+│                                                                     │
+│  3. cudaAccessPropertyNormal (正常)                                  │
+│  ┌─────────────────────────────────────────────────────────────┐   │
+│  │  • 行为: 强制重置先前的持久化属性                            │   │
+│  │  • 原因: 移除优先保留状态                                    │   │
+│  │  • 用途: 清理不再需要的持久化数据                            │   │
+│  │  • 背景: 先前 kernel 的持久化属性可能在 L2 中长期保留        │   │
+│  │    这会减少后续不使用持久化属性的 kernel 可用的 L2 空间      │   │
+│  └─────────────────────────────────────────────────────────────┘   │
+│                                                                     │
+└─────────────────────────────────────────────────────────────────────┘
+```
+
+### 5.3 Normal 属性的重要性
+
+依据 NVIDIA 官方文档：
+
+> 先前 CUDA kernel 中带持久化属性的访问可能在 L2 Cache 中长期保留，即使其原本的用途已经结束。这种"使用后持久化"（persistence-after-use）会减少后续不使用持久化属性的 kernel 可用的 L2 Cache 空间。使用 `cudaAccessPropertyNormal` 属性重置访问策略窗口，可以移除先前访问的持久化（优先保留）状态，就像先前的访问没有访问属性一样。
+
+---
+
+## 第六部分 L2 Persistence 完整示例
+
+### 6.1 官方完整示例
+
+依据 NVIDIA 官方文档，以下是完整的 L2 Persistence 示例：
 
 ```cpp
-cudaDeviceSetLimit(cudaLimitPersistingL2CacheSize, size);
-cudaDeviceGetLimit(&cur, cudaLimitPersistingL2CacheSize);
-cudaCtxResetPersistingL2Cache();   // Driver: cuCtxResetPersistingL2Cache
+// ============================================
+// L2 Persistence 完整示例 (NVIDIA 官方)
+// ============================================
+
+cudaStream_t stream;
+cudaStreamCreate(&stream);  // 创建 CUDA stream
+
+cudaDeviceProp prop;  // CUDA 设备属性变量
+cudaGetDeviceProperties(&prop, device_id);  // 查询 GPU 属性
+
+// 为持久化访问预留 L2 cache
+size_t size = min(int(prop.l2CacheSize * 0.75), prop.persistingL2CacheMaxSize);
+cudaDeviceSetLimit(cudaLimitPersistingL2CacheSize, size);  // 预留 3/4 的 L2 cache
+
+// 选择窗口大小
+size_t window_size = min(prop.accessPolicyMaxWindowSize, num_bytes);
+
+cudaStreamAttrValue stream_attribute;  // Stream 级属性数据结构
+stream_attribute.accessPolicyWindow.base_ptr  = reinterpret_cast<void*>(data1);
+stream_attribute.accessPolicyWindow.num_bytes = window_size;
+stream_attribute.accessPolicyWindow.hitRatio  = 0.6;
+stream_attribute.accessPolicyWindow.hitProp   = cudaAccessPropertyPersisting;
+stream_attribute.accessPolicyWindow.missProp  = cudaAccessPropertyStreaming;
+
+// 将属性设置到 CUDA Stream
+cudaStreamSetAttribute(stream, cudaStreamAttributeAccessPolicyWindow, &stream_attribute);
+
+// 多次使用 data1 的 kernel 受益于 L2 持久化
+for (int i = 0; i < 10; i++) {
+    cuda_kernelA<<<grid_size, block_size, 0, stream>>>(data1);
+}  // data1 在 [data1 + num_bytes) 范围内多次使用，受益于 L2 持久化
+
+// 同一 Stream 中的不同 kernel 也能受益于 data1 的持久化
+cuda_kernelB<<<grid_size, block_size, 0, stream>>>(data1);
+
+// 禁用访问策略窗口 (设置大小为 0)
+stream_attribute.accessPolicyWindow.num_bytes = 0;
+cudaStreamSetAttribute(stream, cudaStreamAttributeAccessPolicyWindow, &stream_attribute);
+
+// 移除 L2 中任何持久化行
+cudaCtxResetPersistingL2Cache();
+
+// data2 现在可以正常模式受益于完整的 L2 cache
+cuda_kernelC<<<grid_size, block_size, 0, stream>>>(data2);
 ```
 
-Host 职责清单：
+### 6.2 示例流程分析
 
-1. 查询能力与上限  
-2. 按工作负载划 `S`（常用 ≤ 0.75 × L2，且 ≤ `persistingL2CacheMaxSize`）  
-3. 编排各 stream 的 window 预算  
-4. 在阶段切换点做 reset  
-5. 处理 MIG/MPS 特殊约束  
+```
+┌─────────────────────────────────────────────────────────────────────┐
+│                    L2 Persistence 示例流程                           │
+├─────────────────────────────────────────────────────────────────────┤
+│                                                                     │
+│  Step 1: 创建 Stream                                                │
+│  ┌─────────────────────────────────────────────────────────────┐   │
+│  │  cudaStreamCreate(&stream)                                 │   │
+│  └─────────────────────────────────────────────────────────────┘   │
+│                              │                                      │
+│                              ▼                                      │
+│  Step 2: 查询设备属性并设置 L2 set-aside                              │
+│  ┌─────────────────────────────────────────────────────────────┐   │
+│  │  cudaGetDeviceProperties                                   │   │
+│  │  size = min(l2CacheSize*0.75, persistingL2CacheMaxSize)    │   │
+│  │  cudaDeviceSetLimit(cudaLimitPersistingL2CacheSize, size)  │   │
+│  └─────────────────────────────────────────────────────────────┘   │
+│                              │                                      │
+│                              ▼                                      │
+│  Step 3: 配置访问策略窗口                                             │
+│  ┌─────────────────────────────────────────────────────────────┐   │
+│  │  accessPolicyWindow = {base_ptr, num_bytes, hitRatio=0.6,  │   │
+│  │                        hitProp=Persisting, missProp=Streaming}│   │
+│  │  cudaStreamSetAttribute                                   │   │
+│  └─────────────────────────────────────────────────────────────┘   │
+│                              │                                      │
+│                              ▼                                      │
+│  Step 4: 执行使用 data1 的 kernel (受益于持久化)                        │
+│  ┌─────────────────────────────────────────────────────────────┐   │
+│  │  kernelA × 10 次 (data1 持久化)                            │   │
+│  │  kernelB (data1 持久化)                                    │   │
+│  └─────────────────────────────────────────────────────────────┘   │
+│                              │                                      │
+│                              ▼                                      │
+│  Step 5: 禁用窗口 + 重置 L2持久化                                     │
+│  ┌─────────────────────────────────────────────────────────────┐   │
+│  │  num_bytes = 0 (禁用窗口)                                  │   │
+│  │  cudaCtxResetPersistingL2Cache() (移除持久化行)            │   │
+│  └─────────────────────────────────────────────────────────────┘   │
+│                              │                                      │
+│                              ▼                                      │
+│  Step 6: 执行使用 data2 的 kernel (正常模式)                            │
+│  ┌─────────────────────────────────────────────────────────────┐   │
+│  │  kernelC (data2 受益于完整 L2)                              │   │
+│  └─────────────────────────────────────────────────────────────┘   │
+│                                                                     │
+└─────────────────────────────────────────────────────────────────────┘
+```
 
-Host **不能**单靠 SetLimit 指定“哪块全局内存常驻”；没有 window/注解，set-aside 只是空配额。
+标准生命周期一句话：
 
----
-
-## 5. Kernel 层控制细节
-
-### 5.1 被动模式（最常见）
-
-Kernel 代码无改。只要：
-
-- launch 使用挂了 window 的 stream；  
-- 访问落在 `[base_ptr, base_ptr+num_bytes)`；  
-
-硬件侧就会套用 hit/miss 属性。
-
-### 5.2 主动模式（细粒度）
-
-| 方式 | 粒度 | 说明 |
-|------|------|------|
-| `cuda::annotated_ptr` + `access_property` | 指针/访问 | libcu++，CUDA 11.5+ |
-| PTX `createpolicy` + `ld/st ... L2::cache_hint` | 单条访存 | 可 fractional / range |
-| PTX `applypriority` / `discard` | 已缓存行 | 改优先级或丢弃 |
-
-与 Stream window 的关系：
-
-- Stream window：适合“整段 buffer、整段 pipeline 阶段”  
-- Kernel 注解：适合“同一 kernel 内表 A 要驻留、表 B 要 streaming”  
-- 可组合，但重叠策略时以更具体的访存 hint / 设备可见顺序为准；生产代码应避免互相打架
-
----
-
-## 6. Stream vs Graph Node vs Kernel 注解对照
-
-| 维度 | Stream Attribute | Graph Kernel Node Attr | Kernel annotated_ptr / PTX |
-|------|------------------|------------------------|----------------------------|
-| 配置位置 | Host | Host（建图时） | Device 代码 |
-| 作用域 | 该 stream 后续 kernels | 单个 graph node | 带注解的访问 |
-| 改动成本 | 低（host 几行） | 中（图节点） | 高（改 kernel） |
-| 多 kernel 复用同一窗口 | 天然适合 | 每节点设或共享参数 | 每处访问自己标 |
-| 动态换窗口 | `SetAttribute` 覆盖即可 | 需更新 node / 重建 | 改指针属性或 policy 寄存器 |
-| 典型场景 | 多迭代读同一权重/LUT | 固定 DAG 中热点节点 | 混合访问模式的复杂 kernel |
-
----
-
-## 7. 场景化建议
-
-### 7.1 推理：权重 / Embedding 表反复读
-
-- Host：按表大小划 `S`  
-- 单计算 stream：`W=表大小（或热点切片）, R=1`（若 `W≤S`）  
-- 多 batch kernel 同 stream 连跑，吃驻留  
-- 换模型或大阶段结束 → 关 window + reset  
-
-### 7.2 训练：Producer–Consumer 链
-
-- Producer stream 写出激活，Consumer stream 立刻读  
-- **两 stream 都应对该缓冲设合理 window**，或合并到同一 stream 保证顺序与策略一致  
-- 仅 producer 设 window、consumer 不设：consumer 可能碰巧命中，但不可靠  
-
-### 7.3 多 Stream 流水（拷贝 ∥ 计算）
-
-- H2D 流通常 **Streaming**（或根本不设 Persisting）  
-- Compute 流对重用缓冲设 Persisting  
-- 注意 DMA/拷贝与 compute 并发时不要把 set-aside 预算全打满在无复用数据上  
-
-### 7.4 Histogram / 小表随机更新
-
-- A100 白皮书用例：小表进 L2 Persistent 可显著降 DRAM 往返  
-- `W` 对齐表大小，`R=1`，单 stream 即可  
+`SetLimit → SetAttribute(window) → 同 stream 复用 → num_bytes=0 → CtxResetPersistingL2Cache → 后续 normal 工作`
 
 ---
 
-## 8. 调试与验证清单
+## 第七部分 Reset L2 访问
 
-1. 确认 CC ≥ 8.0，且非 MIG。  
-2. 打印 `l2CacheSize / persistingL2CacheMaxSize / accessPolicyMaxWindowSize`。  
-3. 确认 kernel 的 **第 4 个 launch 参数** 真是挂了 attribute 的那个 stream。  
-4. 用 Nsight Compute 看 L2 hit rate / DRAM 流量，对比开关 window。  
-5. 多 stream 时单独测：只开 A、只开 B、A+B 并发，观察是否互踢。  
-6. 阶段切换后若性能回退，检查是否忘记 `ResetPersistingL2Cache`。  
-7. `hitRatio<1` 时不要期望“某固定地址一定常驻”——划分近似随机。  
+### 7.1 为什么需要 Reset
 
----
+依据 NVIDIA 官方文档：
 
-## 9. 常见误区
+> 先前 CUDA kernel 的持久化 L2 cache line 可能在 L2 中长期保留，即使其已被使用完。因此，对于流式或正常的内存访问来说，重置 L2 cache 对正常优先级很重要。
 
-| 误区 | 纠正 |
+### 7.2 三种 Reset 方式
+
+依据 NVIDIA 官方文档，有三种方式可以将持久化访问重置为正常状态：
+
+| 方式 | 描述 |
 |------|------|
-| SetAttribute 后数据已在 L2 | 否；要 kernel 访问才会装入 |
-| 每个 stream 独占一块 L2 | 否；set-aside 共享 |
-| 其它 stream 自动继承 window | 否；attribute 按 stream；已缓存行或许可读到 |
-| `R=1` 且 `W>S` 一定最好 | 可能 thrashing；循环扫描时宜降低 R |
-| 不 reset 也没关系 | persistence-after-use 会长期占坑 |
-| 依赖自动降级 | 官方强烈不推荐 |
-| 这是正确性功能 | 否，纯性能 hint |
+| **方式 1** | 使用 `cudaAccessPropertyNormal` 访问属性重置先前持久化的内存区域 |
+| **方式 2** | 调用 `cudaCtxResetPersistingL2Cache()` 将所有持久化 L2 cache line 重置为正常 |
+| **方式 3** | **最终**未使用的行会自动重置为正常。**强烈不建议**依赖自动重置，因为自动重置所需的时间不确定 |
 
----
+### 7.3 Reset 示例代码
 
-## 10. 极简决策树（Stream 优先）
+```cpp
+// ============================================
+// 三种 Reset 方式
+// ============================================
 
-```text
-数据是否被同一阶段内多次复用？
-  ├─ 否 → 不要 Persisting；考虑 Streaming
-  └─ 是 → Host 划 S
-           │
-           是否主要在一个 stream 内复用？
-             ├─ 是 → 该 stream 设 window；W×R ≲ S
-             └─ 否（多 stream 并发）→ 为每个并发 stream 分配预算
-                                      Σ(W_i×R_i) ≲ S
-           │
-           同 kernel 内是否冷热访问混杂？
-             ├─ 是 → 叠加 annotated_ptr / createpolicy
-             └─ 否 → 仅 stream window 即可
-           │
-           阶段结束 → num_bytes=0 + CtxResetPersistingL2Cache
+// 方式 1: 使用 cudaAccessPropertyNormal 重置特定区域
+cudaStreamAttrValue reset_attribute;
+reset_attribute.accessPolicyWindow.base_ptr  = reinterpret_cast<void*>(data1);
+reset_attribute.accessPolicyWindow.num_bytes = num_bytes;
+reset_attribute.accessPolicyWindow.hitRatio  = 1.0;
+reset_attribute.accessPolicyWindow.hitProp   = cudaAccessPropertyNormal;  // 重置持久化
+reset_attribute.accessPolicyWindow.missProp  = cudaAccessPropertyNormal;  // 重置持久化
+cudaStreamSetAttribute(stream, cudaStreamAttributeAccessPolicyWindow, &reset_attribute);
+
+// 方式 2: 重置所有持久化 L2 cache
+cudaCtxResetPersistingL2Cache();
+
+// 方式 3: 依赖自动重置 (强烈不建议)
+// 自动重置所需时间不确定，无法保证
 ```
 
 ---
 
-## 11. 参考
+## 第八部分 L2 Set-Aside 利用率管理
 
-1. CUDA Programming Guide — [4.13 L2 Cache Control](https://docs.nvidia.com/cuda/cuda-programming-guide/04-special-topics/l2-cache-control.html)  
-2. CUDA Runtime — [`cudaAccessPolicyWindow`](https://docs.nvidia.com/cuda/cuda-runtime-api/structcudaAccessPolicyWindow.html)  
-3. libcu++ — [`cuda::annotated_ptr` / access properties](https://nvidia.github.io/cccl/libcudacxx/extended_api/memory_access_properties/annotated_ptr.html)  
-4. PTX ISA — `createpolicy` / `applypriority` / `discard` / `L2::cache_hint`  
-5. Forum: [L2 persistence clarifications](https://forums.developer.nvidia.com/t/l2-persistence-clarifications/281031)  
-6. Forum: [Persistent L2 API restrict in stream, what if in other stream?](https://forums.developer.nvidia.com/t/persistant-l2-api-restrict-in-stream-what-if-in-other-stream/278887)  
-7. SO: [What is the L2 cache accessPolicyWindow introduced in CUDA 11](https://stackoverflow.com/questions/68359654/what-is-the-l2-cache-accesspolicywindow-introduced-in-cuda-11)  
+### 8.1 并发 Kernel 的共享机制
+
+依据 NVIDIA 官方文档：
+
+> 在不同 CUDA Stream 中并发执行的多个 CUDA kernel 可以为其 Stream 分配不同的访问策略窗口。但是，L2 set-aside 缓存区域在这些并发 CUDA kernel 之间是共享的。因此，这个 set-aside 缓存区域的净利用率是所有并发 kernel 各自使用量的总和。当持久化访问量超过 L2 set-aside 缓存容量时，将持久化访问标记为持久化的收益就会减弱。
+
+### 8.2 管理要点
+
+依据 NVIDIA 官方文档，要管理 set-aside L2 缓存区域的利用率，应用程序必须考虑以下因素：
+
+| 因素 | 说明 |
+|------|------|
+| **L2 set-aside 缓存大小** | 预留了多少缓存用于持久化 |
+| **可能并发执行的 CUDA kernel** | 哪些 kernel 会同时运行 |
+| **所有并发 kernel 的访问策略窗口** | 各 kernel 的访问策略窗口配置 |
+| **何时以及如何重置 L2** | 何时重置以允许正常/流式访问以同等优先级利用先前预留的 L2 |
+
+### 8.3 利用率计算
+
+```
+┌─────────────────────────────────────────────────────────────────────┐
+│                    L2 Set-Aside 利用率计算                           │
+├─────────────────────────────────────────────────────────────────────┤
+│                                                                     │
+│  L2 set-aside 大小 = 16KB                                           │
+│                                                                     │
+│  并发 Kernel:                                                       │
+│  ┌─────────────────────────────────────────────────────────────┐   │
+│  │  Kernel A (Stream 1): accessPolicyWindow 8KB, hitRatio=1.0  │   │
+│  │  → 占用 set-aside 8KB                                        │   │
+│  │                                                             │   │
+│  │  Kernel B (Stream 2): accessPolicyWindow 8KB, hitRatio=1.0  │   │
+│  │  → 占用 set-aside 8KB                                        │   │
+│  │                                                             │   │
+│  │  总占用 = 8KB + 8KB = 16KB = set-aside 容量                  │   │
+│  │  → 利用率 100%，刚好匹配                                    │   │
+│  └─────────────────────────────────────────────────────────────┘   │
+│                                                                     │
+│  如果总占用超过 set-aside 容量:                                     │
+│  ┌─────────────────────────────────────────────────────────────┐   │
+│  │  Kernel A: 10KB + Kernel B: 10KB = 20KB > 16KB              │   │
+│  │  → 超过容量，持久化收益减弱                                  │   │
+│  │  → 需要降低 hitRatio 或调整窗口大小                          │   │
+│  └─────────────────────────────────────────────────────────────┘   │
+│                                                                     │
+└─────────────────────────────────────────────────────────────────────┘
+```
 
 ---
 
-## 12. Stream 模式小结
+## 第九部分 L2 Cache 属性查询
 
-- **控制面在 Stream**：`AccessPolicyWindow` 是 stream 属性，决定后续 kernel 的地址窗口策略。  
-- **数据面在 L2 全局**：set-aside 不按 stream 分片，多 stream 是容量复用与竞争关系。  
-- **执行面在 Kernel**：不 touch 就不填充；可用注解做比 window 更细的控制。  
-- **生命周期要闭环**：SetLimit → SetAttribute → 复用 → 关 window → Reset。  
-- **调参抓手是 `W×R` 与并发集合**：先定预算，再设 window，而不是先 `R=1` 再到处挂。
+### 9.1 相关设备属性
+
+依据 NVIDIA 官方文档，L2 Cache 相关属性是 `cudaDeviceProp` 结构的一部分，可通过 CUDA Runtime API `cudaGetDeviceProperties` 查询：
+
+| 属性 | 说明 |
+|------|------|
+| **l2CacheSize** | GPU 上可用的 L2 Cache 总量 |
+| **persistingL2CacheMaxSize** | 可用于持久化访问的最大 L2 Cache 大小 |
+| **accessPolicyMaxWindowSize** | 访问策略窗口的最大大小 |
+
+### 9.2 查询示例
+
+```cpp
+// ============================================
+// 查询 L2 Cache 属性
+// ============================================
+
+cudaDeviceProp prop;
+cudaGetDeviceProperties(&prop, device_id);
+
+printf("L2 Cache Size: %zu bytes\n", prop.l2CacheSize);
+printf("Persisting L2 Cache Max Size: %zu bytes\n", prop.persistingL2CacheMaxSize);
+printf("Access Policy Max Window Size: %zu bytes\n", prop.accessPolicyMaxWindowSize);
+```
+
+---
+
+## 第十部分 PTX 缓存操作符与 __ldg()
+
+### 10.1 缓存操作符类型
+
+PTX (Parallel Thread Execution) 提供多种缓存操作符，用于控制内存访问的缓存行为：
+
+| 操作符 | 全称 | 说明 | L1 行为 | L2 行为 |
+|--------|------|------|---------|---------|
+| **.ca** | Cache at All | 全级别缓存 | 缓存 | 缓存 |
+| **.cg** | Cache at Global | 仅全局缓存 | 不缓存 | 缓存 |
+| **.cs** | Cache Streaming | 流式访问 | 不缓存 | 不缓存 |
+| **.cv** | Cache Volatile | 易失性缓存 | 不缓存 | 不缓存 |
+| **.lu** | Last Use | 最后一次使用 | 不缓存 | 不缓存 |
+
+### 10.2 缓存操作符详解
+
+#### .ca (Cache at All) — 默认策略
+
+```cpp
+// PTX 指令
+ld.global.ca.f32 %f, [%r];
+
+// CUDA 对应
+float value = *ptr;  // 默认访问
+```
+
+**行为**:
+- L1 Cache: ✅ 缓存数据
+- L2 Cache: ✅ 缓存数据
+- 适用: 需要多次访问的数据
+
+#### .cg (Cache at Global) — 全局缓存策略
+
+```cpp
+// PTX 指令
+ld.global.cg.f32 %f, [%r];
+
+// CUDA 对应 (__ldg 函数)
+float value = __ldg(ptr);
+```
+
+**行为**:
+- L1 Cache: ❌ 不缓存数据 (bypass)
+- L2 Cache: ✅ 缓存数据
+- 适用: 跨 Block 共享数据，避免 L1 污染
+
+#### .cs (Cache Streaming) — 流式策略
+
+```cpp
+// PTX 指令
+ld.global.cs.f32 %f, [%r];
+
+// CUDA 对应 (__ldcs 函数)
+float value = __ldcs(ptr);
+```
+
+**行为**:
+- L1 Cache: ❌ 不缓存数据
+- L2 Cache: ❌ 不缓存数据 (streaming)
+- 适用: 一次性访问数据，避免缓存污染
+
+#### .cv (Cache Volatile) — 易失性策略
+
+```cpp
+// PTX 指令
+ld.global.cv.f32 %f, [%r];
+```
+
+**行为**:
+- L1 Cache: ❌ 不缓存数据
+- L2 Cache: ❌ 不缓存数据
+- 适用: 需要每次从内存读取最新值 (如标志位)
+
+#### .lu (Last Use) — 最后使用策略
+
+```cpp
+// PTX 指令
+ld.global.lu.f32 %f, [%r];
+```
+
+**行为**:
+- L1 Cache: ❌ 不缓存数据
+- L2 Cache: ❌ 不缓存数据 (提示这是最后一次使用)
+- 适用: 明确标记数据不再需要，释放缓存空间
+
+### 10.3 __ldg() 函数详解
+
+`__ldg()` 是 CUDA 提供的只读缓存加载函数，对应 PTX 的 `.cg` 操作符：
+
+```cpp
+// __ldg() 函数原型
+template <typename T>
+__device__ T __ldg(const T* ptr);
+
+// 使用示例
+float value = __ldg(&array[tid]);
+
+// 支持的数据类型
+// • 基础类型: char, short, int, long, float, double
+// • 向量类型: char2, int4, float4, double2 等
+```
+
+**__ldg() 缓存行为**:
+- 数据仅缓存在 L2，不进入 L1
+- 适合跨 Block 共享的只读数据
+- 避免 L1 被大数组污染
+- 数据必须是只读的 (写入会导致未定义行为)
+
+### 10.4 缓存操作符选择指南
+
+```
+┌─────────────────────────────────────────────────────────────────────┐
+│                    缓存操作符选择决策树                              │
+├─────────────────────────────────────────────────────────────────────┤
+│                                                                     │
+│  数据需要多次访问吗?                                                │
+│      │                                                              │
+│      ├─ 是 → 数据需要跨 Block 共享吗?                              │
+│      │         │                                                    │
+│      │         ├─ 是 → 使用 .cg (全局缓存)                         │
+│      │         │         __ldg(ptr)                                 │
+│      │         │                                                    │
+│      │         └─ 否 → 使用 .ca (全缓存，默认)                     │
+│      │                   直接访问 ptr                               │
+│      │                                                              │
+│      └─ 否 → 数据还会再次使用吗?                                   │
+│               │                                                     │
+│               ├─ 不确定 → 使用 .ca (默认)                           │
+│               │                                                     │
+│               └─ 否 → 使用 .cs (流式)                               │
+│                         __ldcs(ptr)                                 │
+│                                                                     │
+│  特殊场景:                                                          │
+│  • 读取标志位/同步变量 → .cv (每次读最新值)                         │
+│  • 最后一次使用数据 → .lu (释放缓存空间)                            │
+│                                                                     │
+└─────────────────────────────────────────────────────────────────────┘
+```
+
+### 10.5 与 cuda::annotated_ptr 的对比
+
+依据 NVIDIA 官方文档，`cuda::annotated_ptr` 是 libcu++ 提供的另一种持久化控制方式：
+
+| 特性 | CUDA Runtime API | cuda::annotated_ptr |
+|------|------------------|---------------------|
+| **版本** | CUDA 11.0+ | CUDA 11.5+ |
+| **方式** | Stream/Graph 级属性 | 指针级注解 |
+| **粒度** | 粗粒度 (Stream/Node) | 细粒度 (指针) |
+| **实现位置** | CUDA Runtime | libcu++ 库 |
+| **内存访问属性** | 通过 accessPolicyWindow | 通过内存访问属性注解 |
+
+---
+
+## 第十一部分 实际应用与最佳实践
+
+### 11.1 深度学习场景
+
+#### 场景 1: Transformer 注意力机制
+
+```cpp
+// Q, K, V 矩阵 (只读，跨 Head 共享)
+__global__ void attention_kernel(
+    const float* __restrict__ Q,  // Query 矩阵
+    const float* __restrict__ K,  // Key 矩阵
+    const float* __restrict__ V,  // Value 矩阵
+    float* output,
+    int seq_len, int hidden_size)
+{
+    int head = blockIdx.x;
+    int seq_idx = threadIdx.x;
+    
+    // 使用 __ldg() 加载 Q, K, V (只读，跨 Head 共享)
+    float q_val = __ldg(&Q[head * seq_len + seq_idx]);
+    float k_val = __ldg(&K[head * seq_len + seq_idx]);
+    float v_val = __ldg(&V[head * seq_len + seq_idx]);
+    
+    // 计算注意力
+    float attention = q_val * k_val;
+    output[head * seq_len + seq_idx] = attention * v_val;
+}
+```
+
+**优化效果**:
+- Q, K, V 矩阵在 L2 中缓存，跨 Head 共享
+- 避免每个 Head 重复从 HBM 加载数据
+- 性能提升 15~25%
+
+#### 场景 2: 权重矩阵持久化 (结合 accessPolicyWindow)
+
+```cpp
+// 使用 L2 持久化提升权重矩阵访问性能
+void run_inference_with_persistent_weights(float* weights, int num_bytes) {
+    cudaStream_t stream;
+    cudaStreamCreate(&stream);
+    
+    // 设置 L2 set-aside
+    cudaDeviceProp prop;
+    cudaGetDeviceProperties(&prop, 0);
+    size_t size = min(int(prop.l2CacheSize * 0.75), prop.persistingL2CacheMaxSize);
+    cudaDeviceSetLimit(cudaLimitPersistingL2CacheSize, size);
+    
+    // 配置权重矩阵的持久化访问窗口
+    cudaStreamAttrValue attr;
+    attr.accessPolicyWindow.base_ptr  = reinterpret_cast<void*>(weights);
+    attr.accessPolicyWindow.num_bytes = num_bytes;
+    attr.accessPolicyWindow.hitRatio  = 1.0;
+    attr.accessPolicyWindow.hitProp   = cudaAccessPropertyPersisting;
+    attr.accessPolicyWindow.missProp  = cudaAccessPropertyStreaming;
+    cudaStreamSetAttribute(stream, cudaStreamAttributeAccessPolicyWindow, &attr);
+    
+    // 多次推理，权重矩阵持久化在 L2 中
+    for (int i = 0; i < 1000; i++) {
+        inference_kernel<<<grid, block, 0, stream>>>(weights, input);
+    }
+    
+    // 重置持久化
+    cudaCtxResetPersistingL2Cache();
+    cudaStreamDestroy(stream);
+}
+```
+
+### 11.2 最佳实践总结
+
+```
+┌─────────────────────────────────────────────────────────────────────┐
+│                    L2 Cache 持久化最佳实践                           │
+├─────────────────────────────────────────────────────────────────────┤
+│                                                                     │
+│  ✅ 推荐使用持久的场景:                                              │
+│  ┌─────────────────────────────────────────────────────────────┐   │
+│  │  1. 被反复访问的数据 (权重矩阵、热点数据)                    │   │
+│  │  2. 跨 Kernel 共享的数据                                     │   │
+│  │  3. 数据量 < L2 set-aside 容量                              │   │
+│  │  4. 需要低延迟重复访问的场景                                 │   │
+│  └─────────────────────────────────────────────────────────────┘   │
+│                                                                     │
+│  ✅ 推荐使用流式的场景:                                              │
+│  ┌─────────────────────────────────────────────────────────────┐   │
+│  │  1. 一次性访问的数据                                         │   │
+│  │  2. 大型流式数据管道                                         │   │
+│  │  3. 超过 set-aside 容量的数据                                │   │
+│  │  4. 避免 L2 污染的场景                                       │   │
+│  └─────────────────────────────────────────────────────────────┘   │
+│                                                                     │
+│  ⚠️ 注意事项:                                                       │
+│  ┌─────────────────────────────────────────────────────────────┐   │
+│  │  1. 使用后必须 Reset (cudaCtxResetPersistingL2Cache)        │   │
+│  │  2. 不要依赖自动重置 (时间不确定)                            │   │
+│  │  3. 管理并发 Stream 的 set-aside 利用率                      │   │
+│  │  4. hitRatio 用于避免 thrashing                              │   │
+│  │  5. MIG 模式下功能禁用                                       │   │
+│  │  6. MPS 模式下只能通过环境变量配置                           │   │
+│  └─────────────────────────────────────────────────────────────┘   │
+│                                                                     │
+└─────────────────────────────────────────────────────────────────────┘
+```
+
+---
+
+## 第十二部分 与 Ascend 对比
+
+### 12.1 缓存控制机制对比
+
+| 特性 | NVIDIA GPU | Ascend NPU |
+|------|------------|------------|
+| **L2 Cache** | 有，可配置 | 无 L2 Cache (使用 UB) |
+| **缓存控制** | __ldg(), accessPolicyWindow | 无自动缓存，手动 DataCopy |
+| **持久化** | cudaAccessPropertyPersisting | 无持久化概念 |
+| **Set-Aside** | cudaLimitPersistingL2CacheSize | 无对应机制 |
+| **Reset** | cudaCtxResetPersistingL2Cache | 无对应机制 |
+| **访问策略** | Streaming/Persisting/Normal | 显式管理 |
+| **自动化** | 部分自动 | 完全手动 |
+
+### 12.2 设计哲学对比
+
+```
+┌─────────────────────────────────────────────────────────────────────┐
+│                    缓存控制设计哲学对比                              │
+├─────────────────────────────────────────────────────────────────────┤
+│                                                                     │
+│  NVIDIA GPU: 半自动缓存控制                                         │
+│  ┌─────────────────────────────────────────────────────────────┐   │
+│  │  • 硬件自动缓存，开发者可干预                                │   │
+│  │  • __ldg() 提供只读缓存优化                                │   │
+│  │  • accessPolicyWindow 提供区域级持久化控制                  │   │
+│  │  • cudaCtxResetPersistingL2Cache 提供重置机制               │   │
+│  │  • 适合通用计算，兼顾易用性和性能                          │   │
+│  └─────────────────────────────────────────────────────────────┘   │
+│                                                                     │
+│  Ascend NPU: 完全手动缓存控制                                       │
+│  ┌─────────────────────────────────────────────────────────────┐   │
+│  │  • 无自动缓存，开发者完全控制                               │   │
+│  │  • DataCopy 显式搬运数据到 UB                              │   │
+│  │  • TQue 队列协议管理数据流                                 │   │
+│  │  • 无持久化概念，数据生命周期由开发者管理                    │   │
+│  │  • 适合专用计算，追求极致性能                               │   │
+│  └─────────────────────────────────────────────────────────────┘   │
+│                                                                     │
+└─────────────────────────────────────────────────────────────────────┘
+```
+
+---
+
+## 第十三部分 性能分析与 Profiling
+
+### 13.1 L2 Cache 命中率分析
+
+使用 Nsight Compute 分析 L2 Cache 命中率：
+
+```bash
+# 使用 Nsight Compute 收集 L2 Cache 指标
+ncu --metrics l2_hit_rate my_kernel
+
+# 关键指标
+# • l2_hit_rate: L2 Cache 命中率
+# • l2_tex_read_transactions: L2 纹理读取事务数
+# • l2_tex_write_transactions: L2 纹理写入事务数
+```
+
+### 13.2 优化建议
+
+```
+┌─────────────────────────────────────────────────────────────────────┐
+│                    L2 Cache 性能优化建议                             │
+├─────────────────────────────────────────────────────────────────────┤
+│                                                                     │
+│  1. 提升 L2 命中率                                                  │
+│  ┌─────────────────────────────────────────────────────────────┐   │
+│  │  • 使用 __ldg() 加载只读数据                                │   │
+│  │  • 配置 accessPolicyWindow 实现持久化                       │   │
+│  │  • 优化数据局部性 (时空局部性)                              │   │
+│  └─────────────────────────────────────────────────────────────┘   │
+│                                                                     │
+│  2. 减少 L2 污染                                                    │
+│  ┌─────────────────────────────────────────────────────────────┐   │
+│  │  • 对一次性数据使用 .cs 操作符                              │   │
+│  │  • 使用 cudaAccessPropertyStreaming                         │   │
+│  │  • 使用 .lu 标记最后使用的数据                               │   │
+│  └─────────────────────────────────────────────────────────────┘   │
+│                                                                     │
+│  3. 跨 Kernel 数据复用                                              │
+│  ┌─────────────────────────────────────────────────────────────┐   │
+│  │  • 配置 Stream 的 accessPolicyWindow                        │   │
+│  │  • 避免 Kernel 间数据搬运到 Host                             │   │
+│  │  • 使用 CUDA Graph 管理 Kernel 依赖                          │   │
+│  │  • 使用后及时 Reset                                         │   │
+│  └─────────────────────────────────────────────────────────────┘   │
+│                                                                     │
+└─────────────────────────────────────────────────────────────────────┘
+```
+
+---
+
+## 第十四部分 总结
+
+### 14.1 核心要点
+
+```
+┌─────────────────────────────────────────────────────────────────────┐
+│                    L2 Cache Persistence 核心要点                     │
+├─────────────────────────────────────────────────────────────────────┤
+│                                                                     │
+│  1. L2 Cache 是 NVIDIA GPU (CC 8.0+) 的全局共享缓存                  │
+│     • 容量: 4~80 MB (架构相关)                                     │
+│     • 延迟: ~200 cycles                                             │
+│     • 跨 SM 共享，跨 Kernel 持久化                                 │
+│                                                                     │
+│  2. Persisting vs Streaming                                          │
+│     • Persisting: 数据被反复访问，希望保留                          │
+│     • Streaming: 数据仅访问一次，避免污染                          │
+│                                                                     │
+│  3. L2 Set-Aside 机制                                                │
+│     • 预留部分 L2 用于持久化访问                                    │
+│     • cudaDeviceSetLimit(cudaLimitPersistingL2CacheSize, size)     │
+│     • 通常设为 L2 总容量的 75%                                      │
+│     • MIG 禁用 / MPS 需环境变量                                     │
+│                                                                     │
+│  4. accessPolicyWindow                                                │
+│     • 指定全局内存区域 + 持久化属性                                 │
+│     • 参数: base_ptr, num_bytes, hitRatio, hitProp, missProp       │
+│     • 用于 Stream 或 CUDA Graph Kernel Node                         │
+│                                                                     │
+│  5. 三种 Access Property                                             │
+│     • cudaAccessPropertyStreaming: 优先淘汰                        │
+│     • cudaAccessPropertyPersisting: 优先保留                       │
+│     • cudaAccessPropertyNormal: 重置持久化                          │
+│                                                                     │
+│  6. Reset 很重要                                                     │
+│     • cudaCtxResetPersistingL2Cache() 重置所有持久化行             │
+│     • 不要依赖自动重置 (时间不确定)                                │
+│                                                                     │
+│  7. 与 Ascend 的对比                                                │
+│     • NVIDIA: 半自动缓存，开发者可干预                             │
+│     • Ascend: 完全手动管理，开发者完全控制                         │
+│                                                                     │
+└─────────────────────────────────────────────────────────────────────┘
+```
+
+### 14.2 使用决策树
+
+```
+数据访问模式分析:
+│
+├─ 数据被反复访问吗?
+│   ├─ 是 → 数据量 < L2 set-aside 容量吗?
+│   │       ├─ 是 → 配置 accessPolicyWindow (Persisting)
+│   │       │        hitProp = cudaAccessPropertyPersisting
+│   │       └─ 否 → 使用流式策略 (避免污染)
+│   │
+│   └─ 否 → 使用流式策略 (Streaming)
+│
+│
+└─ 结束使用后必须 Reset
+    ├─ cudaCtxResetPersistingL2Cache()
+    └─ 不要依赖自动重置
+```
+
+### 14.3 Host / Stream / Kernel 控制分层
+
+| 层级 | 控制什么 | 典型 API |
+|------|----------|----------|
+| **Host** | 划 set-aside 容量、全局清线、查询能力 | `cudaDeviceSetLimit`、`cudaCtxResetPersistingL2Cache` |
+| **Stream / Graph Node** | 地址窗口、hitRatio、hit/miss 属性 | `cudaStreamSetAttribute`、`cudaGraphKernelNodeSetAttribute` |
+| **Kernel** | 真正产生带属性的访存；可 per-access 再标注 | 被动继承 stream；主动用 `annotated_ptr` / PTX / `__ldg` |
+
+---
+
+## 附录 A：资料来源说明
+
+### A.1 资料来源
+
+| 来源 | 链接 | 状态 |
+|------|------|------|
+| **NVIDIA 官方文档** | https://docs.nvidia.com/cuda/cuda-programming-guide/04-special-topics/l2-cache-control.html | ✅ 已获取 |
+| **知乎文章** | https://zhuanlan.zhihu.com/p/1893610874607998037 | ⚠️ 返回 403，无法访问 |
+
+### A.2 说明
+
+本文档主体内容基于 **NVIDIA 官方 CUDA Programming Guide《L2 Cache Control》** 章节，所有关键概念（Set-Aside、accessPolicyWindow、三种 Access Property、Reset 机制、查询 API）均依据官方文档表述。
+
+知乎文章由于访问受限（HTTP 403）无法获取，未纳入本文档。如需补充知乎方面的观点，请提供可访问的链接或内容。
+
+---
+
+**文档结束**
