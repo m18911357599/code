@@ -16,7 +16,7 @@
 | **API** | 用户声明式 API → Schema/Dispatch → Plan/Iterator → Backend；中间层吸收动态与非对齐 |
 | **Dyn / Align / Pad** | 语义 Pad（07）≠ 向量尾填充 ≠ 硬件对齐 Pad；短尾轴在 NPU 上易被隐式 pad |
 | **同步** | 同步不是计算 Pattern，而是 **执行序约束**；需按阻塞域（Host/Device/Stream/Rank）与序关系（happens-before）提取特征 |
-| **SIMT/SIMD** | Pattern 详解含易用性与所需向量指令；**01–03/15–16 双高**，**09–10/12 走 MMA**，**13/25–26 SIMD 偏低** |
+| **SIMT/SIMD** | 含 matmul 标 **Cube** 并剔出打分；非 Cube：`Score_SIMT≈1.40`、`Score_SIMD≈1.17`（亲=2/偏向=1/难=0）→ **默认 SIMT，SIMD 砸双亲大户** |
 
 ---
 
@@ -59,41 +59,89 @@ NN.M         = 可选子类（一位小数编号）
 
 ## 2. 按核心功能的 Pattern 分类总表
 
-> **亲 SIMT/SIMD**：该类更贴哪套并行模型（详解见 §3）。`双亲`=两者都易写；`偏 SIMT/偏 SIMD`=一方明显更顺；`亲 MMA`=峰值靠矩阵加速单元而非通用 SIMD；`N/A`=无数据面向量化。
+### 2.0 标记与打分约定
 
-| Pattern | 核心功能 | 定义（一句话） | 规模感 | 典型访存/并行 | 亲 SIMT/SIMD |
-|---|---|---|---|---|---|
-| **01** | 逐元素算术 | 同址（广播后）二元/一元数值运算 | 很大 | 带宽；完全并行 | **双亲** |
-| **02** | 比较 / 逻辑 / 选择 | 比较、位运算、`where` 类 | 大 | 同 01 | **双亲** |
-| **03** | 激活与非线性 | 逐点非线性；常可与 01/09/10 融合 | 中 | 同 01 | **双亲**（超越函数 SIMD 略降） |
-| **04** | 广播与维扩展 | 逻辑扩展 shape，默认不拷贝 | 中 | 0-stride / 物化 | **偏 SIMT**（通用广播）；标量广播 SIMD 亦易 |
-| **05** | 规约 | 多→少；沿 dim 聚合 | 大 | 树归约 / 分块 | **双亲中**（SIMT 靠 warp reduce；SIMD 靠 `vreduce`） |
-| **06** | 扫描与累积 | 有序前缀依赖 | 小 | 难乱序 | **偏 SIMT**（扫描原语）；SIMD 需 `vscan` |
-| **07** | 填充 | 边界/长度语义 Pad | 中 | 搬移 + 边界写 | **偏 SIMT**（边界分支）；常值填充 SIMD 易 |
-| **08** | 池化 | 滑窗降采样 / 反池化 | 中 | 固定维；空间并行 | **偏 SIMT**；沿轴可 SIMD |
-| **09** | 卷积 | 局部加权；含转置卷积 | 中 | 高算术密度 | **亲 MMA**（非裸 SIMD） |
-| **10** | 矩阵乘与线性代数 | GEMM / 分解 / 求解 | 大 | MMA / 库 | **亲 MMA**；小向量积可 SIMD |
-| **11** | 归一化 | BN / LN / GN / RMSNorm 等 | 中 | 规约+广播融合 | **双亲中**（05+01 组合） |
-| **12** | Softmax / Attention | Softmax、SDPA、MHA | 中 | 融合 IO 感知 | Softmax **双亲中**；SDPA **亲 MMA** |
-| **13** | 索引 / 散射 / Embedding | 间接读写 | 大 | gather/scatter | **偏 SIMT**；SIMD 需 gather/scatter |
-| **14** | 布局变换 | view / transpose / reshape 等 | 很大 | 元数据或搬移 | view **N/A**；物化转置 **偏 SIMD**（`vtranspose`） |
-| **15** | 拼接与分割 | cat / stack / split | 中 | 分段 copy | **双亲**（分段 copy） |
-| **16** | 拷贝与类型转换 | clone / to / cast | 中 | 带宽 | **双亲** |
-| **17** | 工厂与创建 | 无输入或仅 shape 造张量 | 中 | 写填充 | **双亲** |
-| **18** | 随机与 Dropout | 采样、噪声、dropout | 中 | RNG + 逐点 | **偏 SIMT**；有向量 RNG 则双亲 |
-| **19** | 量化 | quantize / dequant / fake_quant | 中 | 量纲变换+整数核 | QDQ **双亲**；Q-GEMM **亲 MMA** |
-| **20** | 稀疏 | COO/CSR 等稀疏格式与算子 | 中 | 间接、压缩 | **偏 SIMT** |
-| **21** | FFT / 信号 | 频域变换 | 小–中 | 专用库 | **亲库**（非通用 SIMT/SIMD map） |
-| **22** | 损失函数 | 训练目标 | 中 | 常含规约 | **偏 SIMT/双亲中**（01+05）；CTC 低 |
-| **23** | 上采样与插值 | upsample / grid_sample | 中 | 固定维插值 | **偏 SIMT**（邻域 gather） |
-| **24** | Nested / Jagged | 变长序列结构 | 小–中 | 偏移+填充交互 | **偏 SIMT**（按段）；段内可 SIMD |
-| **25** | 排序 / TopK / Unique | 比较网络、选择 | 小–中 | 不规则 | **偏 SIMT**；小块可 SIMD 比较网络 |
-| **26** | 数据依赖动态输出 | 输出 shape 依赖 **数值** | 小 | 两阶段 | **偏 SIMT**；有 `vcompress` 则 SIMD 中 |
-| **27** | 特殊函数 | `special.*`、高阶数学 | 中 | 多为 01 变体 | **偏 SIMT**（近似）；有向量库则双亲 |
-| **28** | 元信息 / 控制 / 辅助 | size、device、assert、autograd 钩子 | 中 | 非计算主路径 | **N/A** |
-| **29** | 同步 / 序约束 | Host·Device·Stream·跨 Rank 等待与屏障 | 中 | 不改数值；约束执行序 | **N/A**（29.8 核内 barrier 属 SIMT 原语） |
+| 术语 | 含义 |
+|---|---|
+| **Cube 类** | 热路径含 **matmul / 等价矩阵收缩**（GEMM、卷积 Cube、SDPA 中 QKᵀ/PV、量化 Linear/Conv 等），峰值走 **Cube/MMA**，**不参与** SIMT/SIMD 打分 |
+| **Vec 类** | 通用向量/线程并行可覆盖的主路径 |
+| **Ctrl / Lib** | 控制面或专用库（打分记 **难=0**，或 Ctrl 直接剔出分母） |
+| **规格数 N** | 以 ATen 唯一基名近似统计（`native_functions` 启发式归类；量级示意，非官方 census） |
+| **亲 / 偏向 / 难** | 对该并行模型的亲和：`亲=2`，`偏向=1`，`难=0` |
 
-复合模块（`nn.Linear`、`nn.MultiheadAttention`）由上表 Pattern **组合** 而成，不单开编号。
+**加权分（剔除 Cube 类；Ctrl 28/29 不入分母）**：
+
+```text
+Score_mode = Σ_i ( N_i × s_mode(i) ) / Σ_i N_i
+s_mode ∈ { 亲=2, 偏向=1, 难=0 }
+mode ∈ { SIMT, SIMD }
+```
+
+### 2.1 总表
+
+| Pattern | 核心功能 | 算子类 | 规格 N | 访存/并行 | SIMT 档 | SIMD 档 | 备注 |
+|---|---|---|---|---|---|---|---|
+| **01** | 逐元素算术 | Vec | 227 | 带宽；全并行 | **亲** | **亲** | TensorIterator 主力 |
+| **02** | 比较 / 逻辑 / 选择 | Vec | 39 | 同 01 | **亲** | **亲** | |
+| **03** | 激活与非线性 | Vec | 79 | 同 01 | **亲** | **偏向** | 超越函数拖累 SIMD |
+| **04** | 广播与维扩展 | Vec | 35 | 0-stride / 物化 | **偏向** | **偏向** | 通用广播偏 SIMT |
+| **05** | 规约 | Vec | 47 | 树归约 / 分块 | **偏向** | **偏向** | warp reduce / `vreduce` |
+| **06** | 扫描与累积 | Vec | 12 | 有序前缀 | **偏向** | **难** | SIMD 需 `vscan` |
+| **07** | 填充 | Vec | 29 | 搬移 + 边界 | **偏向** | **偏向** | 常值填充 SIMD 易 |
+| **08** | 池化 | Vec | 42 | 固定维滑窗 | **偏向** | **偏向** | |
+| **09** | 卷积 | **Cube** | 38 | Cube/MMA | — | — | **含 matmul 收缩**；剔出打分 |
+| **10** | 矩阵乘与线性代数 | **Cube** | 45 | Cube/MMA | — | — | **matmul 本体**；剔出打分 |
+| **11** | 归一化 | Vec | 32 | 规约+仿射 | **偏向** | **偏向** | 05+01 融合 |
+| **12.1** | Softmax | Vec | 16 | 内维 reduce+map | **偏向** | **偏向** | |
+| **12.2/12.3** | SDPA / MHA | **Cube** | 21 | GEMM+softmax | — | — | **内含 matmul**；剔出打分 |
+| **13** | 索引 / 散射 / Embedding | Vec | 55 | gather/scatter | **偏向** | **难** | |
+| **14** | 布局变换 | Vec | 85 | view 或搬移 | **偏向** | **偏向** | view 无向量核 |
+| **15** | 拼接与分割 | Vec | 26 | 分段 copy | **亲** | **亲** | |
+| **16** | 拷贝与类型转换 | Vec | 26 | 带宽 | **亲** | **亲** | |
+| **17** | 工厂与创建 | Vec | 33 | 写填充 | **亲** | **亲** | |
+| **18** | 随机与 Dropout | Vec | 34 | RNG + 逐点 | **偏向** | **偏向** | |
+| **19** QDQ | 量化/反量化/fake | Vec | 27 | `vcvt`+scale | **亲** | **亲** | |
+| **19.4** | 量化 Conv/Linear/MM | **Cube** | ~1+ | 整数 MMA | — | — | **含 matmul**；归 Cube |
+| **20** | 稀疏（非 MM） | Vec | 43 | 间接 | **偏向** | **难** | 稀疏 MM 并入 10/Cube |
+| **21** | FFT / 信号 | Lib | 31 | 专用库 | **难** | **难** | |
+| **22** | 损失函数 | Vec | 35 | 常 01+05 | **偏向** | **偏向** | CTC 更难 |
+| **23** | 上采样与插值 | Vec | 39 | 邻域采样 | **偏向** | **难** | |
+| **24** | Nested / Jagged | Vec | 14 | 变长段 | **偏向** | **偏向** | 段内可 SIMD |
+| **25** | 排序 / TopK / Unique | Vec | 10 | 不规则 | **偏向** | **难** | |
+| **26** | 数据依赖动态输出 | Vec | 6 | 两阶段 | **偏向** | **难** | |
+| **27** | 特殊函数 | Vec | 37 | 同 01 近似 | **偏向** | **偏向** | |
+| **28** | 元信息 / 控制 | Ctrl | 23 | 非数据面 | — | — | **不入分母** |
+| **29** | 同步 / 序约束 | Ctrl | 4 | 序约束 | — | — | **不入分母** |
+
+Cube 类合计规格约 **N_cube ≈ 105**（09+10+12.2/3+19.4）；不参与下列 Score。
+
+### 2.2 剔除 Cube 后的 SIMT / SIMD 打分
+
+参与集合：上表 **Vec + Lib**（不含 Cube、Ctrl）。  
+`Σ N ≈ 1059`，`Σ (N·s_SIMT) = 1485`，`Σ (N·s_SIMD) = 1241`。
+
+| 模式 | Score = Σ(N·s)/ΣN | 换算到满分 2 | 解读 |
+|---|---|---|---|
+| **SIMT** | **1.40** | 70% | 非 Cube 算子整体更亲 SIMT |
+| **SIMD** | **1.17** | 59% | 双亲大户（01/15–17/19QDQ）支撑中等亲和；gather/动态类拖累 |
+
+分档贡献（便于看建议落点）：
+
+| 档 | SIMT 规格占比 | SIMD 规格占比 | 代表 Pattern |
+|---|---|---|---|
+| 亲 (2) | 高（01/02/15–17/19QDQ 等） | 同左为主 | 连续 map/copy |
+| 偏向 (1) | 规约/归一化/池化/布局等 | 激活/规约/布局等 | 需 reduce/mask/近似 |
+| 难 (0) | 很少（主为 Lib 21） | 13/20/23/25/26/06/21 | 间接、动态、扫描、库 |
+
+### 2.3 建议（已剔除 Cube）
+
+1. **默认编程模型选 SIMT**（Score 更高）：GPU/NPU 上非 Cube 算子优先 thread/grid 语义 + 边界谓词，降低 gather/动态 shape 心智负担。  
+2. **SIMD/向量化作为加速层**，优先砸在 **亲=2** 族：`01/02/15/16/17/19QDQ`（及可向量化的 03/07/11/12.1）；指令特征见 §3（`vload/vstore/vloadm`、`vadd/vfma`、`vcmp/vblend`、`vcvt`）。  
+3. **不要用通用 SIMD 硬扛**：`13/20/23/25/26/06`（SIMD 档=难）——保持 SIMT 或专用原语（`vgather`/`vcompress`/`vscan`）。  
+4. **Cube 类独立路由**：`09/10/12.2/19.4`（及稀疏 MM）→ **Cube/MMA API**，仅 epilogue 回落到 Vec（01/03）；**禁止** 计入 SIMT/SIMD 易用性竞赛。  
+5. **落地优先级**：Cube 库对齐 → SIMD 覆盖双亲大户 → SIMT 托底剩余 Vec → Ctrl/Lib 原样。
+
+复合模块（`nn.Linear`、`nn.MultiheadAttention`）= **Cube + Vec epilogue**，编号仍落在 09/10/12 组合，不单开。
 
 ---
 
@@ -127,7 +175,7 @@ NN.M         = 可选子类（一位小数编号）
 | `vprefix`/`vscan` | 有序前缀 |
 | `vcompress`/`vexpand` | 按 mask 压缩/展开 |
 | `vatomic_*` | lane/地址原子（scatter 冲突） |
-| `MMA/*` | 非通用 SIMD，矩阵加速单元 |
+| `MMA/Cube` | **Cube 类**：矩阵加速单元；含 matmul 的算子走此路径，不计入 §2 SIMT/SIMD 分 |
 
 ---
 
@@ -234,28 +282,32 @@ NN.M         = 可选子类（一位小数编号）
 
 ---
 
-### Pattern 09 — 卷积
+### Pattern 09 — 卷积（**Cube 类**）
 
-| 子类 | 典型算子 | 备注 | SIMT 易用 | SIMD 易用 | SIMD 典型指令特征 |
+> 热路径为 **Cube/MMA 矩阵收缩**（或 im2col→GEMM），**含 matmul 等价计算**；§2 打分已剔除。
+
+| 子类 | 典型算子 | 备注 | SIMT 易用 | SIMD 易用 | SIMD/Cube 指令特征 |
 |---|---|---|---|---|---|
-| **09.1** 标准卷积 | `convolution`、`conv1d/2d/3d`、`_convolution` | 统一入口；padding 为 **算法参数**（语义） | 中（手写难打满） | 低（应走 im2col+10 或专用 MMA/Winograd，而非裸 SIMD map） | 若 SIMD 路径则 `vfma` 滑窗或 `vload`→im2col；峰值用 **MMA/Cube** 非通用 SIMD |
-| **09.2** 转置/深度可分 | `conv_transpose*`、`_conv_depthwise2d` | 上采样通路；与 23 不同 | 中 | 低～中（depthwise 可通道/空间向量化） | depthwise：`vfma`+`vload`；transpose：`vscatter`/`vatomic_add` 或 col2im |
-| **09.3** 后端专用 | `cudnn_convolution`、`miopen_convolution`、`slow_conv*` | 分发到库；用户通常不直接调 | N/A（库） | N/A（库） | 库内自选 / MMA |
-| **09.4** im2col | `im2col`、`col2im` | 卷积折叠到 10；调试/后备路径 | 高 | 中 | `vload`/`vstore`、`vgather`（展开）；`col2im` 用 `vscatter`/`vatomic_add` |
+| **09.1** 标准卷积 | `convolution`、`conv1d/2d/3d`、`_convolution` | 统一入口；padding 为算法参数 | 中 | 低 | **Cube/MMA**；后备 `vfma` 滑窗 / im2col |
+| **09.2** 转置/深度可分 | `conv_transpose*`、`_conv_depthwise2d` | 与 23 不同 | 中 | 低～中 | 主路径 **Cube**；depthwise 可 `vfma`+`vload` |
+| **09.3** 后端专用 | `cudnn_convolution`、`miopen_convolution`、`slow_conv*` | 分发到库 | N/A（库） | N/A（库） | **Cube/库** |
+| **09.4** im2col | `im2col`、`col2im` | 折叠到 10（Cube） | 高 | 中 | `vload`/`vstore`/`vgather`；`col2im`：`vscatter` |
 
-**备注**：不宜用通用 01 模型硬写；与 07 的 pad、08 的窗口模式相关但实现独立。
+**备注**：Cube 类；勿用通用 01 模型硬写。
 
 ---
 
-### Pattern 10 — 矩阵乘与线性代数
+### Pattern 10 — 矩阵乘与线性代数（**Cube 类**）
 
-| 子类 | 典型算子 | 备注 | SIMT 易用 | SIMD 易用 | SIMD 典型指令特征 |
+> **matmul / GEMM 本体**；峰值 **Cube/MMA**。§2 打分已剔除。
+
+| 子类 | 典型算子 | 备注 | SIMT 易用 | SIMD 易用 | SIMD/Cube 指令特征 |
 |---|---|---|---|---|---|
-| **10.1** GEMM 族 | `mm`、`bmm`、`addmm`、`baddbmm`、`addbmm`、`matmul`、`tensordot`、`einsum` | 训练/推理算力主力；epilogue 可融 01/03 | 低（手写 tile） | 低（应 MMA/WMMA/Cube/AMX，外加 epilogue `vfma`/`vadd`） | 通用 SIMD 仅作小规模/后备 |
-| **10.2** 向量积 | `dot`、`vdot`、`ger`、`inner`、`outer`、`addr` | 小规模或构建块 | 中 | 高～中 | `vfma` + `vreduce_add`；`outer`/`ger` 用 `vsplat`×`vmul` |
-| **10.3** 分解/求解 | `linalg.svd`、`linalg.qr`、`linalg.cholesky`、`linalg.solve`、`triangular_solve`、`lu_*` | 数值库路径 | 低（数值库） | 低（数值库） | 非通用向量 map |
-| **10.4** 量化/低比特 GEMM | `_int_mm`、`_dyn_quant_matmul_4bit`、`_weight_int4pack_mm` | 与 19 交界；专用核 | 低 | 低～中（`vpdpbusd`/int8 MMA、unpack） | 整数 MMA、`vcvt`、scale `vmul` |
-| **10.5** 分组/稀疏 MM | `_grouped_mm`、`_cslt_sparse_mm`、`_sparse_semi_structured_linear` | 与 20 交界 | 中～低 | 低 | 结构化稀疏 MMA 或 `vgather` |
+| **10.1** GEMM 族 | `mm`、`bmm`、`addmm`、`baddbmm`、`addbmm`、`matmul`、`tensordot`、`einsum` | 算力主力；epilogue 可融 01/03 | 低 | 低 | **Cube/MMA**；epilogue `vfma`/`vadd` |
+| **10.2** 向量积 | `dot`、`vdot`、`ger`、`inner`、`outer`、`addr` | 小规模构建块 | 中 | 高～中 | 可 Vec：`vfma`+`vreduce_add`；`vsplat`×`vmul` |
+| **10.3** 分解/求解 | `linalg.svd`、`linalg.qr`、`linalg.cholesky`、`linalg.solve`、`triangular_solve`、`lu_*` | 数值库 | 低 | 低 | 库（内部或调 Cube） |
+| **10.4** 量化/低比特 GEMM | `_int_mm`、`_dyn_quant_matmul_4bit`、`_weight_int4pack_mm` | 与 19.4 交界 | 低 | 低～中 | **整数 Cube/MMA**、`vcvt`、scale `vmul` |
+| **10.5** 分组/稀疏 MM | `_grouped_mm`、`_cslt_sparse_mm`、`_sparse_semi_structured_linear` | 与 20 交界 | 中～低 | 低 | **Cube** 或 `vgather` |
 
 ---
 
@@ -269,11 +321,11 @@ NN.M         = 可选子类（一位小数编号）
 
 ### Pattern 12 — Softmax / Attention
 
-| 子类 | 典型算子 | 备注 | SIMT 易用 | SIMD 易用 | SIMD 典型指令特征 |
+| 子类 | 典型算子 | 备注 | SIMT 易用 | SIMD 易用 | SIMD/Cube 指令特征 |
 |---|---|---|---|---|---|
-| **12.1** Softmax | `softmax`、`log_softmax`、`_softmax`、`_safe_softmax` | 数值稳定：max-sub → exp → sum → div | 中 | 中 | `vmax`/`vreduce_max`、`vsub`、`vexp`、`vreduce_add`、`vdiv` |
-| **12.2** SDPA / Flash | `scaled_dot_product_attention`、`_flash_attention_forward`、`_efficient_attention_forward`、`_cudnn_attention_forward` | IO 感知；动态序列长度敏感 | 低（专用算法） | 低～中（块内 GEMM+在线 softmax） | MMA + 12.1 向量 epilogue；**非**纯 SIMD map |
-| **12.3** MHA 包装 | `_native_multi_head_attention` | 组合 10+12+13 | 见组合 | 见组合 | 同 10+12+13 组合 |
+| **12.1** Softmax | `softmax`、`log_softmax`、`_softmax`、`_safe_softmax` | Vec；数值稳定 max-sub→exp→sum→div | 中 | 中 | `vmax`/`vreduce_max`、`vsub`、`vexp`、`vreduce_add`、`vdiv` |
+| **12.2** SDPA / Flash（**Cube**） | `scaled_dot_product_attention`、`_flash_attention_*`、`_efficient_attention_*`、`_cudnn_attention_*` | **内含 matmul**（QKᵀ/PV）；§2 已剔除 | 低 | 低～中 | **Cube/MMA** + 12.1 epilogue |
+| **12.3** MHA 包装（**Cube**） | `_native_multi_head_attention` | 组合 10+12+13；含 matmul | 低 | 低 | **Cube** + Vec epilogue |
 
 ---
 
@@ -347,7 +399,7 @@ NN.M         = 可选子类（一位小数编号）
 | **19.1** 量/反量 | `quantize_per_tensor`、`quantize_per_channel`、`dequantize` | 进出整型表示 | 高 | 高～中 | `vmul`/`vfma`、`vcvt`（sat）、`vrnd`；per-channel 要 `vbroadcast` 轴 |
 | **19.2** Fake quant | `fake_quantize_per_tensor_affine`、`_fake_quantize_learnable_*`、`choose_qparams_*` | QAT；可反传 | 高 | 中 | 同 19.1 + 反传 STE（`vblend`） |
 | **19.3** Q 张量元数据 | `q_scale`、`q_zero_point`、`q_per_channel_scales`、`int_repr` | 读量化参数 | N/A（标量元数据） | N/A / 高（`int_repr`） | `int_repr` 同 16：`vload`/`vstore` |
-| **19.4** 量化计算核 | `quantized::conv2d`、`quantized::linear`、`_int_mm` 等 | 常挂独立 namespace / DispatchKey；与 09/10 功能对应的整数实现 | 见组合 | 见组合 | 同 09/10 的 **整数 MMA + scale epilogue**；非通用 SIMD 主路径 |
+| **19.4** 量化计算核（**Cube**） | `quantized::conv2d`、`quantized::linear`、`_int_mm` 等 | **含 matmul**；与 09/10 整数 Cube 对应；§2 已剔除 | 低 | 低 | **整数 Cube/MMA** + scale epilogue |
 
 **备注**：功能上「量化」既是 **dtype/数值域变换（19.1–19.3）**，也是 **同构算子的整数后端（19.4）**。
 
@@ -449,14 +501,14 @@ NN.M         = 可选子类（一位小数编号）
 
 | 组合 | 例 | Pattern 链 |
 |---|---|---|
-| Linear | `F.linear` | 10 →（可选 01 bias）→（可选 03） |
-| Conv-BN-ReLU | CNN 块 | 09 → 11 → 03 |
+| Linear | `F.linear` | **Cube 10** →（可选 Vec 01 bias）→（可选 03） |
+| Conv-BN-ReLU | CNN 块 | **Cube 09** → 11 → 03 |
 | LayerNorm | Transformer | 11（内含 05+01） |
-| SDPA | Attention | 10 + 12（+ 18 dropout） |
+| SDPA | Attention | **Cube 12.2**（内含 matmul）+ Vec 12.1 epilogue |
 | Embedding + sum | `embedding_bag` | 13 → 05 |
 | Pad + Pack | RNN batch | 07 ↔ 24 |
-| QDQ + Conv | PTQ/QAT | 19 → 09/19.4 |
-| 通信–计算重叠 | async allreduce + compute + wait | 10/01 ∥ **29.5** → **29.5 wait** |
+| QDQ + Conv | PTQ/QAT | 19 QDQ → **Cube 19.4/09** |
+| 通信–计算重叠 | async allreduce + compute + wait | Cube/Vec ∥ **29.5** → wait |
 | 多流通用 | copy 到侧流 + event 回主流 | 16 + **29.2/29.3** |
 
 ---
