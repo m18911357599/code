@@ -16,7 +16,7 @@
 | **API** | 用户声明式 API → Schema/Dispatch → Plan/Iterator → Backend；中间层吸收动态与非对齐 |
 | **Dyn / Align / Pad** | 语义 Pad（07）≠ 向量尾填充 ≠ 硬件对齐 Pad；短尾轴在 NPU 上易被隐式 pad |
 | **同步** | 同步不是计算 Pattern，而是 **执行序约束**；需按阻塞域（Host/Device/Stream/Rank）与序关系（happens-before）提取特征 |
-| **SIMT/SIMD** | 含 matmul 标 **Cube** 并剔出打分；计分 `亲=2` / `偏向=2（对方1）` / `难=0` → **Score_SIMT≈1.86**、**Score_SIMD≈1.25**；默认 SIMT，SIMD 覆盖 s=2 大户 |
+| **SIMT/SIMD** | Cube 剔出打分；`亲=2`/`偏向=2（对方1）`/`难=0` → SIMT≈1.86、SIMD≈1.25；**定长 `vreduce` 等硬件原语可抬升 05/11/12 SIMD 易用性**（§3.0.1、§8.4） |
 
 ---
 
@@ -160,28 +160,48 @@ Cube 类合计规格约 **N_cube ≈ 105**（09+10+12.2/3+19.4）；不参与下
 | 列名 | 含义 |
 |---|---|
 | **SIMT 易用** | 一线程一元素（CUDA grid-stride / warp 协作）写出正确实现的难度；**高=易写** |
-| **SIMD 易用** | 一指令多 lane / tile（AVX·NEON·RVV·AscendC Vec·SIMD-Tile）写出正确实现的难度；**高=易写** |
-| **SIMD 典型指令特征** | 该类热路径需要的可移植向量指令族（后端再映射到具体 ISA） |
+| **SIMD 易用** | 一指令多 lane / tile（AVX·NEON·RVV·AscendC Vec·SIMD-Tile）写出正确实现的难度；**高=易写**；**随硬件原语有无可升降档** |
+| **SIMD 典型指令特征** | 热路径所需可移植向量指令族（含硬件原语需求）；原型见 **§8.4** |
 
 易用性取值：`高` / `中` / `低` / `N/A`（可带简短括注）。
 
+#### 3.0.1 硬件指令支持 → 抬升 SIMD 易用性
+
+SIMD 易用性取决于算法 **与** ISA 原语。缺原语时需手写 shuffle 树 / 标量收尾，易用性降 1～2 档。
+
+| 硬件能力 | 主要抬升 Pattern | 缺省代价 | 易用性（有 → 无） |
+|---|---|---|---|
+| **定长水平规约** `vreduce_*`（固定 VL→标量/偏量） | 05、11、12.1、08、22 | 蝶式 `vhadd`+多轮 `vshuf` | 中/高 → 低 |
+| **掩码规约** `vreduce_*_masked` | 05 尾块、短内维 | 先 blend 中性元 | 中 → 低 |
+| **定长前缀** `vscan`/`vprefix` | 06、26 | 多轮扫描网络 | 中 → 低 |
+| **compress/expand** | 13.3、26 | 前缀和+scatter | 中 → 低 |
+| **gather/scatter** | 04、07、13、23 | 标量间接 | 中 → 低 |
+| **谓词访存** `vloadm`/`vstorem` | 01–03 尾块 | 标量 epilogue | 高 → 中 |
+| **向量 RNG** `vrng` | 18 | 标量填 lane | 中 → 低 |
+| **Cube/MMA** | 09/10/12.2 | 禁止通用 SIMD 冒充 | （Cube，不入 SIMD 分） |
+
+**约定**：各 Pattern「备注」写清 **硬件依赖**；「SIMD 典型指令特征」列写助记，**完整原型见 §8.4**。
+
 **SIMD 指令助记**：
 
-| 助记 | 特征含义 |
-|---|---|
-| `vload`/`vstore` | 连续向量读写（含 unaligned） |
-| `vloadm`/`vstorem` | mask/谓词读写（尾块） |
-| `vadd`/`vmul`/`vfma`/`vdiv`… | 逐 lane 算术 |
-| `vcmp`/`vblend`/`vwhere` | 比较与选择 |
-| `vsplat`/`vbroadcast` | 标量/短向量扩到全宽 |
-| `vhadd`/`vhmax`/`vreduce_*` | 水平/树规约 |
-| `vgather`/`vscatter` | 间接读写 |
-| `vshuf`/`vtranspose` | 重排 / 分块转置 |
-| `vcvt` | dtype 转换 |
-| `vprefix`/`vscan` | 有序前缀 |
-| `vcompress`/`vexpand` | 按 mask 压缩/展开 |
-| `vatomic_*` | lane/地址原子（scatter 冲突） |
-| `MMA/Cube` | **Cube 类**：矩阵加速单元；含 matmul 的算子走此路径，不计入 §2 SIMT/SIMD 分 |
+| 助记 | 特征含义 | 硬件要点 |
+|---|---|---|
+| `vload`/`vstore` | 连续向量读写（含 unaligned） | 对齐快路径可选 |
+| `vloadm`/`vstorem` | mask/谓词读写（尾块） | 谓词/mask 寄存器 |
+| `vadd`/`vmul`/`vfma`/`vdiv`… | 逐 lane 算术 | 标准 |
+| `vcmp`/`vblend`/`vwhere` | 比较与选择 | |
+| `vsplat`/`vbroadcast` | 标量扩到全宽 | |
+| `vreduce_add/max/min/...` | **定长**水平规约（VL→标量） | **关键抬升 05/11/12** |
+| `vreduce_*_masked` | 忽略无效 lane 的规约 | 尾块/短内维 |
+| `vhadd`/`vhmax` | 成对水平加（无整宽 reduce 时的积木） | 可软件拼 `vreduce` |
+| `vgather`/`vscatter` | 间接读写 | |
+| `vshuf`/`vtranspose` | 重排 / 分块转置 | |
+| `vcvt` | dtype 转换 | 饱和/舍入 |
+| `vprefix`/`vscan` | **定长**有序前缀 | 抬升 06/26 |
+| `vcompress`/`vexpand` | 按 mask 压缩/展开 | 抬升 26 |
+| `vatomic_*` | 地址原子 | scatter 冲突 |
+| `vrng` | 向量随机 | |
+| `MMA/Cube` | Cube 类矩阵加速 | 不计入 §2 SIMD 分 |
 
 ---
 
@@ -194,7 +214,7 @@ Cube 类合计规格约 **N_cube ≈ 105**（09+10+12.2/3+19.4）；不参与下
 | **01.3** 三元组合 | 乘加类 | `addcmul`、`addcdiv`、`lerp` | 易融合进 10 的 epilogue | 高 | 高 | `vfma`、`vload×3`、`vblend`（lerp） |
 | **01.4** Foreach 变体 | 列表逐元素 | `_foreach_add`、`_foreach_mul`、… | 优化器步进；并行提交多 tensor | 高（多 stream/多核） | 高（每 tensor 同 01.1） | 同 01.1；调度非 SIMD |
 
-**实现备注**：热路径 = 整块向量 + 标量/窄向量尾；非 contiguous 先 reorder/coalesce。
+**实现备注**：热路径 = 整块向量 + 尾块；**有 `vloadm`/`vstorem` 则尾块不降到标量**（SIMD 保持高）。非 contiguous 先 reorder/coalesce。指令原型 §8.4。
 
 ---
 
@@ -233,19 +253,20 @@ Cube 类合计规格约 **N_cube ≈ 105**（09+10+12.2/3+19.4）；不参与下
 
 ### Pattern 05 — 规约
 
-| 子类 | 典型算子 | 备注 | SIMT 易用 | SIMD 易用 | SIMD 典型指令特征 |
+| 子类 | 典型算子 | 备注（含硬件依赖） | SIMT 易用 | SIMD 易用 | SIMD 典型指令特征 |
 |---|---|---|---|---|---|
-| **05.1** 数值规约 | `sum`、`prod`、`mean`、`nansum`、`nanmean`、`norm`、`linalg.vector_norm`、`logsumexp`、`count_nonzero` | keepdim / dim / 多维 reduce | 中（需 warp/block reduce） | 中（水平规约+跨 tile 合并） | `vload`/`vloadm`、`vadd`/`vmul`、`vhadd`/`vreduce_*`；尾 lane 填中性元 |
-| **05.2** Arg 规约 | `argmax`、`argmin`、`amax`、`amin`、`aminmax` | 携带 index 或值；尾块禁无效 idx | 中 | 中～低（值+索引对） | `vmax`/`vmin` + index 伴随、`vblend`；禁用无效 lane |
-| **05.3** 逻辑规约 | `all`、`any` | bool 中性元不同 | 中 | 高～中 | `vand`/`vor` 规约、`vcmp` |
-| **05.4** 统计规约 | `std`、`var`、`median`、`quantile`、`mode` | 有的两遍扫描；`quantile` 更复杂 | 中～低 | 低（`quantile`/`median` 近排序） | 两遍 `vreduce`；或走 25 |
-| **05.5** 全局标量 | `trace`（方阵）、无 dim 的 `sum()` | 可看作全维 05.1 | 见组合 | 见组合 | 同 05.1；对角线另要跨步 `vgather` 或标量 |
+| **05.1** 数值规约 | `sum`、`prod`、`mean`、`nansum`、`nanmean`、`norm`、`linalg.vector_norm`、`logsumexp`、`count_nonzero` | keepdim/dim；**若 ISA 提供定长 `vreduce_add/max/...`，SIMD 升至高**；否则手写水平树 | 中（warp/block reduce） | **高（有定长 reduce）/ 中～低（无）** | `vload`/`vloadm`、`vadd`/`vmul`、**`vreduce_*` / `vreduce_*_masked`**（§8.4）；缺则 `vhadd`+`vshuf` |
+| **05.2** Arg 规约 | `argmax`、`argmin`、`amax`、`amin`、`aminmax` | 需 **值+index 对规约**；硬件若有 `vreduce_max_with_index` 则升档 | 中 | 中（有 index-reduce）/ 低（无） | `vreduce_max_arg`/`vmin_arg` 或 `vmax`+idx 伴随、`vblend`；尾 lane 禁无效 idx |
+| **05.3** 逻辑规约 | `all`、`any` | bool 中性元；`vreduce_and/or` 定长则升档 | 中 | 高（有）/ 中（无） | `vcmp`、`vreduce_and`/`vreduce_or`（或 `vand`/`vor` 树） |
+| **05.4** 统计规约 | `std`、`var`、`median`、`quantile`、`mode` | 两遍 `vreduce`；quantile 仍近排序 | 中～低 | 低 | 两遍 `vreduce_add`；或走 25 |
+| **05.5** 全局标量 | `trace`、无 dim `sum()` | 同 05.1 | 中 | 同 05.1 | 同 05.1；对角可 `vgather` |
 
 **子特征备注**：
 
-- **05.a 内维规约**：`sum(-1)`，连续 load 友好 → SIMD 易用性升高  
-- **05.b 外/中维**：`sum(0)`，常需换轴或跨步累加 → 倾向 SIMT 或先 `vtranspose`  
-- **05.c 短内维**：如 K=3 → SIMD 利用率低；多行打包进向量宽  
+- **05.a 内维规约**：连续 load + **定长 `vreduce`** → SIMD 易用性最高  
+- **05.b 外/中维**：先 `vtranspose` 或跨步累加；无 transpose 则偏 SIMT  
+- **05.c 短内维**：多行打包填满 VL 后再 `vreduce`；依赖 **`vreduce_*_masked`** 或中性元  
+- **硬件建议**：优先实现 **固定 VL 的 `vreduce_{add,max,min,and,or}` + masked 变体**（原型 §8.4），可将 05 的 SIMD 档从「对方/中」抬向「亲/高」 
 
 ---
 
@@ -253,7 +274,7 @@ Cube 类合计规格约 **N_cube ≈ 105**（09+10+12.2/3+19.4）；不参与下
 
 | 典型算子 | 备注 | SIMT 易用 | SIMD 易用 | SIMD 典型指令特征 |
 |---|---|---|---|---|
-| `cumsum`、`cumprod`、`cummax`、`cummin`、`logcumsumexp` | 沿 dim **有序**；不可随意乱序并行；与 05 不同 | 中（Hillis-Steele / Blelloch） | 中～低（块内 `vprefix`/`vscan` + 块间回写） | `vscan_add`/`vscan_max`、`vshuf`（蝶式）、`vload`/`vstore` |
+| `cumsum`、`cumprod`、`cummax`、`cummin`、`logcumsumexp` | 有序前缀；**定长 `vscan`/`vprefix` 硬件可把 SIMD 从低抬到中**；缺则多轮 `vshuf`（§8.4） | 中（Hillis-Steele/Blelloch） | **中（有 vscan）/ 低（无）** | **`vscan_add`/`vscan_max`**、`vshuf`、`vload`/`vstore` |
 
 ---
 
@@ -321,7 +342,7 @@ Cube 类合计规格约 **N_cube ≈ 105**（09+10+12.2/3+19.4）；不参与下
 
 | 典型算子 | 备注 | SIMT 易用 | SIMD 易用 | SIMD 典型指令特征 |
 |---|---|---|---|---|
-| `native_batch_norm`、`batch_norm`、`native_layer_norm`、`layer_norm`、`native_group_norm`、`group_norm`、`instance_norm`、`rms_norm`、`normalize` | 内部 = **05 规约 + 01/04 仿射**；实现几乎总是融合专用核 | 中（两遍/Welford） | 中（内维 `vreduce` + `vsplat` 广播 + `vfma`） | `vload`、`vreduce_add`/`vhadd`、`vsplat`、`vrsqrt`/`vdiv`、`vfma` |
+| `native_batch_norm`、`batch_norm`、`native_layer_norm`、`layer_norm`、`native_group_norm`、`group_norm`、`instance_norm`、`rms_norm`、`normalize` | 内部=05+01；**定长 `vreduce_add` 是 SIMD 易用关键**（有则中→偏高） | 中（两遍/Welford） | **中～高（有 vreduce）/ 低（无）** | **`vreduce_add`**、`vsplat`、`vrsqrt`/`vdiv`、`vfma`、`vload`（§8.4） |
 
 ---
 
@@ -329,7 +350,7 @@ Cube 类合计规格约 **N_cube ≈ 105**（09+10+12.2/3+19.4）；不参与下
 
 | 子类 | 典型算子 | 备注 | SIMT 易用 | SIMD 易用 | SIMD/Cube 指令特征 |
 |---|---|---|---|---|---|
-| **12.1** Softmax | `softmax`、`log_softmax`、`_softmax`、`_safe_softmax` | Vec；数值稳定 max-sub→exp→sum→div | 中 | 中 | `vmax`/`vreduce_max`、`vsub`、`vexp`、`vreduce_add`、`vdiv` |
+| **12.1** Softmax | `softmax`、`log_softmax`、`_softmax`、`_safe_softmax` | Vec；依赖 **定长 `vreduce_max`+`vreduce_add`**，有则 SIMD 升档 | 中 | **中～高（有双 reduce）/ 低（无）** | **`vreduce_max`/`vreduce_add`**、`vsub`、`vexp`、`vdiv`（§8.4） |
 | **12.2** SDPA / Flash（**Cube**） | `scaled_dot_product_attention`、`_flash_attention_*`、`_efficient_attention_*`、`_cudnn_attention_*` | **内含 matmul**（QKᵀ/PV）；§2 已剔除 | 低 | 低～中 | **Cube/MMA** + 12.1 epilogue |
 | **12.3** MHA 包装（**Cube**） | `_native_multi_head_attention` | 组合 10+12+13；含 matmul | 低 | 低 | **Cube** + Vec epilogue |
 
@@ -464,7 +485,7 @@ Cube 类合计规格约 **N_cube ≈ 105**（09+10+12.2/3+19.4）；不参与下
 
 | 典型算子 | 备注 | SIMT 易用 | SIMD 易用 | SIMD 典型指令特征 |
 |---|---|---|---|---|
-| `nonzero`、`masked_select`、`unique`（长度）、`syncronized` 类 compact | 官方 tag：`dynamic_output_shape`；实现常 **两阶段 count → write**；meta/导出受限 | 中（compact 扫描） | 中～低 | 阶段1 `vcmp`+`vreduce`/`vprefix` 计数；阶段2 `vcompress`/`vscatter`；无 compress 则 SIMT 更易 |
+| `nonzero`、`masked_select`、`unique`（长度）、同步 compact | `dynamic_output_shape`；两阶段；**有 `vcompress`+`vprefix` 则 SIMD 升档** | 中 | **中（有 compress）/ 低（无）** | `vcmp`、**`vprefix`/`vreduce`**、**`vcompress`**/`vscatter`（§8.4） |
 
 ---
 
@@ -729,8 +750,131 @@ notes:  # 如 “NCCL wait 默认为 stream-order，非 Host-block”
 | 算子迁类 | 改 §3 典型列表与备注，更新交叉表 §4 |
 | 同步语义变更 | 更新 §7 特征矩阵与 Host-block / stream-order 注记 |
 | SIMT/SIMD 映射变更 | 更新 §3.0 助记表与各 Pattern 末列 |
+| **SIMD 硬件原语变更** | 更新 §3.0.1、相关 Pattern 备注、**§8.4 原型** |
 | 统计口径变化 | 更新 §1.1 |
+
+### 8.4 SIMD 指令原型（可移植伪接口）
+
+> 下列为 **逻辑原型**（非某一 ISA 汇编）。`VL` = 固定向量 lane 数（或实现定义的最大定长）；`mask_t` 与 `vec<T,VL>` 同宽。后端映射：AVX-512 / NEON / RVV / AscendC Vec / C++26 `simd` 等。  
+> **定长**意指单次操作作用在编译期可知或 ABI 固定的 `VL` 上（相对“软件循环拼规约”）。
+
+```cpp
+// ---- 类型 ----
+template<class T, int VL> struct vec;      // VL 个 T 的定长向量
+template<int VL>          struct mask_t;   // VL 位谓词
+enum class reduce_op { add, mul, max, min, and_, or_ };
+enum class scan_op   { add, max, min, mul };
+
+// ---- 访存（Pattern 01–03 / 15–17 尾块关键）----
+template<class T, int VL>
+vec<T,VL> vload(const T* p);                          // 连续；可有 unaligned 变体
+
+template<class T, int VL>
+vec<T,VL> vloadm(const T* p, mask_t<VL> m);           // 无效 lane 不产生故障读
+
+template<class T, int VL>
+void vstore(T* p, vec<T,VL> v);
+
+template<class T, int VL>
+void vstorem(T* p, mask_t<VL> m, vec<T,VL> v);
+
+template<class T, int VL>
+vec<T,VL> vgather(const T* base, vec<int,VL> idx);
+
+template<class T, int VL>
+void vscatter(T* base, vec<int,VL> idx, vec<T,VL> v);
+// 冲突：确定性顺序或要求无冲突；否则 vatomic_add
+
+// ---- 逐 lane 算术 / 选择 ----
+template<class T, int VL>
+vec<T,VL> vadd(vec<T,VL> a, vec<T,VL> b);
+template<class T, int VL>
+vec<T,VL> vmul(vec<T,VL> a, vec<T,VL> b);
+template<class T, int VL>
+vec<T,VL> vfma(vec<T,VL> a, vec<T,VL> b, vec<T,VL> c); // a*b+c
+
+template<class T, int VL>
+mask_t<VL> vcmp_lt(vec<T,VL> a, vec<T,VL> b);         // 及 eq/ne/le/...
+
+template<class T, int VL>
+vec<T,VL> vblend(mask_t<VL> m, vec<T,VL> t, vec<T,VL> f); // m?t:f
+
+template<class T, int VL>
+vec<T,VL> vsplat(T x);                                // 广播到 VL
+
+template<class To, class From, int VL>
+vec<To,VL> vcvt(vec<From,VL> x);                      // 类型转换
+
+// ---- 定长水平规约（抬升 Pattern 05/11/12.1；硬件优先提供）----
+// 语义：对 v 的全部 VL 个 lane 做结合运算，返回标量（或广播回 vec，由后端定）
+template<class T, int VL>
+T vreduce(reduce_op op, vec<T,VL> v);
+// 等价别名（便于 codegen）：
+//   T vreduce_add(vec<T,VL>);
+//   T vreduce_max(vec<T,VL>);
+//   T vreduce_min(vec<T,VL>);
+//   T vreduce_and(vec<T,VL>); // 逻辑/按位
+//   T vreduce_or (vec<T,VL>);
+
+// 掩码规约：m=false 的 lane 视作 op 的中性元（+0 / +inf / true…），不参与
+template<class T, int VL>
+T vreduce_masked(reduce_op op, vec<T,VL> v, mask_t<VL> m);
+
+// Arg-reduce：返回 (值, lane_index)；无效 lane 禁用
+template<class T, int VL>
+struct arg_t { T val; int idx; };
+template<class T, int VL>
+arg_t<T> vreduce_max_arg(vec<T,VL> v, mask_t<VL> m);
+template<class T, int VL>
+arg_t<T> vreduce_min_arg(vec<T,VL> v, mask_t<VL> m);
+
+// 无整宽 reduce 时的积木（软件模拟定长 reduce）：
+template<class T, int VL>
+vec<T,VL> vhadd(vec<T,VL> v);   // 相邻对水平加，宽度折半语义由实现定义
+template<class T, int VL>
+vec<T,VL> vshuf(vec<T,VL> v, vec<int,VL> perm);
+
+// ---- 定长前缀 / 扫描（抬升 Pattern 06/26）----
+template<class T, int VL>
+vec<T,VL> vscan(scan_op op, vec<T,VL> v, bool inclusive = true);
+// 别名：vscan_add / vscan_max / …
+
+template<class T, int VL>
+vec<T,VL> vprefix_sum(vec<T,VL> v);   // 常用；可与 vscan(add) 同构
+
+// ---- 压缩 / 展开（抬升 Pattern 26 / masked_select）----
+template<class T, int VL>
+int vcompress_store(T* out, mask_t<VL> m, vec<T,VL> v);
+// 将 m=true 的 lane 按序写入 out，返回写入个数（≤VL）
+
+template<class T, int VL>
+vec<T,VL> vexpand_load(const T* in, mask_t<VL> m);
+// 按 m 把紧凑输入展开到向量（其余 lane 未定义或零）
+
+// ---- 其它 ----
+template<class T, int VL>
+vec<T,VL> vrng(rng_state& st);        // 向量随机（Pattern 18）
+
+template<class T, int VL>
+void vatomic_add(T* base, vec<int,VL> idx, vec<T,VL> v); // scatter-add
+
+// Cube（不属通用 SIMD；Pattern 09/10/12.2）
+// mma_sync(acc, a, b) / CubeLoad / CubeExecute … 见各 NPU/GPU MMA ABI
+```
+
+**与 Pattern 的最小硬件清单（建议实现优先级）**：
+
+| 优先级 | 原语 | 解锁的 SIMD 易用性 |
+|---|---|---|
+| P0 | `vload/vstore`、`vloadm/vstorem`、`vadd/vmul/vfma`、`vcmp/vblend` | 01–03、15–17 双亲 |
+| P0 | **`vreduce_{add,max,min}` + `_masked`** | **05/11/12.1 从中/对方 → 高** |
+| P1 | `vscan`/`vprefix`、`vcompress` | 06、26 |
+| P1 | `vgather`/`vscatter`、`vtranspose` | 13、14、23 |
+| P2 | `vrng`、`vreduce_*_arg`、超越函数近似 | 18、05.2、03 |
+| — | Cube/MMA | 09/10/12.2（独立路由） |
+
+**缺省回退**：无 `vreduce` 时用 `log2(VL)` 级 `vshuf`+`vhadd` 软件树，并在备注中把该 Pattern SIMD 易用性标低一档（与 §3.0.1 表一致）。
 
 ---
 
-*本文以核心功能 + 数字 Pattern 组织 PyTorch 三千量级底层算子，并提取同步算子（Pattern 29）的阻塞域与序关系特征，供算子库与 NPU 中间层对照使用。*
+*本文以核心功能 + 数字 Pattern 组织 PyTorch 三千量级底层算子；同步特征见 Pattern 29；SIMD 易用性与硬件定长原语（尤其 `vreduce`）绑定，原型见 §8.4。*
