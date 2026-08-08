@@ -142,10 +142,11 @@ Cube 类合计规格约 **N_cube ≈ 105**（09+10+12.2/3+19.4）；不参与下
 ### 2.3 建议（已剔除 Cube）
 
 1. **默认编程模型选 SIMT**（Score **1.86** ≫ SIMD）：非 Cube 优先 thread/grid 语义。  
-2. **SIMD 作加速层**（Score **1.25**）：优先 **s=2** 族——双亲 `01/02/15/16/17/19QDQ`，以及 **偏 SIMD** 的 `14`；指令见 §3。  
-3. **SIMD s=0 勿硬扛**：`06/13/20/23/25/26/21`——SIMT 或专用原语（`vscan`/`vgather`/`vcompress`）。  
-4. **Cube 独立路由**：`09/10/12.2/19.4` → Cube/MMA；epilogue 回 Vec；**不计入**本打分。  
-5. **落地优先级**：Cube 库 → SIMD 覆盖 s=2 → SIMT 托底其余 Vec → Ctrl/Lib。
+2. **SIMD 作加速层**（Score **1.25**）：优先 **s=2** 族——双亲 `01/02/15/16/17/19QDQ`，以及 **偏 SIMD** 的 `14`；指令见 §3 / **§8.4**。  
+3. **硬件原语换易用性**：优先落地 **定长 `vreduce_*`(+masked)**，其次 `vscan`/`vcompress`/`vgather`；可将 05/11/12.1（及 06/26）SIMD 易用升档（§3.0.1）。  
+4. **SIMD s=0 勿硬扛**：`06/13/20/23/25/26/21`——缺原语时走 SIMT 或先补 ISA。  
+5. **Cube 独立路由**：`09/10/12.2/19.4` → Cube/MMA；epilogue 回 Vec；**不计入**本打分。  
+6. **落地优先级**：Cube 库 → **定长 reduce 等 SIMD 原语** → SIMD 覆盖 s=2 → SIMT 托底 → Ctrl/Lib。
 
 复合模块（`nn.Linear`、`nn.MultiheadAttention`）= **Cube + Vec epilogue**，编号仍落在 09/10/12 组合，不单开。
 
