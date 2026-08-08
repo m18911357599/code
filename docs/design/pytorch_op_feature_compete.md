@@ -16,7 +16,7 @@
 | **API** | 用户声明式 API → Schema/Dispatch → Plan/Iterator → Backend；中间层吸收动态与非对齐 |
 | **Dyn / Align / Pad** | 语义 Pad（07）≠ 向量尾填充 ≠ 硬件对齐 Pad；短尾轴在 NPU 上易被隐式 pad |
 | **同步** | 同步不是计算 Pattern，而是 **执行序约束**；需按阻塞域（Host/Device/Stream/Rank）与序关系（happens-before）提取特征 |
-| **SIMT/SIMD** | Cube 剔出打分；`亲=2`/`偏向=2（对方1）`/`难=0` → SIMT≈1.86、SIMD≈1.25；**定长 `vreduce` 等硬件原语可抬升 05/11/12 SIMD 易用性**（§3.0.1、§8.4） |
+| **SIMT/SIMD** | 基线 Score_SIMT≈1.86、Score_SIMD≈1.25；**特殊指令后 Score_SIMD′≈1.86**（含 `vreduce`/`vsort`/`vmergesort` 等，见总表 s_SIMD′） |
 
 ---
 
@@ -80,73 +80,82 @@ Score_mode = Σ_i ( N_i × s_mode(i) ) / Σ_i N_i
   偏 SIMD（「偏向」主 SIMD） → SIMT=1, SIMD=2（对方）
   某侧「难」                 → 该侧=0
   亲 + 对方                  → 亲侧=2, 对方侧=1
-mode ∈ { SIMT, SIMD }
+
+s_SIMD  = 基线（仅通用算术/load-store）
+s_SIMD′ = 采用「特殊指令」列硬件原语之后的同分规则重估
+Score_SIMD′ 同上公式，用 s_SIMD′
 ```
 
 ### 2.1 总表
 
-| Pattern | 核心功能 | 算子类 | 规格 N | 访存/并行 | SIMT 档 | SIMD 档 | s_SIMT | s_SIMD | 备注 |
-|---|---|---|---|---|---|---|---|---|---|
-| **01** | 逐元素算术 | Vec | 227 | 带宽；全并行 | **亲** | **亲** | 2 | 2 | TensorIterator 主力 |
-| **02** | 比较 / 逻辑 / 选择 | Vec | 39 | 同 01 | **亲** | **亲** | 2 | 2 | |
-| **03** | 激活与非线性 | Vec | 79 | 同 01 | **亲** | **对方** | 2 | 1 | 超越函数拖累 SIMD |
-| **04** | 广播与维扩展 | Vec | 35 | 0-stride / 物化 | **偏向** | **对方** | 2 | 1 | 偏 SIMT |
-| **05** | 规约 | Vec | 47 | 树归约 / 分块 | **偏向** | **对方** | 2 | 1 | 偏 SIMT（warp/`vreduce`） |
-| **06** | 扫描与累积 | Vec | 12 | 有序前缀 | **偏向** | **难** | 2 | 0 | SIMD 需 `vscan` |
-| **07** | 填充 | Vec | 29 | 搬移 + 边界 | **偏向** | **对方** | 2 | 1 | 偏 SIMT |
-| **08** | 池化 | Vec | 42 | 固定维滑窗 | **偏向** | **对方** | 2 | 1 | 偏 SIMT |
-| **09** | 卷积 | **Cube** | 38 | Cube/MMA | — | — | — | — | **含 matmul**；剔出打分 |
-| **10** | 矩阵乘与线性代数 | **Cube** | 45 | Cube/MMA | — | — | — | — | **matmul 本体**；剔出打分 |
-| **11** | 归一化 | Vec | 32 | 规约+仿射 | **偏向** | **对方** | 2 | 1 | 偏 SIMT（05+01） |
-| **12.1** | Softmax | Vec | 16 | 内维 reduce+map | **偏向** | **对方** | 2 | 1 | 偏 SIMT |
-| **12.2/12.3** | SDPA / MHA | **Cube** | 21 | GEMM+softmax | — | — | — | — | **内含 matmul**；剔出打分 |
-| **13** | 索引 / 散射 / Embedding | Vec | 55 | gather/scatter | **偏向** | **难** | 2 | 0 | 偏 SIMT |
-| **14** | 布局变换 | Vec | 85 | view 或搬移 | **对方** | **偏向** | 1 | 2 | **偏 SIMD**（`vtranspose`） |
-| **15** | 拼接与分割 | Vec | 26 | 分段 copy | **亲** | **亲** | 2 | 2 | |
-| **16** | 拷贝与类型转换 | Vec | 26 | 带宽 | **亲** | **亲** | 2 | 2 | |
-| **17** | 工厂与创建 | Vec | 33 | 写填充 | **亲** | **亲** | 2 | 2 | |
-| **18** | 随机与 Dropout | Vec | 34 | RNG + 逐点 | **偏向** | **对方** | 2 | 1 | 偏 SIMT |
-| **19** QDQ | 量化/反量化/fake | Vec | 27 | `vcvt`+scale | **亲** | **亲** | 2 | 2 | |
-| **19.4** | 量化 Conv/Linear/MM | **Cube** | ~1+ | 整数 MMA | — | — | — | — | **含 matmul**；归 Cube |
-| **20** | 稀疏（非 MM） | Vec | 43 | 间接 | **偏向** | **难** | 2 | 0 | 偏 SIMT |
-| **21** | FFT / 信号 | Lib | 31 | 专用库 | **难** | **难** | 0 | 0 | |
-| **22** | 损失函数 | Vec | 35 | 常 01+05 | **偏向** | **对方** | 2 | 1 | 偏 SIMT |
-| **23** | 上采样与插值 | Vec | 39 | 邻域采样 | **偏向** | **难** | 2 | 0 | 偏 SIMT |
-| **24** | Nested / Jagged | Vec | 14 | 变长段 | **偏向** | **对方** | 2 | 1 | 偏 SIMT |
-| **25** | 排序 / TopK / Unique | Vec | 10 | 不规则 | **偏向** | **难** | 2 | 0 | 偏 SIMT |
-| **26** | 数据依赖动态输出 | Vec | 6 | 两阶段 | **偏向** | **难** | 2 | 0 | 偏 SIMT |
-| **27** | 特殊函数 | Vec | 37 | 同 01 近似 | **偏向** | **对方** | 2 | 1 | 偏 SIMT |
-| **28** | 元信息 / 控制 | Ctrl | 23 | 非数据面 | — | — | — | — | **不入分母** |
-| **29** | 同步 / 序约束 | Ctrl | 4 | 序约束 | — | — | — | — | **不入分母** |
+> **s_SIMD′**：在采用「特殊指令」列所列硬件原语后的 SIMD 计分（同一套 亲=2 / 偏向主侧=2 / 对方=1 / 难=0）。基线 `s_SIMD` 假设仅有通用算术+load/store，无定长 reduce/scan/sort/compress/gather 等。
 
-Cube 类合计规格约 **N_cube ≈ 105**（09+10+12.2/3+19.4）；不参与下列 Score。
+| Pattern | 核心功能 | 算子类 | N | SIMT档 | SIMD档 | s_SIMT | s_SIMD | 特殊指令（升档关键） | s_SIMD′ | 备注 |
+|---|---|---|---|---|---|---|---|---|---|---|
+| **01** | 逐元素算术 | Vec | 227 | 亲 | 亲 | 2 | 2 | `vloadm`/`vstorem` | **2** | 已亲；谓词尾块保档 |
+| **02** | 比较/逻辑/选择 | Vec | 39 | 亲 | 亲 | 2 | 2 | `vcmp`/`vblend` | **2** | |
+| **03** | 激活与非线性 | Vec | 79 | 亲 | 对方 | 2 | 1 | `vexp`/`vtanh` 等近似 | **2** | 有向量超越→升亲 |
+| **04** | 广播与维扩展 | Vec | 35 | 偏向 | 对方 | 2 | 1 | `vsplat`/`vgather` | **2** | |
+| **05** | 规约 | Vec | 47 | 偏向 | 对方 | 2 | 1 | **`vreduce_*`+masked** | **2** | 定长 reduce→亲 |
+| **06** | 扫描与累积 | Vec | 12 | 偏向 | 难 | 2 | 0 | **`vscan`/`vprefix`** | **2** | 难→亲 |
+| **07** | 填充 | Vec | 29 | 偏向 | 对方 | 2 | 1 | `vsplat`/`vgather` | **2** | |
+| **08** | 池化 | Vec | 42 | 偏向 | 对方 | 2 | 1 | `vreduce`/`vmax` | **2** | |
+| **09** | 卷积 | **Cube** | 38 | — | — | — | — | Cube/MMA | — | 剔出打分 |
+| **10** | 矩阵乘/线性代数 | **Cube** | 45 | — | — | — | — | Cube/MMA | — | 剔出打分 |
+| **11** | 归一化 | Vec | 32 | 偏向 | 对方 | 2 | 1 | **`vreduce_add`** | **2** | |
+| **12.1** | Softmax | Vec | 16 | 偏向 | 对方 | 2 | 1 | **`vreduce_max`+`add`** | **2** | |
+| **12.2/12.3** | SDPA/MHA | **Cube** | 21 | — | — | — | — | Cube+epilogue | — | 剔出打分 |
+| **13** | 索引/散射/Embedding | Vec | 55 | 偏向 | 难 | 2 | 0 | **`vgather`/`vscatter`** | **2** | 难→亲 |
+| **14** | 布局变换 | Vec | 85 | 对方 | 偏向 | 1 | 2 | `vtranspose`/`vshuf` | **2** | 已偏 SIMD |
+| **15** | 拼接与分割 | Vec | 26 | 亲 | 亲 | 2 | 2 | `vload`/`vstore` | **2** | |
+| **16** | 拷贝与类型转换 | Vec | 26 | 亲 | 亲 | 2 | 2 | `vload`/`vcvt` | **2** | |
+| **17** | 工厂与创建 | Vec | 33 | 亲 | 亲 | 2 | 2 | `vsplat` | **2** | |
+| **18** | 随机与 Dropout | Vec | 34 | 偏向 | 对方 | 2 | 1 | **`vrng`** | **2** | |
+| **19** QDQ | 量化变换 | Vec | 27 | 亲 | 亲 | 2 | 2 | `vcvt` | **2** | |
+| **19.4** | 量化 Conv/Linear | **Cube** | ~1+ | — | — | — | — | 整数 Cube | — | 剔出打分 |
+| **20** | 稀疏（非 MM） | Vec | 43 | 偏向 | 难 | 2 | 0 | `vgather` | **1** | 仍不规则→对方 |
+| **21** | FFT / 信号 | Lib | 31 | 难 | 难 | 0 | 0 | 专用 FFT 库 | **0** | 不走通用 SIMD |
+| **22** | 损失函数 | Vec | 35 | 偏向 | 对方 | 2 | 1 | `vreduce` | **2** | |
+| **23** | 上采样与插值 | Vec | 39 | 偏向 | 难 | 2 | 0 | `vgather` | **1** | 邻域仍别扭→对方 |
+| **24** | Nested / Jagged | Vec | 14 | 偏向 | 对方 | 2 | 1 | 段内 `vload` | **2** | |
+| **25** | 排序 / TopK / Unique | Vec | 10 | 偏向 | 难 | 2 | 0 | **`vsort`/`vmergesort`** | **2** | **难→亲**（见下） |
+| **26** | 数据依赖动态输出 | Vec | 6 | 偏向 | 难 | 2 | 0 | **`vcompress`+`vprefix`** | **2** | 难→亲 |
+| **27** | 特殊函数 | Vec | 37 | 偏向 | 对方 | 2 | 1 | 向量特殊函数近似 | **2** | |
+| **28** | 元信息 / 控制 | Ctrl | 23 | — | — | — | — | — | — | 不入分母 |
+| **29** | 同步 / 序约束 | Ctrl | 4 | — | — | — | — | — | — | 不入分母 |
+
+Cube 类合计 **N_cube ≈ 105**；不参与 Score。
+
+**Pattern 25 升档说明**：基线手写 bitonic/`vcmp`+`vblend` 网络 → SIMD **难(0)**；若 ISA 提供定长 **`vsort`（单向量内排序）** 与跨向量 **`vmergesort`/`vmerge_odd_even`（归并网络积木）**，则 `sort`/`topk`/`argsort` 可拼装为库级原语，SIMD′=**亲(2)**。原型见 §8.4。
 
 ### 2.2 剔除 Cube 后的 SIMT / SIMD 打分
 
-参与集合：上表 **Vec + Lib**（不含 Cube、Ctrl）。  
-`Σ N ≈ 1059`，`Σ (N·s_SIMT) = 1971`，`Σ (N·s_SIMD) = 1326`。
+参与集合：**Vec + Lib**（不含 Cube、Ctrl），`Σ N ≈ 1059`。
 
-| 模式 | Score = Σ(N·s)/ΣN | 换算到满分 2 | 解读 |
-|---|---|---|---|
-| **SIMT** | **1.86** | **93%** | 偏向档按「主侧=2」后，非 Cube 整体强烈亲 SIMT |
-| **SIMD** | **1.25** | **63%** | 双亲大户 + 对方(1) 抬分；难档（gather/动态等）仍拖累 |
+| 模式 | Σ(N·s) | Score=Σ(N·s)/ΣN | /满分2 | 解读 |
+|---|---|---|---|---|
+| **SIMT** | 1971 | **1.86** | **93%** | 非 Cube 整体强烈亲 SIMT |
+| **SIMD（基线）** | 1326 | **1.25** | **63%** | 无特殊原语；gather/sort/scan/reduce 拖累 |
+| **SIMD′（特殊指令后）** | 1974 | **1.86** | **93%** | 与 SIMT 持平；升档来自 reduce/scan/sort/gather/compress 等 |
 
-分档贡献（按计分后的 s 值）：
+```text
+ΔScore_SIMD = Score_SIMD′ − Score_SIMD ≈ 1.86 − 1.25 = +0.61
+```
 
-| s | SIMT 含义 | SIMD 含义 | 代表 |
-|---|---|---|---|
-| 2 | 亲 或 偏向主侧 | 亲 或 偏 SIMD 主侧 | 01/02/15–17/19QDQ；多数偏 SIMT 的主侧；14 的 SIMD |
-| 1 | 对方（偏 SIMD 时） | 对方（偏 SIMT 时） | 03/04/05/… 的 SIMD；14 的 SIMT |
-| 0 | 难 | 难 | 21；SIMD 侧的 06/13/20/23/25/26 |
+升档贡献最大的规格块（`s: 0/1 → 2`）：**05/06/11/12.1/13/18/22/25/26/03/04/07/08/27** 等；**20/23** 仅抬到对方(1)；**21** 仍为 0。
 
 ### 2.3 建议（已剔除 Cube）
 
-1. **默认编程模型选 SIMT**（Score **1.86** ≫ SIMD）：非 Cube 优先 thread/grid 语义。  
-2. **SIMD 作加速层**（Score **1.25**）：优先 **s=2** 族——双亲 `01/02/15/16/17/19QDQ`，以及 **偏 SIMD** 的 `14`；指令见 §3 / **§8.4**。  
-3. **硬件原语换易用性**：优先落地 **定长 `vreduce_*`(+masked)**，其次 `vscan`/`vcompress`/`vgather`；可将 05/11/12.1（及 06/26）SIMD 易用升档（§3.0.1）。  
-4. **SIMD s=0 勿硬扛**：`06/13/20/23/25/26/21`——缺原语时走 SIMT 或先补 ISA。  
-5. **Cube 独立路由**：`09/10/12.2/19.4` → Cube/MMA；epilogue 回 Vec；**不计入**本打分。  
-6. **落地优先级**：Cube 库 → **定长 reduce 等 SIMD 原语** → SIMD 覆盖 s=2 → SIMT 托底 → Ctrl/Lib。
+1. **默认仍可用 SIMT**（基线 Score 1.86）；若目标 ISA **承诺 §2.1 特殊指令集**，则 SIMD′≈SIMT，可 **SIMD 优先实现非 Cube**。  
+2. **基线 SIMD（1.25）**：先覆盖已是 s=2 的双亲族 `01/02/15–17/19QDQ` 与 `14`。  
+3. **指令投资优先级（按抬升 ΣN·Δs）**：  
+   - P0：`vreduce_*`(+masked) → 05/08/11/12.1/22  
+   - P0：`vgather`/`vscatter` → 13（及 04/07/23）  
+   - P1：`vscan`/`vcompress` → 06/26  
+   - P1：**`vsort`/`vmergesort`** → **25**  
+   - P2：`vrng`、向量超越/特殊函数 → 18/03/27  
+4. **Cube** 仍独立：`09/10/12.2/19.4`。  
+5. **度量口径**：对外报告 SIMD 易用性时须声明是 **基线** 还是 **SIMD′（指令优化后）**，避免混比。
 
 复合模块（`nn.Linear`、`nn.MultiheadAttention`）= **Cube + Vec epilogue**，编号仍落在 09/10/12 组合，不单开。
 
@@ -176,6 +185,7 @@ SIMD 易用性取决于算法 **与** ISA 原语。缺原语时需手写 shuffle
 | **掩码规约** `vreduce_*_masked` | 05 尾块、短内维 | 先 blend 中性元 | 中 → 低 |
 | **定长前缀** `vscan`/`vprefix` | 06、26 | 多轮扫描网络 | 中 → 低 |
 | **compress/expand** | 13.3、26 | 前缀和+scatter | 中 → 低 |
+| **定长排序/归并** `vsort`/`vmergesort` | **25** | bitonic 手写网络 | **难 → 亲** |
 | **gather/scatter** | 04、07、13、23 | 标量间接 | 中 → 低 |
 | **谓词访存** `vloadm`/`vstorem` | 01–03 尾块 | 标量 epilogue | 高 → 中 |
 | **向量 RNG** `vrng` | 18 | 标量填 lane | 中 → 低 |
@@ -200,6 +210,7 @@ SIMD 易用性取决于算法 **与** ISA 原语。缺原语时需手写 shuffle
 | `vcvt` | dtype 转换 | 饱和/舍入 |
 | `vprefix`/`vscan` | **定长**有序前缀 | 抬升 06/26 |
 | `vcompress`/`vexpand` | 按 mask 压缩/展开 | 抬升 26 |
+| `vsort`/`vmergesort` | 定长向量排序 / 归并网络积木 | **抬升 25** |
 | `vatomic_*` | 地址原子 | scatter 冲突 |
 | `vrng` | 向量随机 | |
 | `MMA/Cube` | Cube 类矩阵加速 | 不计入 §2 SIMD 分 |
@@ -475,10 +486,10 @@ SIMD 易用性取决于算法 **与** ISA 原语。缺原语时需手写 shuffle
 
 ### Pattern 25 — 排序 / TopK / Unique
 
-| 子类 | 典型算子 | 备注 | SIMT 易用 | SIMD 易用 | SIMD 典型指令特征 |
+| 子类 | 典型算子 | 备注（含硬件依赖） | SIMT 易用 | SIMD 易用 | SIMD 典型指令特征 |
 |---|---|---|---|---|---|
-| **25.1** 排序选择 | `sort`、`argsort`、`topk`、`kthvalue`、`msort` | 比较网络；dim 指定 | 中 | 中～低（bitonic/`vcmp`+`vblend` 网络） | `vcmp`、`vblend`、`vmin`/`vmax`、`vshuf`；大 topk 用堆（标量友好） |
-| **25.2** Unique / 成员 | `unique`、`unique_consecutive`、`_unique2`、`isin` | `unique` 输出长度数据依赖 → 亦标 26 | 中 | 低 | 排序后 `vcmp` 邻差 + `vcompress`；或哈希（SIMT 更自然） |
+| **25.1** 排序选择 | `sort`、`argsort`、`topk`、`kthvalue`、`msort` | 基线手写 bitonic；**有定长 `vsort`+跨块 `vmergesort` 则 SIMD′=亲(2)**（总表） | 中 | **亲（有 vsort/mergesort）/ 难～低（无）** | **`vsort`**、**`vmergesort`/`vmerge_odd_even`**、`vcmp`/`vblend`；无则 `vshuf` 网络（§8.4） |
+| **25.2** Unique / 成员 | `unique`、`unique_consecutive`、`_unique2`、`isin` | 常先排序；依赖 25.1 + `vcompress` | 中 | 中（有 sort+compress）/ 低（无） | `vsort` 后 `vcmp` 邻差 + **`vcompress`** |
 
 ---
 
@@ -852,6 +863,31 @@ template<class T, int VL>
 vec<T,VL> vexpand_load(const T* in, mask_t<VL> m);
 // 按 m 把紧凑输入展开到向量（其余 lane 未定义或零）
 
+// ---- 定长排序 / 归并（抬升 Pattern 25：sort / topk / argsort）----
+// 语义：单向量内全序排序；stable 可选。返回值向量；argsort 另返索引。
+enum class sort_order { asc, desc };
+
+template<class T, int VL>
+vec<T,VL> vsort(vec<T,VL> v, sort_order ord = sort_order::asc);
+
+template<class T, int VL>
+struct sorted_t { vec<T,VL> keys; vec<int,VL> idx; };
+template<class T, int VL>
+sorted_t<T,VL> vargsort(vec<T,VL> v, sort_order ord = sort_order::asc);
+
+// 跨向量归并积木：输入 a、b 各自已有序，输出长度为 2·VL 的有序对（或写回两个 vec）
+template<class T, int VL>
+void vmergesort(vec<T,VL> a, vec<T,VL> b, vec<T,VL>& lo, vec<T,VL>& hi,
+                sort_order ord = sort_order::asc);
+// 等价别名 / 网络积木：
+//   vmerge_odd_even(a,b)  — odd-even 归并一层
+//   vbitonic_merge(a,b)   — bitonic 归并一层
+// 大数组 = 分块 vsort + 多轮 vmergesort（库级 mergesort / bitonic）
+
+// 掩码部分排序（TopK 热路径）：仅对 m=true 的有效 lane 排序，无效 lane 沉底/置哨兵
+template<class T, int VL>
+vec<T,VL> vsort_masked(vec<T,VL> v, mask_t<VL> m, sort_order ord = sort_order::asc);
+
 // ---- 其它 ----
 template<class T, int VL>
 vec<T,VL> vrng(rng_state& st);        // 向量随机（Pattern 18）
@@ -871,11 +907,12 @@ void vatomic_add(T* base, vec<int,VL> idx, vec<T,VL> v); // scatter-add
 | P0 | **`vreduce_{add,max,min}` + `_masked`** | **05/11/12.1 从中/对方 → 高** |
 | P1 | `vscan`/`vprefix`、`vcompress` | 06、26 |
 | P1 | `vgather`/`vscatter`、`vtranspose` | 13、14、23 |
+| P1 | **`vsort` / `vmergesort`（+ `vargsort`/`vsort_masked`）** | **25 难→亲（SIMD′=2）** |
 | P2 | `vrng`、`vreduce_*_arg`、超越函数近似 | 18、05.2、03 |
 | — | Cube/MMA | 09/10/12.2（独立路由） |
 
-**缺省回退**：无 `vreduce` 时用 `log2(VL)` 级 `vshuf`+`vhadd` 软件树，并在备注中把该 Pattern SIMD 易用性标低一档（与 §3.0.1 表一致）。
+**缺省回退**：无 `vreduce` 时用 `log2(VL)` 级 `vshuf`+`vhadd` 软件树；无 `vsort`/`vmergesort` 时用 `vcmp`+`vblend`/`vshuf` 手写 bitonic，并把 Pattern **25** 的 SIMD 易用性标为 **难**（基线 `s_SIMD=0`，与总表一致）。
 
 ---
 
-*本文以核心功能 + 数字 Pattern 组织 PyTorch 三千量级底层算子；同步特征见 Pattern 29；SIMD 易用性与硬件定长原语（尤其 `vreduce`）绑定，原型见 §8.4。*
+*本文以核心功能 + 数字 Pattern 组织 PyTorch 三千量级底层算子；同步特征见 Pattern 29；SIMD 易用性分 **基线** 与 **特殊指令后（SIMD′，含 `vreduce`/`vsort`/`vmergesort` 等）** 两档，原型见 §8.4。*
