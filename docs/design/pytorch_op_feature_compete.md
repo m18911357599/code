@@ -662,6 +662,7 @@ notes:  # 如 “NCCL wait 默认为 stream-order，非 Host-block”
 | 新增功能族 | 追加 Pattern 30+；不复用已有数字 |
 | 算子迁类 | 改 §3 典型列表与备注，更新交叉表 §4 |
 | 同步语义变更 | 更新 §7 特征矩阵与 Host-block / stream-order 注记 |
+| SIMT/SIMD 映射变更 | 更新 §3.0 助记表与各 Pattern 末列 |
 | 统计口径变化 | 更新 §1.1 |
 
 ---
