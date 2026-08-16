@@ -8,6 +8,8 @@ CCU / HCOMM 相关分析笔记与工具。
 - [PyTorch 算子特征分类、API 特征与同步特征提取](docs/design/pytorch_op_feature_compete.md)
 - [CUDA L2 Cache Persistence 控制机制](docs/cuda/a.md)
 - [下一代调试调优度量体系（三档性能 + 六类负载亲和）](docs/下一代调试调优度量体系.md)
+  - 目录接口：分类 → 度量项 → 度量子项（文首）
+  - 机读目录：[docs/metrics/catalog.yaml](docs/metrics/catalog.yaml)
 
 ## 工具
 
