@@ -1,0 +1,19 @@
+# A3 super-pod dialect (version 1.2)
+ranktable 1.2 {
+  status completed
+
+  server "node_0" host 172.16.0.100 {
+    device 0 sdid 0 ip 192.168.1.6 port 16666 backup_ip 192.168.1.7 backup_port 16667 host_port 16665 rank 0
+    device 1 sdid 1 ip 192.168.1.7 port 16666 backup_ip 192.168.1.6 backup_port 16667 host_port 16666 rank 1
+  }
+
+  server "node_1" host 172.16.0.101 {
+    device 0 sdid 4 ip 192.168.2.6 port 16666 backup_ip 192.168.2.7 backup_port 16667 host_port 16665 rank 2
+    device 1 sdid 5 ip 192.168.2.7 port 16666 backup_ip 192.168.2.6 backup_port 16667 host_port 16666 rank 3
+  }
+
+  super_pod 0 {
+    server "node_0"
+    server "node_1"
+  }
+}

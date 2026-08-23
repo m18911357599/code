@@ -1,0 +1,65 @@
+# Atlas 350 / Ascend 950: intra-server TOPO_FILE_DESC + inter-server CLOS
+ranktable 2.0 {
+  status completed
+
+  rank 0 {
+    local 0
+    device 0
+    device_port 16666
+    host_port 16665
+
+    level 0 "az0-rack0-pod0" TOPO_FILE_DESC {
+      addr IPV4 172.16.0.10 ports [1/0]
+    }
+    level 1 "az0" CLOS {
+      addr IPV4 172.16.0.15 ports [0/4, 0/5, 0/6, 0/7] plane plane0
+      addr IPV4 172.16.0.5  ports [1/5, 1/6]           plane plane1
+                     backup [172.16.0.6]
+    }
+
+    control_plane IPV4 172.16.0.100 listen 16666
+  }
+
+  rank 1 {
+    local 1
+    device 1
+    device_port 16667
+    host_port 16666
+
+    level 0 "az0-rack0-pod0" TOPO_FILE_DESC {
+      addr IPV4 172.16.0.28 ports [1/0]
+    }
+    level 1 "az0" CLOS {
+      addr IPV4 172.16.0.33 ports [0/4, 0/5, 0/6, 0/7] plane plane2
+      addr IPV4 172.16.0.23 ports [1/5, 1/6]           plane plane3
+    }
+  }
+
+  rank 2 {
+    local 0
+    device 0
+    device_port 16668
+
+    level 0 "az0-rack0-pod1" TOPO_FILE_DESC {
+      addr IPV4 172.16.1.10 ports [1/0]
+    }
+    level 1 "az0" CLOS {
+      addr IPV4 172.16.1.15 ports [0/4, 0/5, 0/6, 0/7] plane plane0
+      addr IPV4 172.16.1.5  ports [1/5, 1/6]           plane plane1
+    }
+  }
+
+  rank 3 {
+    local 1
+    device 1
+    device_port 16669
+
+    level 0 "az0-rack0-pod1" TOPO_FILE_DESC {
+      addr IPV4 172.16.1.28 ports [1/0]
+    }
+    level 1 "az0" CLOS {
+      addr IPV4 172.16.1.33 ports [0/4, 0/5, 0/6, 0/7] plane plane2
+      addr IPV4 172.16.1.23 ports [1/5, 1/6]           plane plane3
+    }
+  }
+}

@@ -1,0 +1,15 @@
+# hcomm examples/.../rank_table.json
+ranktable 1.0 {
+  status completed
+
+  server "SERVER_ID_SV1" {
+    device 0 ip 192.168.1.8  rank 0
+    device 1 ip 192.168.1.9  rank 1
+    device 2 ip 192.168.1.10 rank 2
+    device 3 ip 192.168.1.11 rank 3
+    device 4 ip 192.168.1.12 rank 4
+    device 5 ip 192.168.1.13 rank 5
+    device 6 ip 192.168.1.14 rank 6
+    device 7 ip 192.168.1.15 rank 7
+  }
+}
