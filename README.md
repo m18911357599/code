@@ -4,6 +4,7 @@ CCU / HCOMM 相关分析笔记与工具。
 
 ## 文档
 
+- [微架构易用性度量](measure.md)（26 Pattern 各自 $\eta_j$；7 度量项权重 $\Omega_c$ 与度量方法）
 - [HCOMM CCU 底层指令格式分析](docs/ccu/01-underlying-instruction-format.md)
 - [PyTorch 算子特征分类、API 特征与同步特征提取](docs/design/pytorch_op_feature_compete.md)
 - [CUDA L2 Cache Persistence 控制机制](docs/cuda/a.md)
