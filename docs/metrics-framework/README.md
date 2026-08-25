@@ -9,7 +9,7 @@
 | G0 主观档 | [`docs/design/pytorch_op_feature_compete.md`](../design/pytorch_op_feature_compete.md) | `main` | SIMT/SIMD「亲 / 偏向 / 难」打分；Pattern 29 同步分类 |
 | G1 三档加权 | [`docs/下一代调试调优度量体系.md`](../下一代调试调优度量体系.md) | `main` | A–E 五维、60/90/99% 档位、四锚点分段、红线降到 59 |
 | G2 软件税坐标系 | [`docs/design/hw_usability_from_software.md`](https://github.com/m18911357599/code/blob/cursor/hw-usability-metrics-3c96/docs/design/hw_usability_from_software.md) | PR [#12](https://github.com/m18911357599/code/pull/12)（未合入） | 六轴客观计数：税种 × 层 × 计量 × 义务 × 可见性 × 作用域 |
-| G3 七章体例 | [`docs/next.md`](https://github.com/m18911357599/code/blob/cursor/metrics-affinity-classes-8bb9/docs/next.md) | PR [#13](https://github.com/m18911357599/code/pull/13)（未合入） | 总则 + `S1`–`S7` / `Sx-Dy`；红线把总分打到 0 |
+| G3 七章体例 | [`docs/next_me.md`](../next_me.md)（源自 PR13 的 `docs/next.md`） | PR [#13](https://github.com/m18911357599/code/pull/13)（未合入） | 总则 + `S1`–`S7` / `Sx-Dy`；红线把总分打到 0 |
 
 G1 引用的《度量.xlsx》《下一代调试调优度量方案.md》《易用性度量.md》**不在本仓库**。审计只对仓库内可检出的 Markdown。
 

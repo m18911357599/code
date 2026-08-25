@@ -157,7 +157,7 @@ S-LOC、ΔS-LOC、S-Ratio、S-N、S-Implicit、Tail-LOC、Cover、Gap-I、Space-
 
 ---
 
-## 4. G3 审计（PR #13，`docs/next.md`）
+## 4. G3 审计（PR #13，`docs/next.md`；本分支副本 `docs/next_me.md`）
 
 ### 4.1 结构
 
