@@ -10,7 +10,8 @@
 > - `src/coll_communicator_mgr/rank_graph/rank_graph_builder/rank_graph_builder.cc`
 > - 样例：`examples/01_communicators/02_one_device_per_process_rank_table/`
 
-配套工具：[`tools/ranktable_dsl/`](../../tools/ranktable_dsl/README.md)。
+配套工具：[`tools/ranktable_dsl/`](../../tools/ranktable_dsl/README.md)。  
+算子侧用法：[`docs/hcomm/02-coll-op-topo-alg-dsl.md`](02-coll-op-topo-alg-dsl.md)。
 
 ---
 

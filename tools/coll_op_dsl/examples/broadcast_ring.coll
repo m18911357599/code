@@ -1,0 +1,7 @@
+topo from "v2_two_layer.rt"
+
+operator Broadcast {
+  count 4
+  root 0
+  use ring on layer 1
+}

@@ -1,0 +1,7 @@
+topo from "v2_two_layer.rt"
+
+operator AllReduce {
+  reduce SUM
+  count 8
+  use recursive_hd on layer 1
+}

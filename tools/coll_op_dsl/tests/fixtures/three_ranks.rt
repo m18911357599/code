@@ -1,0 +1,18 @@
+ranktable 2.0 {
+  status completed
+  rank 0 {
+    local 0
+    device 0
+    level 0 node TOPO_FILE_DESC { addr IPV4 10.0.0.1 ports [0/0] }
+  }
+  rank 1 {
+    local 1
+    device 1
+    level 0 node TOPO_FILE_DESC { addr IPV4 10.0.0.2 ports [0/1] }
+  }
+  rank 2 {
+    local 2
+    device 2
+    level 0 node TOPO_FILE_DESC { addr IPV4 10.0.0.3 ports [0/2] }
+  }
+}
