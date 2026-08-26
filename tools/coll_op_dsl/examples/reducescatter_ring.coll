@@ -1,0 +1,7 @@
+topo from "v2_two_layer.rt"
+
+operator ReduceScatter {
+  reduce SUM
+  count 8
+  use ring on layer 1
+}

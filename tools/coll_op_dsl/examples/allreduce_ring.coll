@@ -1,0 +1,14 @@
+# AllReduce on the CLOS layer (flat ring over all ranks)
+topo from "v2_two_layer.rt"
+
+algo ring {
+  match ranks >= 2
+  pattern ring
+}
+
+operator AllReduce {
+  reduce SUM
+  dtype i32
+  count 8
+  use ring on layer 1
+}

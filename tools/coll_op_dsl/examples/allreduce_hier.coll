@@ -1,0 +1,15 @@
+# Same AllReduce, hierarchical template: intra RS @ L0, inter AR @ slots, intra AG
+topo from "v2_two_layer.rt"
+
+algo hierarchical {
+  match layers >= 2
+  intra ring on layer 0
+  inter ring on layer 1
+}
+
+operator AllReduce {
+  reduce SUM
+  dtype i32
+  count 8
+  use hierarchical
+}

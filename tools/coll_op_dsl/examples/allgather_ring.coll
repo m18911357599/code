@@ -1,0 +1,6 @@
+topo from "v2_two_layer.rt"
+
+operator AllGather {
+  count 2
+  use ring on layer 1
+}
