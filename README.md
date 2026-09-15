@@ -5,6 +5,7 @@ CCU / HCOMM 相关分析笔记与工具。
 ## 文档
 
 - [HCOMM CCU 底层指令格式分析](docs/ccu/01-underlying-instruction-format.md)
+- [asc-devkit 通信编程能力架构（1 页 PPT）](docs/ppt/asc_devkit_comm_arch.pptx)
 - [PyTorch 算子特征分类、API 特征与同步特征提取](docs/design/pytorch_op_feature_compete.md)
 - [CUDA L2 Cache Persistence 控制机制](docs/cuda/a.md)
 
