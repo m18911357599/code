@@ -7,7 +7,7 @@ CCU / HCOMM 相关分析笔记与工具。
 - [HCOMM CCU 底层指令格式分析](docs/ccu/01-underlying-instruction-format.md)
 - [PyTorch 算子特征分类、API 特征与同步特征提取](docs/design/pytorch_op_feature_compete.md)
 - [CUDA L2 Cache Persistence 控制机制](docs/cuda/a.md)
-- [昇腾 Cube L0A/L0B 相对 L1 的必要性（软件模型）](docs/ascend/l0a_l0b_necessity.md)
+- [昇腾 Cube 引入 L0A/L0B 的必要性评估](docs/ascend/l0a_l0b_necessity.md)
 
 ## 工具
 
