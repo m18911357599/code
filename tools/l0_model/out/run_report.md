@@ -11,11 +11,16 @@ Self-check:
 - OK MMAD-from-L1 μ=1 T=262144 vs L0A T=262144 (A-pipe T_A/T_cube=1 at 512 B/cyc); μ=64 T=262144
 - OK ablation 1024^3 L0A-only 532680 bound=mte1; L0B-only 270474 bound=cube
 - OK wide-N 1024x4096x1024 L0A+L0B 1053834 vs L0B-only 1053833 (1.00x L0A extra)
+- OK balance pair=256, B-port hide pair=128, shared native MTE1=3 T_cube
+- OK SplitA dual Cube-width cancel L0 T=67584 == gold 67584
+- OK SplitA+B ρ*=0.40 holds full C 256x128, η=1
+- OK balance SRAM m0=512 L0C=2097152 tot=2162688 > current 655360
+- OK 384² 搬入Bound ρ*=0.90 tile 256x288 pair=135.5
 
 ## Closed-form necessities (independent of the tiler)
 - Cube FP16 peak: 4096 MAC/cyc. A-port at n=16: `P*s/n = 512 B/cyc` (matches L1→L0A=512).
 - B-port at m=16: `512 B/cyc`, but L1→L0B=256. A-fill hide `n_l0 >= 16`; B-fill hide `m_l0 >= 32`.
-- 搬入-bound iff `mn/(m+n) < P*s/B_GM = 256`. Square GEMM needs m=n>`512` to be compute-bound from HBM.
+- 搬入-bound iff `mn/(m+n) < P*s/B_GM = 256`. Square GEMM needs m=n>`512` to be compute-bound from HBM. Native B-port 256 hides behind GM iff pair ≤ 128. Compute-bound range: pair≥256 (no sweep).
 - Without L0A, L1 A-traffic is `m*K*s*(n/16)`; without L0B, L1 B-traffic is `n*K*s*(m/16)`.
 - L1 ping-pong working set `2*k_l1*(m+n)*s`; L0A ping-pong `2*m0*k0*s`. Ratio `L0A/L1 ≈ (m0*k0)/(k_l1*(m+n))`. With typical k_l1=4..8 k0 and m≈n, ratio ≈ 1/8 to 1/16.
 - **1-core 1024^3**: per-core 1024x1024x1024, pair=512.0 (计算Bound); no-L0 T≈786.4k (A-reload 64x, B-reload 64x) vs L0 T≈262.1k → **3.00x**.
@@ -120,6 +125,141 @@ Roofline note: T_A(MMAD)/T_cube = P s / (C B_A) = 1 when B_A=512, independent of
 | SplitK | 1024×1024×32 | 64 | 32768 | 65536 | 65536 | 64.0 | 64.0 |
 | SplitA+B | 256×128×1024 | 8 | 4096 | 16384 | 8192 | 8.0 | 16.0 |
 
+### Cancel L0A+L0B, boost L1→MMAD on A and B (搬入Bound)
+
+Balance T_cube=T_GM (η=1): pair mn/(m+n) = 256 (square m=n=512). Native B port 256 hides behind GM iff pair ≤ 128 (T_GM ≥ 2 T_cube). Compute-bound range pair≥256: no sweep.
+
+| split | m×n×k | pair | regime | port | μ_A | μ_B | B_A | B_B | T_A | T_B | T_MTE1 | T | bound | vs L0A+L0B |
+|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|
+| SplitA | 32×1024×1024 | 31.0 | 强搬入 pair≤128 | dual | 1 | 1 | 512 | 256 | 8.2k | 16.4k | 16.4k | 67.6k | gm | 1.00× |
+| SplitA | 32×1024×1024 | 31.0 | 强搬入 pair≤128 | dual | 1 | 2 | 512 | 512 | 8.2k | 8.2k | 8.2k | 67.6k | gm | 1.00× |
+| SplitA | 32×1024×1024 | 31.0 | 强搬入 pair≤128 | dual | 2 | 2 | 1024 | 512 | 4.1k | 8.2k | 8.2k | 67.6k | gm | 1.00× |
+| SplitA | 32×1024×1024 | 31.0 | 强搬入 pair≤128 | shared | 1 | 1 | 512 | 256 | 8.2k | 16.4k | 24.6k | 67.6k | gm | 1.00× |
+| SplitA | 32×1024×1024 | 31.0 | 强搬入 pair≤128 | shared | 1 | 2 | 512 | 512 | 8.2k | 8.2k | 16.4k | 67.6k | gm | 1.00× |
+| SplitA | 32×1024×1024 | 31.0 | 强搬入 pair≤128 | shared | 2 | 2 | 1024 | 512 | 4.1k | 8.2k | 12.3k | 67.6k | gm | 1.00× |
+| SplitB | 1024×32×1024 | 31.0 | 强搬入 pair≤128 | dual | 1 | 1 | 512 | 256 | 8.2k | 16.4k | 16.4k | 67.6k | gm | 1.00× |
+| SplitB | 1024×32×1024 | 31.0 | 强搬入 pair≤128 | dual | 1 | 2 | 512 | 512 | 8.2k | 8.2k | 8.2k | 67.6k | gm | 1.00× |
+| SplitB | 1024×32×1024 | 31.0 | 强搬入 pair≤128 | dual | 2 | 2 | 1024 | 512 | 4.1k | 8.2k | 8.2k | 67.6k | gm | 1.00× |
+| SplitB | 1024×32×1024 | 31.0 | 强搬入 pair≤128 | shared | 1 | 1 | 512 | 256 | 8.2k | 16.4k | 24.6k | 67.6k | gm | 1.00× |
+| SplitB | 1024×32×1024 | 31.0 | 强搬入 pair≤128 | shared | 1 | 2 | 512 | 512 | 8.2k | 8.2k | 16.4k | 67.6k | gm | 1.00× |
+| SplitB | 1024×32×1024 | 31.0 | 强搬入 pair≤128 | shared | 2 | 2 | 1024 | 512 | 4.1k | 8.2k | 12.3k | 67.6k | gm | 1.00× |
+| SplitA+B | 256×128×1024 | 85.3 | 强搬入 pair≤128 | dual | 1 | 1 | 512 | 256 | 8.2k | 16.4k | 16.4k | 24.6k | gm | 1.00× |
+| SplitA+B | 256×128×1024 | 85.3 | 强搬入 pair≤128 | dual | 1 | 2 | 512 | 512 | 8.2k | 8.2k | 8.2k | 24.6k | gm | 1.00× |
+| SplitA+B | 256×128×1024 | 85.3 | 强搬入 pair≤128 | dual | 2 | 2 | 1024 | 512 | 4.1k | 8.2k | 8.2k | 24.6k | gm | 1.00× |
+| SplitA+B | 256×128×1024 | 85.3 | 强搬入 pair≤128 | shared | 1 | 1 | 512 | 256 | 8.2k | 16.4k | 24.6k | 24.6k | gm | 1.00× |
+| SplitA+B | 256×128×1024 | 85.3 | 强搬入 pair≤128 | shared | 1 | 2 | 512 | 512 | 8.2k | 8.2k | 16.4k | 24.6k | gm | 1.00× |
+| SplitA+B | 256×128×1024 | 85.3 | 强搬入 pair≤128 | shared | 2 | 2 | 1024 | 512 | 4.1k | 8.2k | 12.3k | 24.6k | gm | 1.00× |
+
+计算Bound 场景不扫（pair≥256）：SplitK 核上 1024×1024，pair=512。该范围内有 L0 时 T=T_cube；取消 L0 且 B 口仍 256 则 T≥2 T_cube，直到 μ_B≥2。
+
+T_A/T_cube=1/μ_A, T_B/T_cube=2/μ_B. Dual Cube-width (μ_A=1, μ_B=2, B_A=B_B=512) gives T_MTE1=T_cube, time-matches L0 on both 搬入 and 计算 Bound. Shared native (μ=1,1) is T_MTE1=3 T_cube; shared Cube-width is 2 T_cube. Traffic match still needs μ_A*=n/C, μ_B*=m/C.
+
+### Shared L1→Cube bus width to hide behind GM or Cube
+
+| split | pair | B_shared ≥ 4·pair (≤T_GM) | B_shared ≥ 1024 (≤T_cube) | native 512+256=768 hide GM? |
+|---|---|---|---|---|
+| SplitA | 31.0 | 124 | 1024 | yes |
+| SplitB | 31.0 | 124 | 1024 | yes |
+| SplitK | 512.0 | 计算Bound 范围 pair≥256 | 1024 | — |
+| SplitA+B | 85.3 | 341 | 1024 | yes |
+
+### L1 vs L0C under S_L1+S_L0C constant (搬入Bound)
+
+Current S_tot = L1+L0C = 655360 B (640KB). Reclaim L0A+L0B → 786432 B (768KB). Ping-pong L0C: S_L0C=8 m0 n0. L1 ping-pong min k_l1=16: S_L1=64(m0+n0).
+
+Compute/bandwidth balance (square): m0=n0=512, pair=256. Need S_L0C=2097152 B (2048KB) ping-pong or 1048576 B (1024KB) single-buffer, plus S_L1≥65536 B. Total ≥ 2112KB (pp) / 1088KB (single). 640KB cannot reach the balance point; remains 搬入Bound.
+
+#### Best ρ at S_tot=640KB (搬入Bound splits only)
+
+| split | m×n×k | pair | full-C S_L0C | ρ* | S_L1* | m0×n0 | k_l1 | ηA | ηB | T_GM | T | bound | vs η=1 |
+|---|---|---|---|---|---|---|---|---|---|---|---|---|---|
+| SplitA | 32×1024×1024 | 31.0 | 262144 | 0.40 | 393216 | 32×1024 | 80 | 1.00 | 1.00 | 67.6k | 67.6k | gm | 1.00× |
+| SplitB | 1024×32×1024 | 31.0 | 262144 | 0.40 | 393216 | 1024×32 | 80 | 1.00 | 1.00 | 67.6k | 67.6k | gm | 1.00× |
+| SplitK | 1024×1024×32 | 512.0 | — | 计算Bound 范围 pair≥256，不扫 ρ | — | — | — | — | — | — | — | — | — |
+| SplitA+B | 256×128×1024 | 85.3 | 262144 | 0.40 | 393216 | 256×128 | 256 | 1.00 | 1.00 | 24.6k | 24.6k | gm | 1.00× |
+
+ρ sweep (S_tot=640KB), 搬入Bound only:
+
+| split | ρ | S_L0C | S_L1 | m0×n0 | k_l1 | ηA,ηB | T_GM | bound |
+|---|---|---|---|---|---|---|---|---|
+| SplitA | 0.1 | 65536 | 589824 | 32×256 | 512 | 4.0,1.0 | 73.7k | gm |
+| SplitA | 0.2 | 131072 | 524288 | 32×512 | 240 | 2.0,1.0 | 69.6k | gm |
+| SplitA | 0.3 | 196608 | 458752 | 32×768 | 128 | 1.3,1.0 | 68.3k | gm |
+| SplitA | 0.4 | 262144 | 393216 | 32×1024 | 80 | 1.0,1.0 | 67.6k | gm |
+| SplitA | 0.5 | 327680 | 327680 | 32×1024 | 64 | 1.0,1.0 | 67.6k | gm |
+| SplitA | 0.6 | 393216 | 262144 | 32×1024 | 48 | 1.0,1.0 | 67.6k | gm |
+| SplitA | 0.7 | 458752 | 196608 | 32×1024 | 32 | 1.0,1.0 | 67.6k | gm |
+| SplitA | 0.8 | 524288 | 131072 | 32×1024 | 16 | 1.0,1.0 | 67.6k | gm |
+| SplitA | 0.9 | 589824 | 65536 | 32×512 | 16 | 2.0,1.0 | 69.6k | gm |
+| SplitB | 0.1 | 65536 | 589824 | 256×32 | 512 | 1.0,4.0 | 73.7k | gm |
+| SplitB | 0.2 | 131072 | 524288 | 512×32 | 240 | 1.0,2.0 | 69.6k | gm |
+| SplitB | 0.3 | 196608 | 458752 | 768×32 | 128 | 1.0,1.3 | 68.3k | gm |
+| SplitB | 0.4 | 262144 | 393216 | 1024×32 | 80 | 1.0,1.0 | 67.6k | gm |
+| SplitB | 0.5 | 327680 | 327680 | 1024×32 | 64 | 1.0,1.0 | 67.6k | gm |
+| SplitB | 0.6 | 393216 | 262144 | 1024×32 | 48 | 1.0,1.0 | 67.6k | gm |
+| SplitB | 0.7 | 458752 | 196608 | 1024×32 | 32 | 1.0,1.0 | 67.6k | gm |
+| SplitB | 0.8 | 524288 | 131072 | 1024×32 | 16 | 1.0,1.0 | 67.6k | gm |
+| SplitB | 0.9 | 589824 | 65536 | 512×32 | 16 | 1.0,2.0 | 69.6k | gm |
+| SplitA+B | 0.1 | 65536 | 589824 | 64×128 | 768 | 1.0,4.0 | 49.2k | gm |
+| SplitA+B | 0.2 | 131072 | 524288 | 128×128 | 512 | 1.0,2.0 | 32.8k | gm |
+| SplitA+B | 0.3 | 196608 | 458752 | 192×128 | 352 | 1.0,1.3 | 27.3k | gm |
+| SplitA+B | 0.4 | 262144 | 393216 | 256×128 | 256 | 1.0,1.0 | 24.6k | gm |
+| SplitA+B | 0.5 | 327680 | 327680 | 256×128 | 208 | 1.0,1.0 | 24.6k | gm |
+| SplitA+B | 0.6 | 393216 | 262144 | 256×128 | 160 | 1.0,1.0 | 24.6k | gm |
+| SplitA+B | 0.7 | 458752 | 196608 | 256×128 | 128 | 1.0,1.0 | 24.6k | gm |
+| SplitA+B | 0.8 | 524288 | 131072 | 256×128 | 80 | 1.0,1.0 | 24.6k | gm |
+| SplitA+B | 0.9 | 589824 | 65536 | 256×128 | 32 | 1.0,1.0 | 24.6k | gm |
+
+#### Best ρ at S_tot=768KB (搬入Bound splits only)
+
+| split | m×n×k | pair | full-C S_L0C | ρ* | S_L1* | m0×n0 | k_l1 | ηA | ηB | T_GM | T | bound | vs η=1 |
+|---|---|---|---|---|---|---|---|---|---|---|---|---|---|
+| SplitA | 32×1024×1024 | 31.0 | 262144 | 0.40 | 471859 | 32×1024 | 96 | 1.00 | 1.00 | 67.6k | 67.6k | gm | 1.00× |
+| SplitB | 1024×32×1024 | 31.0 | 262144 | 0.40 | 471859 | 1024×32 | 96 | 1.00 | 1.00 | 67.6k | 67.6k | gm | 1.00× |
+| SplitK | 1024×1024×32 | 512.0 | — | 计算Bound 范围 pair≥256，不扫 ρ | — | — | — | — | — | — | — | — | — |
+| SplitA+B | 256×128×1024 | 85.3 | 262144 | 0.40 | 471859 | 256×128 | 304 | 1.00 | 1.00 | 24.6k | 24.6k | gm | 1.00× |
+
+ρ sweep (S_tot=768KB), 搬入Bound only:
+
+| split | ρ | S_L0C | S_L1 | m0×n0 | k_l1 | ηA,ηB | T_GM | bound |
+|---|---|---|---|---|---|---|---|---|
+| SplitA | 0.1 | 78643 | 707789 | 32×304 | 512 | 3.4,1.0 | 72.4k | gm |
+| SplitA | 0.2 | 157286 | 629146 | 32×608 | 240 | 1.7,1.0 | 69.0k | gm |
+| SplitA | 0.3 | 235930 | 550502 | 32×912 | 144 | 1.1,1.0 | 67.8k | gm |
+| SplitA | 0.4 | 314573 | 471859 | 32×1024 | 96 | 1.0,1.0 | 67.6k | gm |
+| SplitA | 0.5 | 393216 | 393216 | 32×1024 | 80 | 1.0,1.0 | 67.6k | gm |
+| SplitA | 0.6 | 471859 | 314573 | 32×1024 | 64 | 1.0,1.0 | 67.6k | gm |
+| SplitA | 0.7 | 550502 | 235930 | 32×1024 | 48 | 1.0,1.0 | 67.6k | gm |
+| SplitA | 0.8 | 629146 | 157286 | 32×1024 | 32 | 1.0,1.0 | 67.6k | gm |
+| SplitA | 0.9 | 707789 | 78643 | 32×1024 | 16 | 1.0,1.0 | 67.6k | gm |
+| SplitB | 0.1 | 78643 | 707789 | 304×32 | 512 | 1.0,3.4 | 72.4k | gm |
+| SplitB | 0.2 | 157286 | 629146 | 608×32 | 240 | 1.0,1.7 | 69.0k | gm |
+| SplitB | 0.3 | 235930 | 550502 | 912×32 | 144 | 1.0,1.1 | 67.8k | gm |
+| SplitB | 0.4 | 314573 | 471859 | 1024×32 | 96 | 1.0,1.0 | 67.6k | gm |
+| SplitB | 0.5 | 393216 | 393216 | 1024×32 | 80 | 1.0,1.0 | 67.6k | gm |
+| SplitB | 0.6 | 471859 | 314573 | 1024×32 | 64 | 1.0,1.0 | 67.6k | gm |
+| SplitB | 0.7 | 550502 | 235930 | 1024×32 | 48 | 1.0,1.0 | 67.6k | gm |
+| SplitB | 0.8 | 629146 | 157286 | 1024×32 | 32 | 1.0,1.0 | 67.6k | gm |
+| SplitB | 0.9 | 707789 | 78643 | 1024×32 | 16 | 1.0,1.0 | 67.6k | gm |
+| SplitA+B | 0.1 | 78643 | 707789 | 144×64 | 848 | 2.0,1.8 | 47.3k | gm |
+| SplitA+B | 0.2 | 157286 | 629146 | 144×128 | 576 | 1.0,1.8 | 30.9k | gm |
+| SplitA+B | 0.3 | 235930 | 550502 | 224×128 | 384 | 1.0,1.1 | 25.7k | gm |
+| SplitA+B | 0.4 | 314573 | 471859 | 256×128 | 304 | 1.0,1.0 | 24.6k | gm |
+| SplitA+B | 0.5 | 393216 | 393216 | 256×128 | 256 | 1.0,1.0 | 24.6k | gm |
+| SplitA+B | 0.6 | 471859 | 314573 | 256×128 | 192 | 1.0,1.0 | 24.6k | gm |
+| SplitA+B | 0.7 | 550502 | 235930 | 256×128 | 144 | 1.0,1.0 | 24.6k | gm |
+| SplitA+B | 0.8 | 629146 | 157286 | 256×128 | 96 | 1.0,1.0 | 24.6k | gm |
+| SplitA+B | 0.9 | 707789 | 78643 | 256×128 | 48 | 1.0,1.0 | 24.6k | gm |
+
+#### C does not fit: square 384×384×1024 (pair=192<256, 搬入Bound)
+
+| S_tot | ρ* | S_L0C | S_L1 | m0×n0 | pair_tile | T_GM | T_GM(η=1) | bound |
+|---|---|---|---|---|---|---|---|---|
+| 640KB | 0.90 | 589824 | 65536 | 256×288 | 135.5 | 69.6k | 49.2k | gm |
+| 768KB | 0.90 | 707789 | 78643 | 256×336 | 145.3 | 65.0k | 49.2k | gm |
+
+Closed form when C does not fit, square ping-pong, min k_l1=16: 8t²+128t=S_tot ⇒ t=-8+√(64+S_tot/8). 640KB: t≈278.3; 768KB: t≈305.6. ρ=8t²/S_tot ≈ 0.90. Extra SRAM after min L1 staging goes to L0C.
+
 
 ## Hierarchy ablation
 
@@ -216,4 +356,13 @@ Roofline note: T_A(MMAD)/T_cube = P s / (C B_A) = 1 when B_A=512, independent of
 | (1024, 1024, 1024, 32, '2D') | 258048 | 4096 | 4096 | 0.016 | 0.016 | 0.032 | split=2D blockNum=32 per-core (256,128,1024); tile m=256 n=128 k1=336 m0=128 n0=128 k0=16 stat=B |
 | (1024, 1024, 1024, 32, 'K') | 131072 | 2048 | 32768 | 0.016 | 0.250 | 0.266 | split=K blockNum=32 per-core (1024,1024,32); tile m=1024 n=1024 k1=32 m0=32 n0=512 k0=32 stat=B |
 | (16, 4096, 4096, 8, 'B') | 253440 | 512 | 16384 | 0.002 | 0.065 | 0.067 | split=B blockNum=8 per-core (16,512,4096); tile m=16 n=512 k1=240 m0=16 n0=512 k0=16 stat=A |
+
+## L1 vs L0C ρ (S_tot=640KB, 搬入Bound)
+
+| shape | ρ* | m0×n0 | T_GM / η=1 | bound |
+|---|---|---|---|---|
+| SplitA 32x1024 | 0.40 | 32×1024 | 1.00 | gm |
+| SplitB 1024x32 | 0.40 | 1024×32 | 1.00 | gm |
+| SplitA+B 256x128 | 0.40 | 256×128 | 1.00 | gm |
+| square 384 | 0.90 | 256×288 | 1.42 | gm |
 

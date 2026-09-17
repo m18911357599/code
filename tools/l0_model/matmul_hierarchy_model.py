@@ -455,41 +455,49 @@ def closed_form(
     has_l0a: bool,
     has_l0b: bool,
     bw_a: Optional[float] = None,
+    bw_b: Optional[float] = None,
     a_from_l1_mmad: bool = False,
+    b_from_l1_mmad: bool = False,
     split_k_cstore: bool = False,
+    shared_port: Optional[bool] = None,
 ) -> Closed:
-    """Roofline (7): T = max(T_cube, T_GM, T_MTE1), no prologue.
+    """Roofline: T = max(T_cube, T_GM, T_MTE1), no prologue.
 
-    a_from_l1_mmad: Cube/MMAD issues A from L1 every 16-wide pulse (reload n/C)
-    even if bw_a is boosted. This is the 'cancel L0A, raise this path' model.
+    a/b_from_l1_mmad: Cube/MMAD issues that operand from L1 every 16-wide pulse
+    (reload n/C or m/C) even if the path bandwidth is boosted.
+    shared_port: A and B serialize on one L1 read bus. Default True iff both
+    operands come from L1 (no L0A and no L0B).
     """
     s, p, c = arch.dtype_in, arch.macs_per_cycle, arch.cube_n
     ba = arch.bw_l1_l0a if bw_a is None else bw_a
-    bb = arch.bw_l1_l0b
+    bb = arch.bw_l1_l0b if bw_b is None else bw_b
     t_cube = m * n * k / p
     t_gm = (m * k + n * k) * s / arch.bw_gm_l1
     if split_k_cstore:
         t_gm += m * n * s / arch.bw_gm_l1
 
-    if a_from_l1_mmad or not has_l0a:
-        a_reload = n / c
-    else:
-        a_reload = 1.0
-    b_reload = 1.0 if has_l0b else (m / arch.cube_m)
+    from_l1_a = a_from_l1_mmad or not has_l0a
+    from_l1_b = b_from_l1_mmad or not has_l0b
+    a_reload = n / c if from_l1_a else 1.0
+    b_reload = m / arch.cube_m if from_l1_b else 1.0
 
     t_a = m * k * s * a_reload / ba
     t_b = n * k * s * b_reload / bb
-    if not has_l0b:
+    if from_l1_a:
+        t_a = max(t_a, t_cube * (arch.cube_a_bw / ba))
+    if from_l1_b:
         t_b = max(t_b, t_cube * (arch.cube_b_bw / bb))
 
-    shared = (a_from_l1_mmad or not has_l0a) and not has_l0b
+    if shared_port is None:
+        shared = from_l1_a and from_l1_b
+    else:
+        shared = shared_port
     t_mte1 = (t_a + t_b) if shared else max(t_a, t_b)
     t = max(t_cube, t_gm, t_mte1)
     bound = max({"cube": t_cube, "gm": t_gm, "mte1": t_mte1}, key=lambda x: {"cube": t_cube, "gm": t_gm, "mte1": t_mte1}[x])
     k0 = min(k, arch.cube_k)
     s_l0a = 2 * m * k0 * s if has_l0a else 0
     s_l0b = 2 * k0 * n * s if has_l0b else 0
-    # clip to physical L0 if the unsplit operand does not fit: tiler would n-panel.
     if has_l0a:
         s_l0a = min(s_l0a, arch.l0a_size)
     if has_l0b:
@@ -506,6 +514,182 @@ def required_mmad_bw(arch: Arch, n: int) -> float:
     Cancel m,K,s: B_L1,A = B_A * (n/C).
     """
     return arch.bw_l1_l0a * (n / arch.cube_n)
+
+
+def pair_size(m: int, n: int) -> float:
+    return (m * n) / max(m + n, 1)
+
+
+def compute_bw_balance_pair(arch: Arch) -> float:
+    """mn/(m+n) where T_cube = T_GM (η_GM=1). Square m=n=2·pair."""
+    return arch.compute_bound_pair_size
+
+
+def bport_hide_pair(arch: Arch) -> float:
+    """mn/(m+n) where T_GM = 2 T_cube (native L1→B = 256 hides behind GM)."""
+    return arch.compute_bound_pair_size / 2.0
+
+
+@dataclass
+class L1L0C:
+    rho: float
+    s_tot: int
+    s_l1: int
+    s_l0c: int
+    m0: int
+    n0: int
+    k_l1: int
+    eta_a: float
+    eta_b: float
+    t_cube: float
+    t_gm: float
+    t: float
+    pair_tile: float
+    pair_core: float
+    bound: str
+    feasible: bool
+    notes: str = ""
+
+
+def _l0c_elems(s_l0c: int, acc: int, pingpong: bool) -> int:
+    buf = 2 if pingpong else 1
+    return max(0, s_l0c // (buf * acc))
+
+
+def _k_l1_max(s_l1: int, m0: int, n0: int, s: int, pingpong: bool, k: int) -> int:
+    buf = 2 if pingpong else 1
+    denom = buf * (m0 + n0) * s
+    if denom <= 0:
+        return 0
+    raw = s_l1 // denom
+    return min(k, (raw // CUBE) * CUBE)
+
+
+def pick_c_tile(m: int, n: int, q_elems: int) -> Tuple[int, int]:
+    """Choose Cube-aligned (m0,n0) minimizing 1/m0+1/n0 under m0 n0 ≤ q_elems."""
+    if q_elems < CUBE * CUBE:
+        return 0, 0
+    m_opts = set(_cands(m))
+    n_opts = set(_cands(n))
+    for m0 in list(m_opts):
+        n_lim = min(n, q_elems // m0)
+        if n_lim >= CUBE:
+            n_opts.add(_align_down(n_lim))
+    for n0 in list(n_opts):
+        m_lim = min(m, q_elems // n0)
+        if m_lim >= CUBE:
+            m_opts.add(_align_down(m_lim))
+    best = (CUBE, CUBE)
+    best_cost = None
+    for m0 in m_opts:
+        if m0 > m:
+            continue
+        for n0 in n_opts:
+            if n0 > n or m0 * n0 > q_elems:
+                continue
+            cost = 1.0 / m0 + 1.0 / n0
+            score = (cost, -(m0 * n0), abs(m0 - n0))
+            if best_cost is None or score < best_cost:
+                best_cost = score
+                best = (m0, n0)
+    return best
+
+
+def l1_l0c_at_rho(
+    arch: Arch,
+    m: int,
+    n: int,
+    k: int,
+    s_tot: int,
+    rho: float,
+    pingpong_c: bool = True,
+    pingpong_l1: bool = True,
+) -> L1L0C:
+    """Hard-split S_L0C=ρ S_tot, S_L1=(1-ρ) S_tot. T_GM uses C-tile GM reload."""
+    s, p, acc = arch.dtype_in, arch.macs_per_cycle, arch.dtype_acc
+    s_l0c = int(round(rho * s_tot))
+    s_l1 = s_tot - s_l0c
+    t_cube = m * n * k / p
+    pair_core = pair_size(m, n)
+    q = _l0c_elems(s_l0c, acc, pingpong_c)
+    m0, n0 = pick_c_tile(m, n, q)
+    if m0 < CUBE or n0 < CUBE:
+        return L1L0C(
+            rho, s_tot, s_l1, s_l0c, 0, 0, 0, 0, 0, t_cube, math.inf, math.inf,
+            0.0, pair_core, "infeasible", False, "L0C too small for one Cube C-tile",
+        )
+    k_l1 = _k_l1_max(s_l1, m0, n0, s, pingpong_l1, k)
+    if k_l1 < CUBE:
+        # Shrink C tile so L1 can hold one K-slice.
+        best = None
+        for mm in _cands(m):
+            for nn in _cands(n):
+                if mm * nn > q:
+                    continue
+                kk = _k_l1_max(s_l1, mm, nn, s, pingpong_l1, k)
+                if kk < CUBE:
+                    continue
+                cost = 1.0 / mm + 1.0 / nn
+                score = (cost, -kk, -(mm * nn))
+                if best is None or score < best[0]:
+                    best = (score, mm, nn, kk)
+        if best is None:
+            return L1L0C(
+                rho, s_tot, s_l1, s_l0c, m0, n0, 0, 0, 0, t_cube, math.inf, math.inf,
+                pair_size(m0, n0), pair_core, "infeasible", False, "L1 too small for k0=16",
+            )
+        _, m0, n0, k_l1 = best
+    eta_a = n / n0 if n0 < n else 1.0
+    eta_b = m / m0 if m0 < m else 1.0
+    t_gm = (m * k * s * eta_a + n * k * s * eta_b) / arch.bw_gm_l1
+    t = max(t_cube, t_gm)
+    bound = "gm" if t_gm > t_cube else "cube"
+    return L1L0C(
+        rho, s_tot, s_l1, s_l0c, m0, n0, k_l1, eta_a, eta_b, t_cube, t_gm, t,
+        pair_size(m0, n0), pair_core, bound, True,
+        f"m0={m0} n0={n0} k_l1={k_l1} ηA={eta_a:.2f} ηB={eta_b:.2f}",
+    )
+
+
+def best_l1_l0c_split(
+    arch: Arch,
+    m: int,
+    n: int,
+    k: int,
+    s_tot: int,
+    pingpong_c: bool = True,
+    pingpong_l1: bool = True,
+    rhos: Optional[Sequence[float]] = None,
+) -> Tuple[L1L0C, List[L1L0C]]:
+    """Sweep ρ=S_L0C/S_tot; pick min T_GM (then max k_l1) on feasible points."""
+    if rhos is None:
+        rhos = [i / 20.0 for i in range(1, 20)]
+    rows = [l1_l0c_at_rho(arch, m, n, k, s_tot, rho, pingpong_c, pingpong_l1) for rho in rhos]
+    ok = [r for r in rows if r.feasible]
+    if not ok:
+        return rows[0], rows
+    ok.sort(key=lambda r: (r.t_gm, -r.k_l1, r.s_l0c))
+    return ok[0], rows
+
+
+def sram_for_balance(arch: Arch, pingpong_c: bool = True) -> Tuple[int, int, int, int]:
+    """SRAM to put a square C-tile on the compute/bandwidth balance point.
+
+    Returns (m0, S_L0C, S_L1_min, S_tot_min) with k_l1=C ping-pong in L1.
+    """
+    pair = compute_bw_balance_pair(arch)
+    m0 = int(2 * pair)  # square: m0=n0=512 when pair=256
+    buf = 2 if pingpong_c else 1
+    s_l0c = buf * m0 * m0 * arch.dtype_acc
+    s_l1_min = 2 * arch.cube_k * (m0 + m0) * arch.dtype_in  # L1 ping-pong, k_l1=C
+    return m0, s_l0c, s_l1_min, s_l0c + s_l1_min
+
+
+def t_mte1_over_tcube(mu_a: float, mu_b: float, shared: bool) -> float:
+    """T_MTE1/T_cube when both operands pulse from L1. μ=1 is native 512/256."""
+    # T_A/T_cube = 1/μ_A, T_B/T_cube = 2/μ_B (native B_B=256 vs Cube 512).
+    ra, rb = 1.0 / mu_a, 2.0 / mu_b
+    return (ra + rb) if shared else max(ra, rb)
 
 
 def proof_tables(arch: Arch, m: int = 1024, n: int = 1024, k: int = 1024, g: int = 32) -> str:
@@ -609,7 +793,184 @@ def proof_tables(arch: Arch, m: int = 1024, n: int = 1024, k: int = 1024, g: int
             f"{cap_a} | {cap_b} | {nc/arch.cube_n:.1f} | {mc/arch.cube_m:.1f} |"
         )
     lines.append("")
+    lines.extend(_proof_cancel_both(arch, m, n, k, g, specs))
+    lines.extend(_proof_l1_l0c(arch, m, n, k, g, specs))
     return "\n".join(lines) + "\n"
+
+
+def _proof_cancel_both(arch: Arch, m: int, n: int, k: int, g: int, specs) -> List[str]:
+    """Cancel L0A+L0B, boost L1→MMAD on both paths. 搬入Bound only."""
+    lines = []
+    pair_star = compute_bw_balance_pair(arch)
+    pair_b = bport_hide_pair(arch)
+    lines.append("### Cancel L0A+L0B, boost L1→MMAD on A and B (搬入Bound)\n")
+    lines.append(
+        f"Balance T_cube=T_GM (η=1): pair mn/(m+n) = {pair_star:.0f} "
+        f"(square m=n={2*pair_star:.0f}). "
+        f"Native B port 256 hides behind GM iff pair ≤ {pair_b:.0f} "
+        f"(T_GM ≥ 2 T_cube). Compute-bound range pair≥{pair_star:.0f}: no sweep.\n"
+    )
+    lines.append(
+        "| split | m×n×k | pair | regime | port | μ_A | μ_B | B_A | B_B | "
+        "T_A | T_B | T_MTE1 | T | bound | vs L0A+L0B |"
+    )
+    lines.append("|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|")
+    mus = ((1, 1), (1, 2), (2, 2))
+    for sname, mode, kstore in specs:
+        mc, nc, kc = split_shape(m, n, k, g, mode)
+        pair = pair_size(mc, nc)
+        if pair >= pair_star:
+            continue
+        if pair > pair_b:
+            regime = f"搬入, pair∈({pair_b:.0f},{pair_star:.0f})"
+        else:
+            regime = f"强搬入 pair≤{pair_b:.0f}"
+        gold = closed_form(arch, mc, nc, kc, True, True, split_k_cstore=kstore)
+        for shared, pname in ((False, "dual"), (True, "shared")):
+            for mu_a, mu_b in mus:
+                r = closed_form(
+                    arch, mc, nc, kc, False, False,
+                    bw_a=arch.bw_l1_l0a * mu_a,
+                    bw_b=arch.bw_l1_l0b * mu_b,
+                    a_from_l1_mmad=True, b_from_l1_mmad=True,
+                    split_k_cstore=kstore, shared_port=shared,
+                )
+                lines.append(
+                    f"| {sname} | {mc}×{nc}×{kc} | {pair:.1f} | {regime} | {pname} | "
+                    f"{mu_a} | {mu_b} | {arch.bw_l1_l0a*mu_a:.0f} | {arch.bw_l1_l0b*mu_b:.0f} | "
+                    f"{_fmt(r.t_a,1)} | {_fmt(r.t_b,1)} | {_fmt(r.t_mte1,1)} | {_fmt(r.t,1)} | "
+                    f"{r.bound} | {r.t/gold.t:.2f}× |"
+                )
+    lines.append("")
+    lines.append(
+        f"计算Bound 场景不扫（pair≥{pair_star:.0f}）：SplitK 核上 1024×1024，pair=512。"
+        "该范围内有 L0 时 T=T_cube；取消 L0 且 B 口仍 256 则 T≥2 T_cube，直到 μ_B≥2。\n"
+    )
+    lines.append(
+        "T_A/T_cube=1/μ_A, T_B/T_cube=2/μ_B. Dual Cube-width (μ_A=1, μ_B=2, B_A=B_B=512) "
+        "gives T_MTE1=T_cube, time-matches L0 on both 搬入 and 计算 Bound. "
+        "Shared native (μ=1,1) is T_MTE1=3 T_cube; shared Cube-width is 2 T_cube. "
+        "Traffic match still needs μ_A*=n/C, μ_B*=m/C.\n"
+    )
+    lines.append("### Shared L1→Cube bus width to hide behind GM or Cube\n")
+    lines.append("| split | pair | B_shared ≥ 4·pair (≤T_GM) | B_shared ≥ 1024 (≤T_cube) | native 512+256=768 hide GM? |")
+    lines.append("|---|---|---|---|---|")
+    for sname, mode, kstore in specs:
+        mc, nc, kc = split_shape(m, n, k, g, mode)
+        pair = pair_size(mc, nc)
+        if pair >= pair_star:
+            lines.append(
+                f"| {sname} | {pair:.1f} | 计算Bound 范围 pair≥{pair_star:.0f} | 1024 | — |"
+            )
+            continue
+        need_gm = 4.0 * pair
+        hide = "yes" if 768 >= need_gm else "no"
+        lines.append(
+            f"| {sname} | {pair:.1f} | {need_gm:.0f} | 1024 | {hide} |"
+        )
+    lines.append("")
+    return lines
+
+
+def _proof_l1_l0c(arch: Arch, m: int, n: int, k: int, g: int, specs) -> List[str]:
+    """S_L1+S_L0C constant, best ρ under 搬入Bound."""
+    lines = []
+    pair_star = compute_bw_balance_pair(arch)
+    s_cur = arch.l1_size + arch.l0c_size
+    s_reclaim = s_cur + arch.l0a_size + arch.l0b_size
+    m_bal, s_c_bal, s_l1_bal, s_tot_bal = sram_for_balance(arch, pingpong_c=True)
+    _m1, s_c_bal1, _s1, s_tot_bal1 = sram_for_balance(arch, pingpong_c=False)
+    lines.append("### L1 vs L0C under S_L1+S_L0C constant (搬入Bound)\n")
+    lines.append(
+        f"Current S_tot = L1+L0C = {s_cur} B ({s_cur/1024:.0f}KB). "
+        f"Reclaim L0A+L0B → {s_reclaim} B ({s_reclaim/1024:.0f}KB). "
+        f"Ping-pong L0C: S_L0C=8 m0 n0. L1 ping-pong min k_l1=16: S_L1=64(m0+n0).\n"
+    )
+    lines.append(
+        f"Compute/bandwidth balance (square): m0=n0={m_bal}, pair={pair_star:.0f}. "
+        f"Need S_L0C={s_c_bal} B ({s_c_bal/1024:.0f}KB) ping-pong "
+        f"or {s_c_bal1} B ({s_c_bal1/1024:.0f}KB) single-buffer, plus "
+        f"S_L1≥{s_l1_bal} B. Total ≥ {s_tot_bal/1024:.0f}KB (pp) / {s_tot_bal1/1024:.0f}KB (single). "
+        f"640KB cannot reach the balance point; remains 搬入Bound.\n"
+    )
+    rhos = [i / 10.0 for i in range(1, 10)]
+    for s_tot, tag in ((s_cur, "640KB"), (s_reclaim, "768KB")):
+        lines.append(f"#### Best ρ at S_tot={tag} (搬入Bound splits only)\n")
+        lines.append(
+            "| split | m×n×k | pair | full-C S_L0C | ρ* | S_L1* | m0×n0 | k_l1 | "
+            "ηA | ηB | T_GM | T | bound | vs η=1 |"
+        )
+        lines.append("|---|---|---|---|---|---|---|---|---|---|---|---|---|---|")
+        for sname, mode, kstore in specs:
+            mc, nc, kc = split_shape(m, n, k, g, mode)
+            pair = pair_size(mc, nc)
+            if pair >= pair_star:
+                lines.append(
+                    f"| {sname} | {mc}×{nc}×{kc} | {pair:.1f} | — | "
+                    f"计算Bound 范围 pair≥{pair_star:.0f}，不扫 ρ | — | — | — | — | — | — | — | — | — |"
+                )
+                continue
+            best, _ = best_l1_l0c_split(arch, mc, nc, kc, s_tot, rhos=rhos)
+            s_full = 2 * mc * nc * arch.dtype_acc
+            t_gm1 = (mc + nc) * kc * arch.dtype_in / arch.bw_gm_l1
+            if not best.feasible:
+                lines.append(
+                    f"| {sname} | {mc}×{nc}×{kc} | {pair:.1f} | {s_full} | infeasible | — | — | — | — | — | — | — | — | — |"
+                )
+                continue
+            lines.append(
+                f"| {sname} | {mc}×{nc}×{kc} | {pair:.1f} | {s_full} | {best.rho:.2f} | "
+                f"{best.s_l1} | {best.m0}×{best.n0} | {best.k_l1} | "
+                f"{best.eta_a:.2f} | {best.eta_b:.2f} | {_fmt(best.t_gm,1)} | {_fmt(best.t,1)} | "
+                f"{best.bound} | {best.t_gm/t_gm1:.2f}× |"
+            )
+        lines.append("")
+        lines.append(f"ρ sweep (S_tot={tag}), 搬入Bound only:\n")
+        lines.append("| split | ρ | S_L0C | S_L1 | m0×n0 | k_l1 | ηA,ηB | T_GM | bound |")
+        lines.append("|---|---|---|---|---|---|---|---|---|")
+        for sname, mode, kstore in specs:
+            mc, nc, kc = split_shape(m, n, k, g, mode)
+            if pair_size(mc, nc) >= pair_star:
+                continue
+            _, rows = best_l1_l0c_split(arch, mc, nc, kc, s_tot, rhos=rhos)
+            for r in rows:
+                if not r.feasible:
+                    lines.append(
+                        f"| {sname} | {r.rho:.1f} | {r.s_l0c} | {r.s_l1} | — | — | — | inf | no |"
+                    )
+                    continue
+                lines.append(
+                    f"| {sname} | {r.rho:.1f} | {r.s_l0c} | {r.s_l1} | {r.m0}×{r.n0} | "
+                    f"{r.k_l1} | {r.eta_a:.1f},{r.eta_b:.1f} | {_fmt(r.t_gm,1)} | {r.bound} |"
+                )
+        lines.append("")
+
+    m_s = n_s = 384
+    k_s = 1024
+    if pair_size(m_s, n_s) < pair_star:
+        lines.append(
+            f"#### C does not fit: square {m_s}×{n_s}×{k_s} "
+            f"(pair={pair_size(m_s,n_s):.0f}<{pair_star:.0f}, 搬入Bound)\n"
+        )
+        lines.append("| S_tot | ρ* | S_L0C | S_L1 | m0×n0 | pair_tile | T_GM | T_GM(η=1) | bound |")
+        lines.append("|---|---|---|---|---|---|---|---|---|")
+        t_gm1 = (m_s + n_s) * k_s * arch.dtype_in / arch.bw_gm_l1
+        for s_tot, tag in ((s_cur, "640KB"), (s_reclaim, "768KB")):
+            best, _ = best_l1_l0c_split(arch, m_s, n_s, k_s, s_tot, rhos=rhos)
+            lines.append(
+                f"| {tag} | {best.rho:.2f} | {best.s_l0c} | {best.s_l1} | "
+                f"{best.m0}×{best.n0} | {best.pair_tile:.1f} | {_fmt(best.t_gm,1)} | "
+                f"{_fmt(t_gm1,1)} | {best.bound} |"
+            )
+        lines.append("")
+        lines.append(
+            "Closed form when C does not fit, square ping-pong, min k_l1=16: "
+            "8t²+128t=S_tot ⇒ t=-8+√(64+S_tot/8). "
+            f"640KB: t≈{(-8+(64+s_cur/8)**0.5):.1f}; "
+            f"768KB: t≈{(-8+(64+s_reclaim/8)**0.5):.1f}. "
+            "ρ=8t²/S_tot ≈ 0.90. Extra SRAM after min L1 staging goes to L0C.\n"
+        )
+    return lines
 
 
 def _fmt(x: float, digits: int = 2) -> str:
@@ -772,7 +1133,9 @@ def analytical_lines(arch: Arch) -> str:
     )
     lines.append(
         f"- 搬入-bound iff `mn/(m+n) < P*s/B_GM = {arch.compute_bound_pair_size:.0f}`. "
-        f"Square GEMM needs m=n>`{2*arch.compute_bound_pair_size:.0f}` to be compute-bound from HBM.\n"
+        f"Square GEMM needs m=n>`{2*arch.compute_bound_pair_size:.0f}` to be compute-bound from HBM. "
+        f"Native B-port 256 hides behind GM iff pair ≤ {bport_hide_pair(arch):.0f}. "
+        f"Compute-bound range: pair≥{arch.compute_bound_pair_size:.0f} (no sweep).\n"
     )
     lines.append(
         "- Without L0A, L1 A-traffic is `m*K*s*(n/16)`; without L0B, L1 B-traffic is `n*K*s*(m/16)`.\n"
@@ -856,6 +1219,37 @@ def self_check(arch: Arch) -> List[str]:
     msgs.append(
         f"OK wide-N 1024x4096x1024 L0A+L0B {wide.cycles:.0f} vs L0B-only {wide_b.cycles:.0f} "
         f"({wide_b.cycles / wide.cycles:.2f}x L0A extra)"
+    )
+    assert abs(compute_bw_balance_pair(arch) - 256.0) < 1e-9
+    assert abs(bport_hide_pair(arch) - 128.0) < 1e-9
+    assert abs(t_mte1_over_tcube(1, 1, True) - 3.0) < 1e-9
+    assert abs(t_mte1_over_tcube(1, 2, False) - 1.0) < 1e-9
+    assert abs(t_mte1_over_tcube(1, 2, True) - 2.0) < 1e-9
+    msgs.append("OK balance pair=256, B-port hide pair=128, shared native MTE1=3 T_cube")
+    gold_a = closed_form(arch, 32, 1024, 1024, True, True)
+    dual = closed_form(
+        arch, 32, 1024, 1024, False, False,
+        bw_a=512, bw_b=512, a_from_l1_mmad=True, b_from_l1_mmad=True, shared_port=False,
+    )
+    assert abs(dual.t - gold_a.t) < 1.0, (dual.t, gold_a.t)
+    assert dual.bound == "gm"
+    msgs.append(f"OK SplitA dual Cube-width cancel L0 T={dual.t:.0f} == gold {gold_a.t:.0f}")
+    s_tot = arch.l1_size + arch.l0c_size
+    best_ab, _ = best_l1_l0c_split(arch, 256, 128, 1024, s_tot)
+    assert best_ab.feasible and best_ab.eta_a == 1.0 and best_ab.eta_b == 1.0
+    assert best_ab.m0 == 256 and best_ab.n0 == 128
+    msgs.append(
+        f"OK SplitA+B ρ*={best_ab.rho:.2f} holds full C {best_ab.m0}x{best_ab.n0}, η=1"
+    )
+    m_bal, s_c, s_l1, s_need = sram_for_balance(arch)
+    assert m_bal == 512 and s_c == 2 * 1024 * 1024
+    assert s_need > s_tot
+    msgs.append(f"OK balance SRAM m0=512 L0C={s_c} tot={s_need} > current {s_tot}")
+    best_sq, _ = best_l1_l0c_split(arch, 384, 384, 1024, s_tot)
+    assert best_sq.feasible and best_sq.pair_tile < 256
+    assert best_sq.bound == "gm"
+    msgs.append(
+        f"OK 384² 搬入Bound ρ*={best_sq.rho:.2f} tile {best_sq.m0}x{best_sq.n0} pair={best_sq.pair_tile:.1f}"
     )
     return msgs
 
@@ -1010,6 +1404,46 @@ def run(out_dir: str, artifact_dir: Optional[str] = None) -> str:
             f"| {sc} | {r.l1_working_bytes} | {r.l0a_working_bytes} | {r.l0b_working_bytes} | "
             f"{r.l0a_over_l1:.3f} | {r.l0b_over_l1:.3f} | "
             f"{(r.l0a_over_l1+r.l0b_over_l1):.3f} | {r.notes} |"
+        )
+    md.append("")
+
+    s_tot = arch.l1_size + arch.l0c_size
+    rhos = [i / 10.0 for i in range(1, 10)]
+    series = []
+    for name, mm, nn, kk in (
+        ("SplitA 32x1024", 32, 1024, 1024),
+        ("SplitA+B 256x128", 256, 128, 1024),
+        ("square 384 搬入Bound", 384, 384, 1024),
+    ):
+        _, rows = best_l1_l0c_split(arch, mm, nn, kk, s_tot, rhos=rhos)
+        t1 = (mm + nn) * kk * arch.dtype_in / arch.bw_gm_l1
+        xs, ys = [], []
+        for r in rows:
+            if r.feasible:
+                xs.append(r.rho)
+                ys.append(r.t_gm / t1)
+        series.append((name, xs, ys))
+    write_line_svg(
+        os.path.join(out_dir, "l1_l0c_ratio.svg"),
+        series,
+        xlabel="ρ = S_L0C / (S_L1+S_L0C)",
+        ylabel="T_GM / T_GM(η=1)",
+        title="L1 vs L0C split, 640KB, 搬入Bound (1=full-C GM traffic)",
+    )
+    md.append("## L1 vs L0C ρ (S_tot=640KB, 搬入Bound)\n")
+    md.append("| shape | ρ* | m0×n0 | T_GM / η=1 | bound |")
+    md.append("|---|---|---|---|---|")
+    for name, mm, nn, kk in (
+        ("SplitA 32x1024", 32, 1024, 1024),
+        ("SplitB 1024x32", 1024, 32, 1024),
+        ("SplitA+B 256x128", 256, 128, 1024),
+        ("square 384", 384, 384, 1024),
+    ):
+        best, _ = best_l1_l0c_split(arch, mm, nn, kk, s_tot, rhos=rhos)
+        t1 = (mm + nn) * kk * arch.dtype_in / arch.bw_gm_l1
+        md.append(
+            f"| {name} | {best.rho:.2f} | {best.m0}×{best.n0} | "
+            f"{best.t_gm/t1:.2f} | {best.bound} |"
         )
     md.append("")
 
