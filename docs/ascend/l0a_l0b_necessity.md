@@ -1,198 +1,207 @@
-# 昇腾 Cube 引入 L0A / L0B 的必要性评估
+# 昇腾 Cube 引入 L0A / L0B：切分场景下的公式化证明
 
-规格锚定公开 Ascend 910B1：L1=512KB，L0A=L0B=64KB，L0C=128KB，Cube 16×16×16，L1→L0A=512 B/cyc，L1→L0B=256 B/cyc，核分摊 HBM 32 B/cyc，入元 FP16 \(s=2\) B。  
-可运行模型：`python3 tools/l0_model/matmul_hierarchy_model.py --out tools/l0_model/out`
+规格：Ascend 910B1。\(P=4096\) MAC/cyc，\(C=16\)，\(s=2\) B，\(B_A=512\)、\(B_B=256\)、\(B_{GM}=32\) B/cyc，\(S_{L1}=512\)KB，\(S_{L0A}=S_{L0B}=64\)KB。  
+默认 GEMM：\(M=N=K=1024\)，`blockNum` \(G=32\)。  
+模型：`python3 tools/l0_model/matmul_hierarchy_model.py --out tools/l0_model/out`
 
 ---
 
 ## 1. 问题背景
 
-昇腾 AI Core 的 Cube 不做通用 Load，只从 L0 取数：
+Cube 只从 L0 取数；L1 已缓存每次搬入的 \(m·k_a\)、\(k_b·n\)：
 
 ```
-GM --MTE2--> L1(m×ka 的 A, kb×n 的 B) --MTE1--> L0A / L0B --> Cube --> L0C
+GM --MTE2--> L1 --MTE1--> L0A / L0B --> Cube(mmad) --> L0C
 ```
 
-工程上已经用 L1 缓存每次搬入的 `m×ka`、`kb×n`。要回答的是：**在 L1 已经存在的前提下，是否还要引入 L0A、L0B；L0 与 L1 的容量比取多少；性能收益从哪来。**
+软件把大 Matmul 切到 `blockNum` 核上，四种切法：
 
-约束来自三类软件行为：
+| 场景 | 核上 \((m,n,k)\) | 直观 |
+|---|---|---|
+| **SplitA** | \(m=M/G,\ n=N,\ k=K\) | 切薄 A 的 M，B 几乎不复用 |
+| **SplitB** | \(m=M,\ n=N/G,\ k=K\) | 切薄 B 的 N，A 几乎不复用 |
+| **SplitK** | \(m=M,\ n=N,\ k=K/G\) | 切 K，C 要核间规约 |
+| **SplitA+B** | \(m=M/g_M,\ n=N/g_N,\ k=K\) | 二维切，两侧都变窄 |
 
-1. **多个切分 Matmul**。大 GEMM 拆成核上 tile，计算多次、搬入多次。切完以后算术强度下降，容易变成 **搬入 Bound**。
-2. **`blockNum` 核切 A 或切 B**。只切 A(\(M×K\)) 则核上 \(m=M/\textit{blockNum}\)、\(n=N\)、走满 \(K\)；只切 B(\(K×N\)) 则 \(n\) 变薄。\(m\) 或 \(n\) 过小，对侧矩阵几乎不复用。
-3. **每次搬入 \(m·k_a\)、\(k_b·n\)，落在 L1**。L1 的职责是抗 HBM 延迟、跨 \(K\) 复用。Cube 每个 pulse 只要 16×16。若 Cube 直接打 L1，L1 从「大块搬入缓存」退化成「512 B 碎读源」，和搬入通路抢端口。
-
-因此评估对象不是「L0 能不能少搬 HBM」，而是「L1 专管搬入、L0 专管供数」这一分层是否必要，以及 \(S_{L0A}/S_{L1}\)、\(S_{L0B}/S_{L1}\) 落在哪一档。
+要证明的是：在这四种切法下，**L0A、L0B 各自在容量和带宽上的收益是什么**。  
+对照假设：**取消 L0A，mmad 直接从 L1 取 A，并把这一路带宽提高到 \(\mu B_A\)**，能否得到与 L0A 相同的时间/流量收益。
 
 ---
 
 ## 2. 评估公式
 
-符号：核上形状 \((m,n,K)\)；Cube 峰值 \(P=4096\) MAC/cyc；Cube 边长 \(C=16\)；L1→L0A / L0B 带宽 \(B_A=512\)、\(B_B=256\) B/cyc；HBM 核分摊 \(B_{GM}=32\) B/cyc。
-
-### 2.1 搬入 Bound
+### 2.1 周期屋顶
 
 $$
-T_{\text{cube}}=\frac{mnK}{P},\qquad
-T_{GM}=\frac{(m+n)Ks}{B_{GM}}
-$$
-
-搬入 Bound 当且仅当 \(T_{GM}>T_{\text{cube}}\)：
-
-$$
-\frac{mn}{m+n} < \frac{Ps}{B_{GM}}=256
+T_{\mathrm{cube}}=\frac{mnk}{P},\quad
+T_{GM}=\frac{(m+n)ks}{B_{GM}},\quad
+T=\max(T_{\mathrm{cube}},T_{GM},T_{MTE1})
 \tag{1}
 $$
 
-方阵需 \(m=n>512\) 才从 HBM 侧计算 Bound。`blockNum=32` 只切 A 时，1024³ 核上 32×1024，\(\frac{mn}{m+n}=31\ll 256\)，必搬入 Bound。
+SplitK 另加部分和写回：\(T_{GM}\leftarrow T_{GM}+mns/B_{GM}\)。
 
-### 2.2 L1 工作集（每次搬入）
+搬入 Bound：\(T_{GM}>T_{\mathrm{cube}}\) \(\Leftrightarrow\) \(mn/(m+n)<Ps/B_{GM}=256\)。
 
-双缓冲：
+### 2.2 重载与 MTE1
+
+无复用缓冲时 Cube 只按 \(C=16\) 复用：
 
 $$
-2\cdot k_{l1}\cdot(m+n)\cdot s \le S_{L1}
+\eta_A=\frac{n}{C},\qquad \eta_B=\frac{m}{C}
 \tag{2}
 $$
 
-即每次缓存到 L1 的 \(m·k_a\) 与 \(k_b·n\)（取 \(k_a=k_b=k_{l1}\)）必须装进半片 L1。
-
-### 2.3 无 L0 时的重载放大
-
-Cube 原生复用宽度为 \(C=16\)。无 L0A 时 A 在 L1 上被读 \(\lceil n/C\rceil\) 次；无 L0B 时 B 被读 \(\lceil m/C\rceil\) 次：
-
 $$
-\textit{Bytes}_{L1,A}=mKs\cdot\frac{n}{C},\qquad
-\textit{Bytes}_{L1,B}=nKs\cdot\frac{m}{C}
+T_A=\frac{mks\cdot\eta_A}{B_A},\qquad
+T_B=\frac{nks\cdot\eta_B}{B_B}
 \tag{3}
 $$
 
-有 L0 且 A-stationary：A 从 L1 读 1 次，B 按 \(m/m_{l0}\) 次（B-stationary 对偶）。
+有 L0A 且 A-stationary：\(\eta_A=1\)。有 L0B 且 B-stationary：\(\eta_B=1\)。  
+无 L0B 时 B 口还受 \(B_B=256\) 对 Cube 512 B/cyc 的端口上限：\(T_B\ge 2\,T_{\mathrm{cube}}\)。  
+A、B 都从 L1 出：\(T_{MTE1}=T_A+T_B\)；否则 \(T_{MTE1}=\max(T_A,T_B)\)。
 
-### 2.4 Cube 口带宽与 L0B 隐藏填入
+### 2.3 填入隐藏（容量下限的来源）
+
+L1→L0A 填一块 \(m_0\times k_0\) 要藏进 Cube：
 
 $$
-BW_{\text{Cube},A}=\frac{Ps}{C}=512\ \text{B/cyc}=B_A
+\frac{m_0 k_0 s}{B_A}\le\frac{m_0 n_0 k_0}{P}
+\Rightarrow n_0\ge\frac{Ps}{B_A}=16
 \tag{4}
 $$
 
-$$
-BW_{\text{Cube},B}=\frac{Ps}{C}=512\ \text{B/cyc},\quad B_B=256
-$$
-
-L0B 用更大的 \(n_{l0}\) 沿 M 复用 B，填入被计算藏住的条件：
+L1→L0B 填一块 \(k_0\times n_0\)：
 
 $$
-n_{l0}\ \ge\ \frac{Ps}{B_B}=32
+\frac{k_0 n_0 s}{B_B}\le\frac{m_0 n_0 k_0}{P}
+\Rightarrow m_0\ge\frac{Ps}{B_B}=32
 \tag{5}
 $$
 
-无 L0B 时，B 口有效供数只有 \(B_B\)，Cube 利用率上限 \(B_B/BW_{\text{Cube},B}=50\%\)。
-
-### 2.5 L0 与 L1 工作集比
+### 2.4 容量（双缓冲、一块 \(k_0=C\)）
 
 $$
-\rho_A=\frac{m_{l0}\,k_{l0}}{k_{l1}(m+n)},\qquad
-\rho_B=\frac{k_{l0}\,n_{l0}}{k_{l1}(m+n)}
+S_{L0A}\ge 2\,m\,C\,s,\qquad S_{L0B}\ge 2\,C\,n\,s
 \tag{6}
 $$
 
-规格比 \(S_{L0A}/S_{L1}=64/512=1/8\)。式 (6) 给出的是 **一次计算用到的工作集比**，用来核对 1/8 是否落在合理区间，而不是要求 L0 做成 L1 的缩小拷贝。
+装不下则再切 \(m\) 或 \(n\)，\(\eta\) 回升。64KB 刚好是 \(m=1024\) 或 \(n=1024\)、\(k_0=16\)、FP16 ping-pong 的上界：\(2\cdot1024\cdot16\cdot2=65536\)。
 
-### 2.6 周期屋顶与加速比
+### 2.5 四场景代入（\(G=32,\ 1024^3\)）
+
+| 场景 | \((m,n,k)\) | \(\eta_A=n/C\) | \(\eta_B=m/C\) | 式(6) \(S_{L0A}\) | 式(6) \(S_{L0B}\) | \(T_{\mathrm{cube}}\) | \(T_{GM}\) |
+|---|---|---|---|---|---|---|---|
+| SplitA | 32×1024×1024 | **64** | 2 | 2KB | **64KB** | 8.2k | 67.6k |
+| SplitB | 1024×32×1024 | 2 | **64** | **64KB** | 2KB | 8.2k | 67.6k |
+| SplitK | 1024×1024×32 | **64** | **64** | **64KB** | **64KB** | 8.2k | 69.6k（含 C 写） |
+| SplitA+B | 256×128×1024 | 8 | 16 | 16KB | 8KB | 8.2k | 24.6k |
+
+证明要点：
+
+- **SplitA**：\(n\) 仍是 1024，无 L0A 则 A 路 L1 流量 ×64；L0A 容量只需 2KB。无 L0B 则 \(\eta_B=2\) 不大，但 L0B 要放下整行 \(n\)，容量 **64KB**。\(m=32\) 恰等于式 (5)，B 填入卡在隐藏边界。
+- **SplitB**：与 SplitA 对偶。L0A 容量 64KB，L0B 2KB；无 L0B 时 \(\eta_B=64\)。
+- **SplitK**：\(mn/(m+n)=512\) 仍是计算侧 pair，但 \(T_{GM}\) 多一项 \(mns/B_{GM}\)，屋顶变成 GM。\(\eta_A=\eta_B=64\)，两侧 L0 都要 64KB。K 切完不能降低 A/B 重载，只能少算一轮 K。
+- **SplitA+B**：两侧 \(\eta\) 都降（8 与 16），容量降到 16KB+8KB，但仍 \(\gg 1\)，L1-only 双侧重载还在。
+
+### 2.6 取消 L0A、mmad 直连 L1、A 路带宽 \(\mu B_A\)
+
+A 仍按 pulse 从 L1 取（无复用缓冲），\(\eta_A=n/C\) 不变：
 
 $$
-T=\max(T_{\text{cube}},\,T_{GM},\,T_{MTE1})+T_{\text{prologue}}
+\frac{T_A^{\mathrm{mmad}}}{T_{\mathrm{cube}}}
+=\frac{mks\cdot(n/C)/(\mu B_A)}{mnk/P}
+=\frac{Ps}{C\,\mu B_A}
+=\frac{1}{\mu}
+\quad(B_A=512)
 \tag{7}
 $$
 
-有 L0A+L0B：\(T_{MTE1}=\max(T_A,T_B)\)（A/B 通道并发）。无 L0：A/B 在 L1 读口串行，且 16×16 碎读另付 L1 气泡。加速比：
+式 (7) **不含 \(n\)**。\(\mu=1\) 时 \(T_A=T_{\mathrm{cube}}\)，A 路已经顶在 Cube 屋顶；**再加大 \(\mu\) 只让 \(T_A\) 小于 \(T_{\mathrm{cube}}\)，被 \(\max\) 吃掉，时间不变。**
+
+若目标是让 \(T_A^{\mathrm{mmad}}=T_A^{L0A}=mks/B_A\)（流量也对齐，而不只是时间对齐）：
 
 $$
-\textit{Speedup}=\frac{T(\text{L1-only})}{T(\text{L0A+L0B})}
+\mu^\ast=\frac{n}{C}
 \tag{8}
 $$
 
-闭式若只计 HBM 字节，搬入 Bound 下式 (8) \(=1\)（L0 不改 GM 流量）。把式 (3) 的 L1 重载算进 \(T_{MTE1}\) 后，L1-only 可能先于 GM 顶死，式 (8) \(>1\)。
+| 场景 | \(\mu^\ast\) | 所需 \(B_{L1,A}\) |
+|---|---|---|
+| SplitA / SplitK | 64 | **32768 B/cyc**（64× 现网 L1→L0A） |
+| SplitB | 2 | 1024 B/cyc |
+| SplitA+B | 8 | 4096 B/cyc |
+
+L1 按 pulse 付延迟 \(L\)（SRAM 未对 Cube 全流水）时：
+
+$$
+T_A\leftarrow T_A+N_{\mathrm{pulse}}L,\quad
+N_{\mathrm{pulse}}=\frac{mnk}{C^3}=T_{\mathrm{cube}}
+\tag{9}
+$$
+
+\(L=16\) 时 \(T_A\approx 17\,T_{\mathrm{cube}}\)，搬入屋顶也会被掀翻。L0A 把 \(N_{\mathrm{pulse}}\) 收成 \(N_{\mathrm{fill}}=(m/m_0)(k/k_0)\)，延迟按 DMA 突发付一次。
+
+若 A 口与 MTE2 不能 1R1W 重叠：\(T\leftarrow T_{GM}+T_A\)，搬入更差。  
+若把「A 驻留 L1、\(\eta_A=1\)、\(B_A=512\)」做进 L1，那就是把 L0A 的端口、双缓冲、分形做进大 SRAM，不是「加带宽」。
 
 ---
 
 ## 3. 数据验证
 
-模型：`tools/l0_model/matmul_hierarchy_model.py`。自检：Cube A 口 = L1→L0A = 512 B/cyc；L0B 隐藏填入 \(n_{l0}\ge 32\)；32 核 A-split 核上 32×1024 满足式 (1)；1024³ 上 L0A+L0B 快于 L1-only。
+闭式，无 tiler 气泡。完整表见 `tools/l0_model/out/run_report.md`。
 
-### 3.1 闭式带宽（不计 L1 气泡）
+### 3.1 单核不切（计算 Bound 参照）
 
-| 场景 | 核上形状 | \(\frac{mn}{m+n}\) | Bound | 无 L0 重载 (A,B) | 闭式加速比 |
-|---|---|---|---|---|---|
-| 单核 1024³ | 1024×1024×1024 | 512 | 计算 | 64×, 64× | **3.00×** |
-| 32 核 A-split | 32×1024×1024 | 31 | 搬入 | 64×, 2× | **1.00×** |
-| 32 核 2D-split | 256×128×1024 | 85 | 搬入 | 8×, 16× | **1.00×** |
-| 宽 N | 1024×4096×1024 | 819 | 计算 | 256×, 64× | **3.00×** |
-| decode 形 | 16×512×4096 | 16 | 搬入 | 32×, 1× | **1.00×** |
-
-闭式结论：计算 Bound 上无 L0 的 L1 流量按式 (3) 放大，屋顶从 Cube 变成 MTE1，约 3×；搬入 Bound 上屋顶是 GM，L0 不省字节，加速比 1。
-
-### 3.2 层次消融（仿真，含 L1 碎读）
-
-| 场景 | 层次 | Cube% | Bound | vs L1-only |
-|---|---|---|---|---|
-| 单核 1024³ | L1-only | 30.4% | MTE1 | 1.00× |
-| 单核 1024³ | 仅 L0A | 49.2% | MTE1（B 口 256） | 1.62× |
-| 单核 1024³ | 仅 L0B | **96.9%** | Cube | **3.18×** |
-| 单核 1024³ | L0A+L0B | **96.9%** | Cube | **3.18×** |
-| 32 核 A-split | L0A+L0B | 10.7% | GM | **2.17×** |
-| 32 核 2D-split | L0A+L0B | 24.6% | GM | **5.42×** |
-| 32 核 B-split | L0A+L0B | 10.7% | GM | **3.00×** |
-| decode 16×512 | L0A+L0B | 5.6% | GM | 1.47× |
-
-与式 (4)(5) 一致：只加 L0A，Cube 被 \(B_B=256\) 卡在约一半；**L0B 才把利用率拉到 97%**。搬入场景仿真加速比 > 闭式 1.0，因为 L1-only 的 16×16 碎读先把 \(T_{MTE1}\) 抬过 \(T_{GM}\)，L0 把核拉回 GM 屋顶。
-
-### 3.3 L0 / L1 容量比（L1 固定 512KB）
-
-| L0 KB | \(S_{L0}/S_{L1}\) | 单核 L0A+L0B Cube% | 32 核 A-split Cube% |
-|---|---|---|---|
-| 4 | 1/128 | 78.0% | 10.7% |
-| 8 | 1/64 | **96.9%** | 10.7% |
-| 16～64 | 1/32～**1/8** | 96.9% | 10.7% |
-| 128～256 | 1/4～1/2 | 96.9% | 10.7% |
-
-计算 Bound：8KB 已饱和；4KB 双 L0 ping-pong 不够。搬入 Bound：Cube% 由 GM 决定，加大 L0 无收益。
-
-默认 64KB 工作集（式 (6)）：
-
-| 场景 | L1 ws | L0A ws | L0B ws | \(\rho_A\) | \(\rho_B\) | \(\rho_A+\rho_B\) |
+| 层次 | \(\eta_A,\eta_B\) | \(T_A\) | \(T_B\) | \(T\) | Bound | vs L1-only |
 |---|---|---|---|---|---|---|
-| 单核 1024³ | 256KB | 2KB | 32KB | 0.008 | **0.125** | 0.13 |
-| 32 核 A-split | 231KB | 0.5KB | 32KB | 0.002 | 0.14 | 0.14 |
-| 32 核 2D | 252KB | 4KB | 4KB | 0.016 | 0.016 | 0.03 |
+| L1-only | 64, 64 | 262k | 524k | 786k | MTE1 | 1.00× |
+| 仅 L0A | 1, 64 | 4.1k | 524k | 524k | MTE1 | 1.50× |
+| 仅 L0B | 64, 1 | 262k | 8.2k | **262k** | Cube | **3.00×** |
+| L0A+L0B | 1, 1 | 4.1k | 8.2k | **262k** | Cube | **3.00×** |
 
-规格 64/512=1/8 与单核 \(\rho_B=32\text{KB}/256\text{KB}=1/8\) 对齐。L0A 在 B-stationary 时可以很小；转置/切 N 后角色对调，规格上必须 L0A=L0B。
+**L0B 的时间收益是硬的**：无 L0B 时 \(T_B=2T_{\mathrm{cube}}\)，\(T=3T_{\mathrm{cube}}\)。仅 L0A 救不了 B 口。L0B-only 已回到 Cube 屋顶；L0A 在此把 \(T_A\) 从 262k 收到 4.1k，时间被 \(T_{\mathrm{cube}}\) 挡住，收益记在 **L1 占用 / 流量 \(\eta_A=64\)**。
 
-### 3.4 `blockNum` 扫描（1024³）
+### 3.2 四场景层次（\(G=32\)，屋顶都是 GM）
 
-| blockNum | 切分 | 式 (1) pair | 搬入? | L0A+L0B vs L1-only |
-|---|---|---|---|---|
-| 1 | A | 512 | 否 | 3.18× |
-| 4 | A | 205 | 是 | 8.09× |
-| 32 | A | 31 | 是 | 2.17× |
-| 32 | 2D | 85 | 是 | 5.42× |
+| 场景 | 层次 | \(T_A\) | \(T_B\) | \(T\) | Bound | 时间 vs L1-only | 容量 L0A / L0B |
+|---|---|---|---|---|---|---|---|
+| SplitA | L0A+L0B | 128 | 8.2k | 67.6k | GM | 1.00× | 2KB / **64KB** |
+| SplitA | L1-only | 8.2k | 16.4k | 67.6k | GM | — | — |
+| SplitB | L0A+L0B | 4.1k | 256 | 67.6k | GM | 1.00× | **64KB** / 2KB |
+| SplitK | L0A+L0B | 128 | 256 | 69.6k | GM | 1.00× | **64KB / 64KB** |
+| SplitA+B | L0A+L0B | 1.0k | 1.0k | 24.6k | GM | 1.00× | 16KB / 8KB |
 
-1D 切薄后必搬入 Bound；2D 把 pair 从 31 抬到 85，是软件侧缓解搬入的办法。2D 后两侧 tile 都不够大，L1-only 双侧重载更狠，L0 收益反而更大。
+闭式时间加速比全是 1：四场景都是 \(T_{GM}>T_{MTE1}\)。  
+**容量收益不对偶**：SplitA 的面积在 L0B，SplitB 的面积在 L0A，SplitK 两侧都要满配，SplitA+B 两侧都缩小。  
+**带宽流量收益**仍按式 (2)：SplitA 的 L0A 把 A 路 L1 流量压 64×（\(T_A\): 8.2k→128），SplitB 的 L0B 把 B 路压 64×（\(T_B\): 16.4k→256）。
 
-复现命令：
+带 L1 pulse 延迟 \(L=16\)（mmad 直连、留 L0B）后，时间才拉开：
 
-```bash
-python3 tools/l0_model/matmul_hierarchy_model.py --out tools/l0_model/out
-```
+| 场景 | \(L=0\) | \(L=1\) | \(L=16\) vs L0A+L0B |
+|---|---|---|---|
+| SplitA / SplitB | 1.00× | 1.00× | **2.06×** |
+| SplitK | 1.00× | 1.00× | **2.00×** |
+| SplitA+B | 1.00× | 1.00× | **5.67×**（\(T_{GM}\) 低，延迟先顶穿） |
 
-原始表：`tools/l0_model/out/run_report.md`、`tools/l0_model/out/hierarchy_ablation.csv`。
+仿真（碎读+端口）与 \(L=16\) 同方向：32 核 A-split 约 2.2×，2D 约 5.4×。
+
+### 3.3 取消 L0A、mmad 从 L1、A 路 ×μ（保留 L0B）
+
+四场景在 \(\mu=1\ldots64\) 下 **\(T\) 全部等于 L0A+L0B**（屋顶是 GM 或 Cube，\(T_A\) 已被挡住）。  
+\(\mu=\mu^\ast\) 只把 \(T_A\) 收到与 L0A 相同（SplitA：128 cyc），**不改变 \(T\)**。
+
+要在流量上也对齐 L0A，SplitA/SplitK 需要 **32768 B/cyc** 的 L1→Cube A 口，是现网 L1→L0A 的 64 倍，且 L1 每个 pulse 仍读 \(\eta_A\) 次，bank 翻转不降。  
+把 \(\eta_A\) 做成 1 的唯一办法是 **复用缓冲**，容量仍是式 (6) 的 \(S_{L0A}\)，只是焊在 L1 边上，等价于 L0A。
 
 ---
 
 ## 4. 结论
 
-1. **L1 不能替代 L0A/L0B。** L1 按式 (2) 缓存搬入块 \(m·k_a\)、\(k_b·n\)；Cube 按 16×16 供数。无 L0 则式 (3) 把 L1 流量放大 \(n/16\)、\(m/16\)，L1 从搬入缓存变成碎读源。
-2. **L0B 比 L0A 更硬。** 式 (5)：\(n_{l0}\ge 32\) 才能用 256 B/cyc 填入跟上 512 B/cyc 的 B 口。仅 L0A 利用率 49%；有 L0B 后 **97%，计算 Bound 约 3.2×**（闭式 3.0×）。
-3. **L0A 仍然必要，且须与 L0B 等容量。** 切 B / 宽 N / 转置后 A 侧出现同样的重载；Cube A 口与 layout（ZZ）只能接 L0A。规格对称 64KB+64KB。
-4. **L0A、L0B 与 L1 的合理比例是 1/8。** 64KB/512KB=1/8，与工作集比 \(\rho_B\approx 1/8\) 一致。低于约 8KB（1/64）伤 ping-pong；高于 64KB 无算力收益。搬入 Bound 应加 L1（更长 \(k_{l1}\)），不应加 L0。
-5. **搬入 Bound 下 L0 不省 HBM 字节，但保住搬入屋顶。** 闭式加速比 1.0；仿真因碎读先顶死 L1，32 核 A-split **2.2×**、2D-split **5.4×**。软件用 2D 切 \(M,N\) 提高式 (1) 的 pair；硬件用 L0 保证切完后 L1 仍能当搬入缓存用。
+1. **SplitA**：时间由 GM 定。L0A 容量只需 2KB，收益是 A 路流量 /64；L0B 必须 64KB 才能稳住 \(n=1024\)，且 \(m=32\) 卡在式 (5)。  
+2. **SplitB**：与 SplitA 对偶。L0A 必须 64KB；L0B 2KB。无 L0B 时 \(\eta_B=64\)，单核计算 Bound 上这就是 3× 时间。  
+3. **SplitK**：pair 不降，C 写让 \(T_{GM}\) 更大。\(\eta_A=\eta_B=64\)，L0A、L0B 都要 64KB。切 K 不能代替 L0。  
+4. **SplitA+B**：容量降到 16KB+8KB，\(\eta\) 仍是 8 与 16。\(T_{GM}\) 最低，L1 pulse 延迟最容易先爆（\(L=16\) 时 5.7×）。  
+5. **L0B 的带宽收益是时间刚需**（无 L0B ⇒ \(T_B\ge 2T_{\mathrm{cube}}\)）。**L0A 的带宽收益首先是流量 \(\eta_A=n/C\) 和 L1 占用**；时间收益出现在 L1 非全流水或与 MTE2 争口时。  
+6. **取消 L0A、mmad 直连 L1、只加该路带宽，不能达成与 L0A 相同的收益。** 式 (7)：\(\mu=1\) 时 \(T_A\) 已等于 \(T_{\mathrm{cube}}\)，再加带宽时间为零。要对齐流量需 \(\mu^\ast=n/C\)（SplitA 为 64×、32768 B/cyc），代价是把 Cube 宽口做到大容量 L1 上，且不消除 \(\eta_A\) 次读。要 \(\eta_A=1\) 必须加一块 \(2mCs\) 的复用缓冲——那就是 L0A。

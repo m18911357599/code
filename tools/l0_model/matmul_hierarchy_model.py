@@ -61,9 +61,19 @@ class Arch:
         return self.macs_per_cycle * self.dtype_in / self.bw_gm_l1
 
     @property
-    def min_n_for_l0b_fill(self) -> float:
-        """n_l0 so that L1->L0B=256 B/cyc can keep Cube B-port=512 B/cyc busy."""
+    def min_n_for_l0a_fill(self) -> float:
+        """n_l0 so L1->L0A=512 B/cyc hides behind Cube (A-fill)."""
+        return self.macs_per_cycle * self.dtype_in / self.bw_l1_l0a
+
+    @property
+    def min_m_for_l0b_fill(self) -> float:
+        """m_l0 so L1->L0B=256 B/cyc hides behind Cube (B-fill)."""
         return self.macs_per_cycle * self.dtype_in / self.bw_l1_l0b
+
+    @property
+    def min_n_for_l0b_fill(self) -> float:
+        # kept for older call sites; B-fill hide is on m, see min_m_for_l0b_fill.
+        return self.min_m_for_l0b_fill
 
 
 @dataclass(frozen=True)
@@ -150,6 +160,8 @@ def split_shape(m: int, n: int, k: int, block_num: int, mode: str) -> Tuple[int,
         return min(m, _align_up(math.ceil(m / block_num))), n, k
     if mode == "B":
         return m, min(n, _align_up(math.ceil(n / block_num))), k
+    if mode == "K":
+        return m, n, min(k, _align_up(math.ceil(k / block_num)))
     if mode == "2D":
         g_m = int(math.floor(math.sqrt(block_num)))
         while g_m > 1 and block_num % g_m != 0:
@@ -218,7 +230,7 @@ def pick_l0_shape(arch: Arch, hier: Hierarchy, m: int, n: int, k: int) -> Tuple[
                     else:
                         n_l1 = math.ceil(k / k1)
                     t_gm = (m * k + n * k) * s / arch.bw_gm_l1 + n_l1 * arch.gm_latency
-                    hide_b = min(n0 / arch.min_n_for_l0b_fill, 1.0) if hier.has_l0b else 1.0
+                    hide_b = min(m0 / arch.min_m_for_l0b_fill, 1.0) if hier.has_l0b else 1.0
                     score = (-max(t_cube, t_gm, t_mte1), -t_mte1, hide_b, k1, m0 * n0 * k0)
                     if best_score is None or score > best_score:
                         best_score = score
@@ -405,6 +417,201 @@ HIER_VARIANTS = (
 )
 
 
+# ---------------------------------------------------------------------------
+# Closed-form proof (no tiler). Source of the markdown equations.
+# ---------------------------------------------------------------------------
+
+@dataclass
+class Closed:
+    name: str
+    m: int
+    n: int
+    k: int
+    t_cube: float
+    t_gm: float
+    t_a: float
+    t_b: float
+    t_mte1: float
+    t: float
+    bound: str
+    a_reload: float
+    b_reload: float
+    bw_a: float
+    has_l0a: bool
+    has_l0b: bool
+    s_l0a: int
+    s_l0b: int
+
+    @property
+    def cube_util(self) -> float:
+        return self.t_cube / self.t if self.t else 0.0
+
+
+def closed_form(
+    arch: Arch,
+    m: int,
+    n: int,
+    k: int,
+    has_l0a: bool,
+    has_l0b: bool,
+    bw_a: Optional[float] = None,
+    a_from_l1_mmad: bool = False,
+    split_k_cstore: bool = False,
+) -> Closed:
+    """Roofline (7): T = max(T_cube, T_GM, T_MTE1), no prologue.
+
+    a_from_l1_mmad: Cube/MMAD issues A from L1 every 16-wide pulse (reload n/C)
+    even if bw_a is boosted. This is the 'cancel L0A, raise this path' model.
+    """
+    s, p, c = arch.dtype_in, arch.macs_per_cycle, arch.cube_n
+    ba = arch.bw_l1_l0a if bw_a is None else bw_a
+    bb = arch.bw_l1_l0b
+    t_cube = m * n * k / p
+    t_gm = (m * k + n * k) * s / arch.bw_gm_l1
+    if split_k_cstore:
+        t_gm += m * n * s / arch.bw_gm_l1
+
+    if a_from_l1_mmad or not has_l0a:
+        a_reload = n / c
+    else:
+        a_reload = 1.0
+    b_reload = 1.0 if has_l0b else (m / arch.cube_m)
+
+    t_a = m * k * s * a_reload / ba
+    t_b = n * k * s * b_reload / bb
+    if not has_l0b:
+        t_b = max(t_b, t_cube * (arch.cube_b_bw / bb))
+
+    shared = (a_from_l1_mmad or not has_l0a) and not has_l0b
+    t_mte1 = (t_a + t_b) if shared else max(t_a, t_b)
+    t = max(t_cube, t_gm, t_mte1)
+    bound = max({"cube": t_cube, "gm": t_gm, "mte1": t_mte1}, key=lambda x: {"cube": t_cube, "gm": t_gm, "mte1": t_mte1}[x])
+    k0 = min(k, arch.cube_k)
+    s_l0a = 2 * m * k0 * s if has_l0a else 0
+    s_l0b = 2 * k0 * n * s if has_l0b else 0
+    # clip to physical L0 if the unsplit operand does not fit: tiler would n-panel.
+    if has_l0a:
+        s_l0a = min(s_l0a, arch.l0a_size)
+    if has_l0b:
+        s_l0b = min(s_l0b, arch.l0b_size)
+    return Closed(
+        "", m, n, k, t_cube, t_gm, t_a, t_b, t_mte1, t, bound,
+        a_reload, b_reload, ba, has_l0a, has_l0b, s_l0a, s_l0b,
+    )
+
+
+def required_mmad_bw(arch: Arch, n: int) -> float:
+    """B_L1,A so that MMAD-from-L1 (reload n/C) matches L0A fill T_A = mKs/B_A.
+
+    Cancel m,K,s: B_L1,A = B_A * (n/C).
+    """
+    return arch.bw_l1_l0a * (n / arch.cube_n)
+
+
+def proof_tables(arch: Arch, m: int = 1024, n: int = 1024, k: int = 1024, g: int = 32) -> str:
+    lines = ["## Closed-form proof tables\n"]
+    specs = [
+        ("SplitA", "A", False),
+        ("SplitB", "B", False),
+        ("SplitK", "K", True),
+        ("SplitA+B", "2D", False),
+    ]
+    cfgs = [
+        ("L1-only", False, False, None, False),
+        ("L0A-only", True, False, None, False),
+        ("L0B-only", False, True, None, False),
+        ("L0A+L0B", True, True, None, False),
+    ]
+    lines.append("### Single-core no-split (1024^3, compute-bound reference)\n")
+    lines.append(
+        "| hier | A-reload | B-reload | T_cube | T_GM | T_A | T_B | T | bound | vs L1-only |"
+    )
+    lines.append("|---|---|---|---|---|---|---|---|---|---|")
+    base1 = closed_form(arch, m, n, k, False, False)
+    for cname, ha, hb, bwa, mmad in cfgs:
+        r = closed_form(arch, m, n, k, ha, hb, bw_a=bwa, a_from_l1_mmad=mmad)
+        lines.append(
+            f"| {cname} | {r.a_reload:.1f} | {r.b_reload:.1f} | {_fmt(r.t_cube,1)} | "
+            f"{_fmt(r.t_gm,1)} | {_fmt(r.t_a,1)} | {_fmt(r.t_b,1)} | {_fmt(r.t,1)} | "
+            f"{r.bound} | {base1.t/r.t:.2f}x |"
+        )
+    lines.append("")
+    lines.append("### Per-split hierarchy (1024^3, blockNum=32)\n")
+    lines.append(
+        "| split | hier | m×n×k | A-reload | B-reload | T_cube | T_GM | T_A | T_B | T | bound | vs L1-only | L0A cap | L0B cap |"
+    )
+    lines.append("|---|---|---|---|---|---|---|---|---|---|---|---|---|---|")
+    for sname, mode, kstore in specs:
+        mc, nc, kc = split_shape(m, n, k, g, mode)
+        base = closed_form(arch, mc, nc, kc, False, False, split_k_cstore=kstore)
+        for cname, ha, hb, bwa, mmad in cfgs:
+            r = closed_form(arch, mc, nc, kc, ha, hb, bw_a=bwa, a_from_l1_mmad=mmad, split_k_cstore=kstore)
+            r.name = f"{sname}/{cname}"
+            sp = base.t / r.t if r.t else 0
+            lines.append(
+                f"| {sname} | {cname} | {mc}×{nc}×{kc} | {r.a_reload:.1f} | {r.b_reload:.1f} | "
+                f"{_fmt(r.t_cube,1)} | {_fmt(r.t_gm,1)} | {_fmt(r.t_a,1)} | {_fmt(r.t_b,1)} | "
+                f"{_fmt(r.t,1)} | {r.bound} | {sp:.2f}x | {r.s_l0a} | {r.s_l0b} |"
+            )
+    lines.append("")
+
+    lines.append("### Cancel L0A, MMAD from L1, boost A-path ×μ (keep L0B)\n")
+    lines.append(
+        "| split | n | μ | B_L1,A | μ* = n/16 | T_A | T | bound | vs L0A+L0B | match? |"
+    )
+    lines.append("|---|---|---|---|---|---|---|---|---|---|")
+    for sname, mode, kstore in specs:
+        mc, nc, kc = split_shape(m, n, k, g, mode)
+        gold = closed_form(arch, mc, nc, kc, True, True, split_k_cstore=kstore)
+        mu_star = nc / arch.cube_n
+        for mu in (1, 2, 4, 8, 16, 32, 64):
+            r = closed_form(
+                arch, mc, nc, kc, False, True,
+                bw_a=arch.bw_l1_l0a * mu, a_from_l1_mmad=True, split_k_cstore=kstore,
+            )
+            match = "yes" if r.t <= gold.t * 1.02 else "no"
+            lines.append(
+                f"| {sname} | {nc} | {mu} | {arch.bw_l1_l0a*mu:.0f} | {mu_star:.0f} | "
+                f"{_fmt(r.t_a,1)} | {_fmt(r.t,1)} | {r.bound} | {r.t/gold.t:.2f}×gold | {match} |"
+            )
+    lines.append("")
+    lines.append(
+        "Roofline note: T_A(MMAD)/T_cube = P s / (C B_A) = 1 when B_A=512, "
+        "independent of n. Boosting μ>1 cannot beat Cube time; it only helps "
+        "if L1 A-port was narrower than 512, or if pulse latency / shared ports apply.\n"
+    )
+    lines.append("### MMAD-from-L1 plus L1 pulse latency L (keep L0B, μ=1, B_A=512)\n")
+    lines.append("| split | L (cyc/pulse) | N_pulse | T_A+N L | T | vs L0A+L0B |")
+    lines.append("|---|---|---|---|---|---|")
+    for sname, mode, kstore in specs:
+        mc, nc, kc = split_shape(m, n, k, g, mode)
+        gold = closed_form(arch, mc, nc, kc, True, True, split_k_cstore=kstore)
+        r = closed_form(arch, mc, nc, kc, False, True, a_from_l1_mmad=True, split_k_cstore=kstore)
+        n_pulse = (mc / arch.cube_m) * (nc / arch.cube_n) * (kc / arch.cube_k)
+        for lat in (0, 1, 16):
+            t_al = r.t_a + n_pulse * lat
+            t = max(r.t_cube, r.t_gm, t_al, r.t_b)
+            lines.append(
+                f"| {sname} | {lat} | {_fmt(n_pulse,1)} | {_fmt(t_al,1)} | {_fmt(t,1)} | {t/gold.t:.2f}x |"
+            )
+    lines.append("")
+    lines.append("### Required μ* and capacity (ping-pong, one K-slice of cube_k=16)\n")
+    lines.append("| split | m×n×k | μ*=n/16 | B_L1,A* (B/cyc) | L0A≥2 m C s | L0B≥2 C n s | η_A=n/C | η_B=m/C |")
+    lines.append("|---|---|---|---|---|---|---|---|")
+    s = arch.dtype_in
+    for sname, mode, _kstore in specs:
+        mc, nc, kc = split_shape(m, n, k, g, mode)
+        mu_star = nc / arch.cube_n
+        cap_a = 2 * mc * arch.cube_k * s
+        cap_b = 2 * arch.cube_k * nc * s
+        lines.append(
+            f"| {sname} | {mc}×{nc}×{kc} | {mu_star:.0f} | {arch.bw_l1_l0a*mu_star:.0f} | "
+            f"{cap_a} | {cap_b} | {nc/arch.cube_n:.1f} | {mc/arch.cube_m:.1f} |"
+        )
+    lines.append("")
+    return "\n".join(lines) + "\n"
+
+
 def _fmt(x: float, digits: int = 2) -> str:
     if math.isinf(x):
         return "inf"
@@ -560,7 +767,8 @@ def analytical_lines(arch: Arch) -> str:
     )
     lines.append(
         f"- B-port at m=16: `{arch.cube_b_bw:.0f} B/cyc`, but L1→L0B="
-        f"{arch.bw_l1_l0b:.0f}. Hide-fill requires `n_l0 >= P*s/BW_B = {arch.min_n_for_l0b_fill:.0f}`.\n"
+        f"{arch.bw_l1_l0b:.0f}. A-fill hide `n_l0 >= {arch.min_n_for_l0a_fill:.0f}`; "
+        f"B-fill hide `m_l0 >= {arch.min_m_for_l0b_fill:.0f}`.\n"
     )
     lines.append(
         f"- 搬入-bound iff `mn/(m+n) < P*s/B_GM = {arch.compute_bound_pair_size:.0f}`. "
@@ -578,6 +786,7 @@ def analytical_lines(arch: Arch) -> str:
         (1024, 1024, 1024, 1, "A", "1-core 1024^3"),
         (1024, 1024, 1024, 32, "A", "32-core A-split"),
         (1024, 1024, 1024, 32, "2D", "32-core 2D-split"),
+        (1024, 1024, 1024, 32, "K", "32-core K-split"),
         (16, 4096, 4096, 8, "B", "decode-like 16x4096"),
         (1024, 4096, 1024, 1, "A", "wide-N 1024x4096"),
         (4096, 1024, 1024, 1, "A", "tall-M 4096x1024"),
@@ -621,7 +830,21 @@ def self_check(arch: Arch) -> List[str]:
     msgs.append(f"OK L0A 64KB ({r64.cycles:.0f}) <= 8KB ({r8.cycles:.0f})")
     assert abs(arch.cube_a_bw - arch.bw_l1_l0a) < 1e-6
     msgs.append(f"OK Cube A-port {arch.cube_a_bw:.0f} == L1→L0A")
-    msgs.append(f"OK L0B hide-fill n_l0 >= {arch.min_n_for_l0b_fill:.0f}")
+    msgs.append(
+        f"OK hide-fill n_l0>={arch.min_n_for_l0a_fill:.0f} (A), "
+        f"m_l0>={arch.min_m_for_l0b_fill:.0f} (B)"
+    )
+    mk, nk, kk = split_shape(1024, 1024, 1024, 32, "K")
+    assert kk == 32 and mk == 1024 and nk == 1024
+    msgs.append(f"OK SplitK 32c per-core {mk}x{nk}x{kk}")
+    gold = closed_form(arch, 1024, 1024, 1024, True, True)
+    mmad1 = closed_form(arch, 1024, 1024, 1024, False, True, bw_a=512, a_from_l1_mmad=True)
+    mmad64 = closed_form(arch, 1024, 1024, 1024, False, True, bw_a=512 * 64, a_from_l1_mmad=True)
+    assert abs(mmad1.t - gold.t) < 1.0 or mmad1.t >= gold.t
+    msgs.append(
+        f"OK MMAD-from-L1 μ=1 T={mmad1.t:.0f} vs L0A T={gold.t:.0f} "
+        f"(A-pipe T_A/T_cube=1 at 512 B/cyc); μ=64 T={mmad64.t:.0f}"
+    )
     only_a = simulate_core(arch, Hierarchy(True, False), 1024, 1024, 1024)
     only_b = simulate_core(arch, Hierarchy(False, True), 1024, 1024, 1024)
     msgs.append(
@@ -645,12 +868,14 @@ def run(out_dir: str, artifact_dir: Optional[str] = None) -> str:
         md.append(f"- {msg}")
     md.append("")
     md.append(analytical_lines(arch))
+    md.append(proof_tables(arch))
 
     shapes = [
         (1024, 1024, 1024, 1, "A"),
         (1024, 1024, 1024, 32, "A"),
         (1024, 1024, 1024, 32, "B"),
         (1024, 1024, 1024, 32, "2D"),
+        (1024, 1024, 1024, 32, "K"),
         (16, 4096, 4096, 8, "B"),
         (2048, 4096, 4096, 24, "A"),
         (4096, 4096, 1024, 32, "2D"),
@@ -742,11 +967,12 @@ def run(out_dir: str, artifact_dir: Optional[str] = None) -> str:
         title="Multi-core split: L0 gain vs reload/port contention",
     )
 
-    labels = ["1c 1024^3", "32c A-split", "32c 2D-split", "8c 16x4096"]
+    labels = ["1c 1024^3", "32c A-split", "32c 2D-split", "32c K-split", "8c 16x4096"]
     scenarios = [
         (1024, 1024, 1024, 1, "A"),
         (1024, 1024, 1024, 32, "A"),
         (1024, 1024, 1024, 32, "2D"),
+        (1024, 1024, 1024, 32, "K"),
         (16, 4096, 4096, 8, "B"),
     ]
     groups = []

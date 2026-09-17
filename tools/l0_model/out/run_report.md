@@ -6,22 +6,119 @@ Self-check:
 - OK A-split 32c per-core 32x1024 is 搬入-bound
 - OK L0A 64KB (270476) <= 8KB (270476)
 - OK Cube A-port 512 == L1→L0A
-- OK L0B hide-fill n_l0 >= 32
+- OK hide-fill n_l0>=16 (A), m_l0>=32 (B)
+- OK SplitK 32c per-core 1024x1024x32
+- OK MMAD-from-L1 μ=1 T=262144 vs L0A T=262144 (A-pipe T_A/T_cube=1 at 512 B/cyc); μ=64 T=262144
 - OK ablation 1024^3 L0A-only 532680 bound=mte1; L0B-only 270474 bound=cube
-- OK wide-N 1024x4096x1024 L0A+L0B 1053833 vs L0B-only 1053833 (1.00x L0A extra)
+- OK wide-N 1024x4096x1024 L0A+L0B 1053834 vs L0B-only 1053833 (1.00x L0A extra)
 
 ## Closed-form necessities (independent of the tiler)
 - Cube FP16 peak: 4096 MAC/cyc. A-port at n=16: `P*s/n = 512 B/cyc` (matches L1→L0A=512).
-- B-port at m=16: `512 B/cyc`, but L1→L0B=256. Hide-fill requires `n_l0 >= P*s/BW_B = 32`.
+- B-port at m=16: `512 B/cyc`, but L1→L0B=256. A-fill hide `n_l0 >= 16`; B-fill hide `m_l0 >= 32`.
 - 搬入-bound iff `mn/(m+n) < P*s/B_GM = 256`. Square GEMM needs m=n>`512` to be compute-bound from HBM.
 - Without L0A, L1 A-traffic is `m*K*s*(n/16)`; without L0B, L1 B-traffic is `n*K*s*(m/16)`.
 - L1 ping-pong working set `2*k_l1*(m+n)*s`; L0A ping-pong `2*m0*k0*s`. Ratio `L0A/L1 ≈ (m0*k0)/(k_l1*(m+n))`. With typical k_l1=4..8 k0 and m≈n, ratio ≈ 1/8 to 1/16.
 - **1-core 1024^3**: per-core 1024x1024x1024, pair=512.0 (计算Bound); no-L0 T≈786.4k (A-reload 64x, B-reload 64x) vs L0 T≈262.1k → **3.00x**.
 - **32-core A-split**: per-core 32x1024x1024, pair=31.0 (搬入Bound); no-L0 T≈67.6k (A-reload 64x, B-reload 2x) vs L0 T≈67.6k → **1.00x**.
 - **32-core 2D-split**: per-core 256x128x1024, pair=85.3 (搬入Bound); no-L0 T≈24.6k (A-reload 8x, B-reload 16x) vs L0 T≈24.6k → **1.00x**.
+- **32-core K-split**: per-core 1024x1024x32, pair=512.0 (计算Bound); no-L0 T≈24.6k (A-reload 64x, B-reload 64x) vs L0 T≈8.2k → **3.00x**.
 - **decode-like 16x4096**: per-core 16x512x4096, pair=15.5 (搬入Bound); no-L0 T≈135.2k (A-reload 32x, B-reload 1x) vs L0 T≈135.2k → **1.00x**.
 - **wide-N 1024x4096**: per-core 1024x4096x1024, pair=819.2 (计算Bound); no-L0 T≈3.1M (A-reload 256x, B-reload 64x) vs L0 T≈1.0M → **3.00x**.
 - **tall-M 4096x1024**: per-core 4096x1024x1024, pair=819.2 (计算Bound); no-L0 T≈3.1M (A-reload 64x, B-reload 256x) vs L0 T≈1.0M → **3.00x**.
+
+
+## Closed-form proof tables
+
+### Single-core no-split (1024^3, compute-bound reference)
+
+| hier | A-reload | B-reload | T_cube | T_GM | T_A | T_B | T | bound | vs L1-only |
+|---|---|---|---|---|---|---|---|---|---|
+| L1-only | 64.0 | 64.0 | 262.1k | 131.1k | 262.1k | 524.3k | 786.4k | mte1 | 1.00x |
+| L0A-only | 1.0 | 64.0 | 262.1k | 131.1k | 4.1k | 524.3k | 524.3k | mte1 | 1.50x |
+| L0B-only | 64.0 | 1.0 | 262.1k | 131.1k | 262.1k | 8.2k | 262.1k | cube | 3.00x |
+| L0A+L0B | 1.0 | 1.0 | 262.1k | 131.1k | 4.1k | 8.2k | 262.1k | cube | 3.00x |
+
+### Per-split hierarchy (1024^3, blockNum=32)
+
+| split | hier | m×n×k | A-reload | B-reload | T_cube | T_GM | T_A | T_B | T | bound | vs L1-only | L0A cap | L0B cap |
+|---|---|---|---|---|---|---|---|---|---|---|---|---|---|
+| SplitA | L1-only | 32×1024×1024 | 64.0 | 2.0 | 8.2k | 67.6k | 8.2k | 16.4k | 67.6k | gm | 1.00x | 0 | 0 |
+| SplitA | L0A-only | 32×1024×1024 | 1.0 | 2.0 | 8.2k | 67.6k | 128.0 | 16.4k | 67.6k | gm | 1.00x | 2048 | 0 |
+| SplitA | L0B-only | 32×1024×1024 | 64.0 | 1.0 | 8.2k | 67.6k | 8.2k | 8.2k | 67.6k | gm | 1.00x | 0 | 65536 |
+| SplitA | L0A+L0B | 32×1024×1024 | 1.0 | 1.0 | 8.2k | 67.6k | 128.0 | 8.2k | 67.6k | gm | 1.00x | 2048 | 65536 |
+| SplitB | L1-only | 1024×32×1024 | 2.0 | 64.0 | 8.2k | 67.6k | 8.2k | 16.4k | 67.6k | gm | 1.00x | 0 | 0 |
+| SplitB | L0A-only | 1024×32×1024 | 1.0 | 64.0 | 8.2k | 67.6k | 4.1k | 16.4k | 67.6k | gm | 1.00x | 65536 | 0 |
+| SplitB | L0B-only | 1024×32×1024 | 2.0 | 1.0 | 8.2k | 67.6k | 8.2k | 256.0 | 67.6k | gm | 1.00x | 0 | 2048 |
+| SplitB | L0A+L0B | 1024×32×1024 | 1.0 | 1.0 | 8.2k | 67.6k | 4.1k | 256.0 | 67.6k | gm | 1.00x | 65536 | 2048 |
+| SplitK | L1-only | 1024×1024×32 | 64.0 | 64.0 | 8.2k | 69.6k | 8.2k | 16.4k | 69.6k | gm | 1.00x | 0 | 0 |
+| SplitK | L0A-only | 1024×1024×32 | 1.0 | 64.0 | 8.2k | 69.6k | 128.0 | 16.4k | 69.6k | gm | 1.00x | 65536 | 0 |
+| SplitK | L0B-only | 1024×1024×32 | 64.0 | 1.0 | 8.2k | 69.6k | 8.2k | 256.0 | 69.6k | gm | 1.00x | 0 | 65536 |
+| SplitK | L0A+L0B | 1024×1024×32 | 1.0 | 1.0 | 8.2k | 69.6k | 128.0 | 256.0 | 69.6k | gm | 1.00x | 65536 | 65536 |
+| SplitA+B | L1-only | 256×128×1024 | 8.0 | 16.0 | 8.2k | 24.6k | 8.2k | 16.4k | 24.6k | gm | 1.00x | 0 | 0 |
+| SplitA+B | L0A-only | 256×128×1024 | 1.0 | 16.0 | 8.2k | 24.6k | 1.0k | 16.4k | 24.6k | gm | 1.00x | 16384 | 0 |
+| SplitA+B | L0B-only | 256×128×1024 | 8.0 | 1.0 | 8.2k | 24.6k | 8.2k | 1.0k | 24.6k | gm | 1.00x | 0 | 8192 |
+| SplitA+B | L0A+L0B | 256×128×1024 | 1.0 | 1.0 | 8.2k | 24.6k | 1.0k | 1.0k | 24.6k | gm | 1.00x | 16384 | 8192 |
+
+### Cancel L0A, MMAD from L1, boost A-path ×μ (keep L0B)
+
+| split | n | μ | B_L1,A | μ* = n/16 | T_A | T | bound | vs L0A+L0B | match? |
+|---|---|---|---|---|---|---|---|---|---|
+| SplitA | 1024 | 1 | 512 | 64 | 8.2k | 67.6k | gm | 1.00×gold | yes |
+| SplitA | 1024 | 2 | 1024 | 64 | 4.1k | 67.6k | gm | 1.00×gold | yes |
+| SplitA | 1024 | 4 | 2048 | 64 | 2.0k | 67.6k | gm | 1.00×gold | yes |
+| SplitA | 1024 | 8 | 4096 | 64 | 1.0k | 67.6k | gm | 1.00×gold | yes |
+| SplitA | 1024 | 16 | 8192 | 64 | 512.0 | 67.6k | gm | 1.00×gold | yes |
+| SplitA | 1024 | 32 | 16384 | 64 | 256.0 | 67.6k | gm | 1.00×gold | yes |
+| SplitA | 1024 | 64 | 32768 | 64 | 128.0 | 67.6k | gm | 1.00×gold | yes |
+| SplitB | 32 | 1 | 512 | 2 | 8.2k | 67.6k | gm | 1.00×gold | yes |
+| SplitB | 32 | 2 | 1024 | 2 | 4.1k | 67.6k | gm | 1.00×gold | yes |
+| SplitB | 32 | 4 | 2048 | 2 | 2.0k | 67.6k | gm | 1.00×gold | yes |
+| SplitB | 32 | 8 | 4096 | 2 | 1.0k | 67.6k | gm | 1.00×gold | yes |
+| SplitB | 32 | 16 | 8192 | 2 | 512.0 | 67.6k | gm | 1.00×gold | yes |
+| SplitB | 32 | 32 | 16384 | 2 | 256.0 | 67.6k | gm | 1.00×gold | yes |
+| SplitB | 32 | 64 | 32768 | 2 | 128.0 | 67.6k | gm | 1.00×gold | yes |
+| SplitK | 1024 | 1 | 512 | 64 | 8.2k | 69.6k | gm | 1.00×gold | yes |
+| SplitK | 1024 | 2 | 1024 | 64 | 4.1k | 69.6k | gm | 1.00×gold | yes |
+| SplitK | 1024 | 4 | 2048 | 64 | 2.0k | 69.6k | gm | 1.00×gold | yes |
+| SplitK | 1024 | 8 | 4096 | 64 | 1.0k | 69.6k | gm | 1.00×gold | yes |
+| SplitK | 1024 | 16 | 8192 | 64 | 512.0 | 69.6k | gm | 1.00×gold | yes |
+| SplitK | 1024 | 32 | 16384 | 64 | 256.0 | 69.6k | gm | 1.00×gold | yes |
+| SplitK | 1024 | 64 | 32768 | 64 | 128.0 | 69.6k | gm | 1.00×gold | yes |
+| SplitA+B | 128 | 1 | 512 | 8 | 8.2k | 24.6k | gm | 1.00×gold | yes |
+| SplitA+B | 128 | 2 | 1024 | 8 | 4.1k | 24.6k | gm | 1.00×gold | yes |
+| SplitA+B | 128 | 4 | 2048 | 8 | 2.0k | 24.6k | gm | 1.00×gold | yes |
+| SplitA+B | 128 | 8 | 4096 | 8 | 1.0k | 24.6k | gm | 1.00×gold | yes |
+| SplitA+B | 128 | 16 | 8192 | 8 | 512.0 | 24.6k | gm | 1.00×gold | yes |
+| SplitA+B | 128 | 32 | 16384 | 8 | 256.0 | 24.6k | gm | 1.00×gold | yes |
+| SplitA+B | 128 | 64 | 32768 | 8 | 128.0 | 24.6k | gm | 1.00×gold | yes |
+
+Roofline note: T_A(MMAD)/T_cube = P s / (C B_A) = 1 when B_A=512, independent of n. Boosting μ>1 cannot beat Cube time; it only helps if L1 A-port was narrower than 512, or if pulse latency / shared ports apply.
+
+### MMAD-from-L1 plus L1 pulse latency L (keep L0B, μ=1, B_A=512)
+
+| split | L (cyc/pulse) | N_pulse | T_A+N L | T | vs L0A+L0B |
+|---|---|---|---|---|---|
+| SplitA | 0 | 8.2k | 8.2k | 67.6k | 1.00x |
+| SplitA | 1 | 8.2k | 16.4k | 67.6k | 1.00x |
+| SplitA | 16 | 8.2k | 139.3k | 139.3k | 2.06x |
+| SplitB | 0 | 8.2k | 8.2k | 67.6k | 1.00x |
+| SplitB | 1 | 8.2k | 16.4k | 67.6k | 1.00x |
+| SplitB | 16 | 8.2k | 139.3k | 139.3k | 2.06x |
+| SplitK | 0 | 8.2k | 8.2k | 69.6k | 1.00x |
+| SplitK | 1 | 8.2k | 16.4k | 69.6k | 1.00x |
+| SplitK | 16 | 8.2k | 139.3k | 139.3k | 2.00x |
+| SplitA+B | 0 | 8.2k | 8.2k | 24.6k | 1.00x |
+| SplitA+B | 1 | 8.2k | 16.4k | 24.6k | 1.00x |
+| SplitA+B | 16 | 8.2k | 139.3k | 139.3k | 5.67x |
+
+### Required μ* and capacity (ping-pong, one K-slice of cube_k=16)
+
+| split | m×n×k | μ*=n/16 | B_L1,A* (B/cyc) | L0A≥2 m C s | L0B≥2 C n s | η_A=n/C | η_B=m/C |
+|---|---|---|---|---|---|---|---|
+| SplitA | 32×1024×1024 | 64 | 32768 | 2048 | 65536 | 64.0 | 2.0 |
+| SplitB | 1024×32×1024 | 2 | 1024 | 65536 | 2048 | 2.0 | 64.0 |
+| SplitK | 1024×1024×32 | 64 | 32768 | 65536 | 65536 | 64.0 | 64.0 |
+| SplitA+B | 256×128×1024 | 8 | 4096 | 16384 | 8192 | 8.0 | 16.0 |
 
 
 ## Hierarchy ablation
@@ -37,7 +134,7 @@ Self-check:
 | L1-only | 32x1024x1024 | mte1 | 5.0% | 41.6% | 64.0 | 2.0 | 0.000 | 0.000 | 165.2k | 1.00x |
 | L0A | 32x1024x1024 | mte1 | 10.1% | 84.6% | 1.0 | 1.0 | 0.004 | 0.000 | 81.3k | 2.03x |
 | L0B | 32x1024x1024 | gm | 10.7% | 90.1% | 1.0 | 1.0 | 0.000 | 0.139 | 76.3k | 2.17x |
-| L0A+L0B | 32x1024x1024 | gm | 10.7% | 90.1% | 1.0 | 1.0 | 0.002 | 0.139 | 76.3k | 2.17x |
+| L0A+L0B | 32x1024x1024 | gm | 10.7% | 90.1% | 1.0 | 1.0 | 0.004 | 0.069 | 76.3k | 2.17x |
 | L1-only/sharedL1 | 1024x32x1024 | mte1 | 3.6% | 45.1% | 2.0 | 64.0 | 0.000 | 0.000 | 228.7k | 1.00x |
 | L1-only | 1024x32x1024 | mte1 | 3.6% | 30.1% | 2.0 | 64.0 | 0.000 | 0.000 | 228.7k | 1.00x |
 | L0A | 1024x32x1024 | gm | 10.7% | 90.1% | 1.0 | 1.0 | 0.139 | 0.000 | 76.4k | 2.99x |
@@ -48,6 +145,11 @@ Self-check:
 | L0A | 256x128x1024 | gm | 24.6% | 75.3% | 1.0 | 1.0 | 0.032 | 0.000 | 33.3k | 5.42x |
 | L0B | 256x128x1024 | gm | 24.6% | 75.3% | 1.0 | 1.0 | 0.000 | 0.016 | 33.3k | 5.42x |
 | L0A+L0B | 256x128x1024 | gm | 24.6% | 75.3% | 1.0 | 1.0 | 0.016 | 0.016 | 33.3k | 5.42x |
+| L1-only/sharedL1 | 1024x1024x32 | mte1 | 8.6% | 6.6% | 64.0 | 64.0 | 0.000 | 0.000 | 95.4k | 1.00x |
+| L1-only | 1024x1024x32 | mte1 | 8.6% | 4.4% | 64.0 | 64.0 | 0.000 | 0.000 | 95.4k | 1.00x |
+| L0A | 1024x1024x32 | mte1 | 39.6% | 20.4% | 1.0 | 1.0 | 0.250 | 0.000 | 20.7k | 4.61x |
+| L0B | 1024x1024x32 | cube | 65.9% | 33.9% | 2.0 | 1.0 | 0.000 | 0.250 | 12.4k | 7.67x |
+| L0A+L0B | 1024x1024x32 | cube | 65.9% | 33.9% | 2.0 | 1.0 | 0.016 | 0.250 | 12.4k | 7.67x |
 | L1-only/sharedL1 | 16x512x4096 | gm | 3.8% | 96.2% | 32.0 | 1.0 | 0.000 | 0.000 | 214.0k | 1.00x |
 | L1-only | 16x512x4096 | mte1 | 4.9% | 81.8% | 32.0 | 1.0 | 0.000 | 0.000 | 167.8k | 1.28x |
 | L0A | 16x512x4096 | mte1 | 5.3% | 88.3% | 1.0 | 1.0 | 0.002 | 0.000 | 155.5k | 1.38x |
@@ -57,7 +159,7 @@ Self-check:
 | L1-only | 96x4096x4096 | mte1 | 5.2% | 14.5% | 256.0 | 6.0 | 0.000 | 0.000 | 7.5M | 1.00x |
 | L0A | 96x4096x4096 | mte1 | 33.1% | 91.9% | 1.0 | 1.0 | 0.012 | 0.000 | 1.2M | 6.32x |
 | L0B | 96x4096x4096 | gm | 35.8% | 99.3% | 4.0 | 1.0 | 0.000 | 0.131 | 1.1M | 6.83x |
-| L0A+L0B | 96x4096x4096 | gm | 35.8% | 99.3% | 4.0 | 1.0 | 0.002 | 0.131 | 1.1M | 6.83x |
+| L0A+L0B | 96x4096x4096 | gm | 35.8% | 99.3% | 8.0 | 1.0 | 0.004 | 0.065 | 1.1M | 6.83x |
 | L1-only/sharedL1 | 1024x512x1024 | mte1 | 30.1% | 39.2% | 32.0 | 64.0 | 0.000 | 0.000 | 435.3k | 1.00x |
 | L1-only | 1024x512x1024 | mte1 | 30.1% | 26.1% | 32.0 | 64.0 | 0.000 | 0.000 | 435.3k | 1.00x |
 | L0A | 1024x512x1024 | mte1 | 48.5% | 37.0% | 1.0 | 1.0 | 0.133 | 0.000 | 270.0k | 1.61x |
@@ -67,7 +169,7 @@ Self-check:
 | L1-only | 1024x4096x1024 | mte1 | 30.7% | 13.2% | 256.0 | 64.0 | 0.000 | 0.000 | 3.4M | 1.00x |
 | L0A | 1024x4096x1024 | mte1 | 49.9% | 16.0% | 1.0 | 1.0 | 0.200 | 0.000 | 2.1M | 1.63x |
 | L0B | 1024x4096x1024 | cube | 99.5% | 31.8% | 4.0 | 1.0 | 0.000 | 0.200 | 1.1M | 3.24x |
-| L0A+L0B | 1024x4096x1024 | cube | 99.5% | 31.8% | 4.0 | 1.0 | 0.003 | 0.200 | 1.1M | 3.24x |
+| L0A+L0B | 1024x4096x1024 | cube | 99.5% | 31.8% | 8.0 | 1.0 | 0.006 | 0.100 | 1.1M | 3.24x |
 | L1-only/sharedL1 | 4096x1024x1024 | mte1 | 30.7% | 19.8% | 64.0 | 256.0 | 0.000 | 0.000 | 3.4M | 1.00x |
 | L1-only | 4096x1024x1024 | mte1 | 30.7% | 13.2% | 64.0 | 256.0 | 0.000 | 0.000 | 3.4M | 1.00x |
 | L0A | 4096x1024x1024 | mte1 | 49.9% | 16.0% | 1.0 | 4.0 | 0.200 | 0.000 | 2.1M | 1.63x |
@@ -84,7 +186,7 @@ Self-check:
 | 32 | 0.062 | 10.7% | 10.7% | 96.9% | 96.9% | 96.9% |
 | 64 | 0.125 | 10.7% | 10.7% | 96.9% | 96.9% | 96.9% |
 | 128 | 0.250 | 10.7% | 10.7% | 96.9% | 96.9% | 96.9% |
-| 256 | 0.500 | 10.7% | 10.7% | 96.9% | 96.9% | 96.9% |
+| 256 | 0.500 | 10.7% | 10.7% | 96.8% | 96.9% | 96.9% |
 
 ## blockNum sweep (1024^3)
 
@@ -95,7 +197,7 @@ Self-check:
 | 4 | A | 204.8 | yes | 91.1k | 736.9k | 736.9k | 8.09x | 8.09x | gm | mte1 |
 | 8 | A | 113.8 | yes | 83.1k | 639.0k | 639.0k | 7.69x | 7.69x | gm | mte1 |
 | 16 | A | 60.2 | yes | 78.6k | 323.1k | 323.1k | 4.11x | 4.11x | gm | mte1 |
-| 24 | A | 45.9 | yes | 77.4k | 244.2k | 244.2k | 3.15x | 3.15x | gm | mte1 |
+| 24 | A | 45.9 | yes | 77.5k | 244.2k | 244.2k | 3.15x | 3.15x | gm | mte1 |
 | 32 | A | 31.0 | yes | 76.3k | 165.2k | 165.2k | 2.17x | 2.17x | gm | mte1 |
 | 1 | 2D | 512.0 | no | 270.5k | 861.3k | 861.3k | 3.18x | 3.18x | cube | mte1 |
 | 2 | 2D | 341.3 | no | 138.9k | 435.3k | 435.3k | 3.13x | 3.13x | cube | mte1 |
@@ -110,7 +212,8 @@ Self-check:
 | scenario | L1 ws | L0A ws | L0B ws | L0A/L1 | L0B/L1 | (L0A+L0B)/L1 | tile |
 |---|---|---|---|---|---|---|---|
 | (1024, 1024, 1024, 1, 'A') | 262144 | 2048 | 32768 | 0.008 | 0.125 | 0.133 | split=A blockNum=1 per-core (1024,1024,1024); tile m=1024 n=1024 k1=64 m0=32 n0=512 k0=32 stat=B |
-| (1024, 1024, 1024, 32, 'A') | 236544 | 512 | 32768 | 0.002 | 0.139 | 0.141 | split=A blockNum=32 per-core (32,1024,1024); tile m=32 n=1024 k1=112 m0=16 n0=1024 k0=16 stat=B |
+| (1024, 1024, 1024, 32, 'A') | 236544 | 1024 | 16384 | 0.004 | 0.069 | 0.074 | split=A blockNum=32 per-core (32,1024,1024); tile m=32 n=1024 k1=112 m0=32 n0=512 k0=16 stat=A |
 | (1024, 1024, 1024, 32, '2D') | 258048 | 4096 | 4096 | 0.016 | 0.016 | 0.032 | split=2D blockNum=32 per-core (256,128,1024); tile m=256 n=128 k1=336 m0=128 n0=128 k0=16 stat=B |
+| (1024, 1024, 1024, 32, 'K') | 131072 | 2048 | 32768 | 0.016 | 0.250 | 0.266 | split=K blockNum=32 per-core (1024,1024,32); tile m=1024 n=1024 k1=32 m0=32 n0=512 k0=32 stat=B |
 | (16, 4096, 4096, 8, 'B') | 253440 | 512 | 16384 | 0.002 | 0.065 | 0.067 | split=B blockNum=8 per-core (16,512,4096); tile m=16 n=512 k1=240 m0=16 n0=512 k0=16 stat=A |
 

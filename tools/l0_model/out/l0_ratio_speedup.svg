@@ -31,23 +31,23 @@
 <circle cx="387.9" cy="134.0" r="3.2" fill="#1f77b4"/>
 <circle cx="716.0" cy="134.0" r="3.2" fill="#1f77b4"/>
 <text x="78" y="56" fill="#1f77b4">L0A sweep, 32c A-split 搬入Bound</text>
-<polyline fill="none" stroke="#d62728" stroke-width="2.2" points="70.0,134.0 80.3,134.0 100.8,134.0 141.8,134.0 223.8,133.9 387.9,133.9 716.0,133.9"/>
+<polyline fill="none" stroke="#d62728" stroke-width="2.2" points="70.0,134.0 80.3,134.0 100.8,134.0 141.8,134.0 223.8,134.0 387.9,134.0 716.0,134.0"/>
 <circle cx="70.0" cy="134.0" r="3.2" fill="#d62728"/>
 <circle cx="80.3" cy="134.0" r="3.2" fill="#d62728"/>
 <circle cx="100.8" cy="134.0" r="3.2" fill="#d62728"/>
 <circle cx="141.8" cy="134.0" r="3.2" fill="#d62728"/>
-<circle cx="223.8" cy="133.9" r="3.2" fill="#d62728"/>
-<circle cx="387.9" cy="133.9" r="3.2" fill="#d62728"/>
-<circle cx="716.0" cy="133.9" r="3.2" fill="#d62728"/>
+<circle cx="223.8" cy="134.0" r="3.2" fill="#d62728"/>
+<circle cx="387.9" cy="134.0" r="3.2" fill="#d62728"/>
+<circle cx="716.0" cy="134.0" r="3.2" fill="#d62728"/>
 <text x="78" y="72" fill="#d62728">L0B sweep, 32c A-split 搬入Bound</text>
-<polyline fill="none" stroke="#2ca02c" stroke-width="2.2" points="70.0,134.0 80.3,134.0 100.8,134.0 141.8,134.0 223.8,134.0 387.9,134.0 716.0,134.0"/>
+<polyline fill="none" stroke="#2ca02c" stroke-width="2.2" points="70.0,134.0 80.3,134.0 100.8,134.0 141.8,134.0 223.8,134.0 387.9,134.0 716.0,134.2"/>
 <circle cx="70.0" cy="134.0" r="3.2" fill="#2ca02c"/>
 <circle cx="80.3" cy="134.0" r="3.2" fill="#2ca02c"/>
 <circle cx="100.8" cy="134.0" r="3.2" fill="#2ca02c"/>
 <circle cx="141.8" cy="134.0" r="3.2" fill="#2ca02c"/>
 <circle cx="223.8" cy="134.0" r="3.2" fill="#2ca02c"/>
 <circle cx="387.9" cy="134.0" r="3.2" fill="#2ca02c"/>
-<circle cx="716.0" cy="134.0" r="3.2" fill="#2ca02c"/>
+<circle cx="716.0" cy="134.2" r="3.2" fill="#2ca02c"/>
 <text x="78" y="88" fill="#2ca02c">L0A sweep, 1-core</text>
 <polyline fill="none" stroke="#9467bd" stroke-width="2.2" points="70.0,134.0 80.3,134.0 100.8,134.0 141.8,133.9 223.8,133.9 387.9,133.9 716.0,133.9"/>
 <circle cx="70.0" cy="134.0" r="3.2" fill="#9467bd"/>
