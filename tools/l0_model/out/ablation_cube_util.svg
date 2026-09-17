@@ -1,0 +1,56 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="780" height="430" viewBox="0 0 780 430">
+<rect width="100%" height="100%" fill="#ffffff"/>
+<style>text{font-family:DejaVu Sans,Liberation Sans,sans-serif;font-size:12px;fill:#222}</style>
+<text x="390.0" y="24" text-anchor="middle" font-weight="700">Cube util with/without L0A and L0B</text>
+<text x="16" y="215.0" text-anchor="middle" transform="rotate(-90 16 215.0)">Cube utilization</text>
+<line x1="64" y1="352.0" x2="764" y2="352.0" stroke="#eee"/>
+<text x="56" y="356.0" text-anchor="end">0.00</text>
+<line x1="64" y1="274.0" x2="764" y2="274.0" stroke="#eee"/>
+<text x="56" y="278.0" text-anchor="end">0.28</text>
+<line x1="64" y1="196.0" x2="764" y2="196.0" stroke="#eee"/>
+<text x="56" y="200.0" text-anchor="end">0.56</text>
+<line x1="64" y1="118.0" x2="764" y2="118.0" stroke="#eee"/>
+<text x="56" y="122.0" text-anchor="end">0.84</text>
+<line x1="64" y1="40.0" x2="764" y2="40.0" stroke="#eee"/>
+<text x="56" y="44.0" text-anchor="end">1.11</text>
+<text x="130.8" y="370" text-anchor="middle">1c 1024^3</text>
+<rect x="76.9" y="266.8" width="19.5" height="85.2" fill="#7f7f7f"/>
+<rect x="98.5" y="266.8" width="19.5" height="85.2" fill="#c7c7c7"/>
+<rect x="120.0" y="214.2" width="19.5" height="137.8" fill="#1f77b4"/>
+<rect x="141.5" y="80.7" width="19.5" height="271.3" fill="#ff7f0e"/>
+<rect x="163.1" y="80.7" width="19.5" height="271.3" fill="#2ca02c"/>
+<text x="270.8" y="370" text-anchor="middle">32c A-split</text>
+<rect x="216.9" y="338.1" width="19.5" height="13.9" fill="#7f7f7f"/>
+<rect x="238.5" y="338.1" width="19.5" height="13.9" fill="#c7c7c7"/>
+<rect x="260.0" y="323.8" width="19.5" height="28.2" fill="#1f77b4"/>
+<rect x="281.5" y="322.0" width="19.5" height="30.0" fill="#ff7f0e"/>
+<rect x="303.1" y="322.0" width="19.5" height="30.0" fill="#2ca02c"/>
+<text x="410.8" y="370" text-anchor="middle">32c 2D-split</text>
+<rect x="356.9" y="339.3" width="19.5" height="12.7" fill="#7f7f7f"/>
+<rect x="378.5" y="339.3" width="19.5" height="12.7" fill="#c7c7c7"/>
+<rect x="400.0" y="283.1" width="19.5" height="68.9" fill="#1f77b4"/>
+<rect x="421.5" y="283.0" width="19.5" height="69.0" fill="#ff7f0e"/>
+<rect x="443.1" y="283.1" width="19.5" height="68.9" fill="#2ca02c"/>
+<text x="550.8" y="370" text-anchor="middle">32c K-split</text>
+<rect x="496.9" y="328.0" width="19.5" height="24.0" fill="#7f7f7f"/>
+<rect x="518.5" y="328.0" width="19.5" height="24.0" fill="#c7c7c7"/>
+<rect x="540.0" y="241.1" width="19.5" height="110.9" fill="#1f77b4"/>
+<rect x="561.5" y="167.5" width="19.5" height="184.5" fill="#ff7f0e"/>
+<rect x="583.1" y="167.5" width="19.5" height="184.5" fill="#2ca02c"/>
+<text x="690.8" y="370" text-anchor="middle">8c 16x4096</text>
+<rect x="636.9" y="341.3" width="19.5" height="10.7" fill="#7f7f7f"/>
+<rect x="658.5" y="338.3" width="19.5" height="13.7" fill="#c7c7c7"/>
+<rect x="680.0" y="337.3" width="19.5" height="14.7" fill="#1f77b4"/>
+<rect x="701.5" y="336.2" width="19.5" height="15.8" fill="#ff7f0e"/>
+<rect x="723.1" y="336.2" width="19.5" height="15.8" fill="#2ca02c"/>
+<rect x="64" y="398" width="10" height="10" fill="#7f7f7f"/>
+<text x="78" y="408">L1-only/sharedL1</text>
+<rect x="209" y="398" width="10" height="10" fill="#c7c7c7"/>
+<text x="223" y="408">L1-only</text>
+<rect x="354" y="398" width="10" height="10" fill="#1f77b4"/>
+<text x="368" y="408">L0A</text>
+<rect x="499" y="398" width="10" height="10" fill="#ff7f0e"/>
+<text x="513" y="408">L0B</text>
+<rect x="644" y="398" width="10" height="10" fill="#2ca02c"/>
+<text x="658" y="408">L0A+L0B</text>
+</svg>

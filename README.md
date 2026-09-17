@@ -7,6 +7,7 @@ CCU / HCOMM 相关分析笔记与工具。
 - [HCOMM CCU 底层指令格式分析](docs/ccu/01-underlying-instruction-format.md)
 - [PyTorch 算子特征分类、API 特征与同步特征提取](docs/design/pytorch_op_feature_compete.md)
 - [CUDA L2 Cache Persistence 控制机制](docs/cuda/a.md)
+- [昇腾 Cube 引入 L0A/L0B 的必要性评估](docs/ascend/l0a_l0b_necessity.md)
 
 ## 工具
 
@@ -14,3 +15,4 @@ CCU / HCOMM 相关分析笔记与工具。
   - C 实现：`tools/ccu_v1_asm/c`
   - C 风格：`create ctx → call main() → 指令填二进制 → write_file`
   - 位置操作数、变量分配/复用、metainfo
+- [Cube L0A/L0B vs L1 软件模型](tools/l0_model/README.md)
